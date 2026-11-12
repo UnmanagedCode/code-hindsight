@@ -319,6 +319,31 @@ test('shutdown after docker.reset() still stops the containers with the last wor
   assert.ok(!dockerCalls(r).some((a) => a[0] === 'version'), 'no re-resolve needed');
 });
 
+// Round 2: switching sudo off is honoured at shutdown too: the remembered sudo invocation is
+// dropped and plain docker is tried within the bounded resolve.
+test('after sudo is switched off, shutdown never uses sudo: plain docker if it works, else a recorded failure', async (t) => {
+  const refused = make(t, { mode: 'denied' });
+  await refused.sup.ensureRunning();
+  assert.equal(refused.sup.status().docker.mode, 'sudo');
+  refused.settingsStore.save({ ...refused.settingsStore.get(), docker: { allowSudo: false } });
+  refused.docker.reset();
+  fs.writeFileSync(refused.r.logPath, '');
+  assert.equal(await refused.sup.shutdown(), null);
+  assert.doesNotMatch(fs.readFileSync(refused.r.logPath, 'utf8'), /"sudo"/, 'sudo was not run');
+  assert.match(JSON.parse(fs.readFileSync(path.join(refused.r.dataDir, 'shutdown-failed.json'), 'utf8')).error, /permission denied|refused/i);
+
+  const fixed = make(t, { mode: 'denied' });
+  await fixed.sup.ensureRunning();
+  fixed.settingsStore.save({ ...fixed.settingsStore.get(), docker: { allowSudo: false } });
+  fixed.docker.reset();
+  fixed.env.FAKE_DOCKER_MODE = ''; // the user got socket access instead
+  fs.writeFileSync(fixed.r.logPath, '');
+  assert.ok(Number.isInteger(await fixed.sup.shutdown()));
+  await waitFor(() => dockerCalls(fixed.r).some((a) => a[0] === 'stop'));
+  assert.doesNotMatch(fs.readFileSync(fixed.r.logPath, 'utf8'), /"sudo"/);
+  assert.equal(dockerCalls(fixed.r).find((a) => a[0] === 'stop').length, 5);
+});
+
 test('shutdown before this backend resolved docker resolves it (bounded) and stops', async (t) => {
   const { r, sup } = make(t);
   const pid = await sup.shutdown();

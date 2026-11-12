@@ -10,10 +10,10 @@ import { pipeline } from 'node:stream/promises';
 import { tarEntry, createTarAppender, createTarScanner } from '../src/tarStream.js';
 import { mkRoot } from './helpers.mjs';
 
-function paxEntry(name, data) {
+function paxEntry(name, data, extra = '') {
   // A PAX record is "<length> <key>=<value>\n", where <length> counts itself.
   const line = (k, v) => { let n = 0; while (Buffer.byteLength(`${n} ${k}=${v}\n`) !== n) n = Buffer.byteLength(`${n} ${k}=${v}\n`); return `${n} ${k}=${v}\n`; };
-  const pax = Buffer.from(line('size', data.length));
+  const pax = Buffer.from(`${extra ? line('comment', extra) : ''}${line('size', data.length)}`);
   const ph = tarEntry('PaxHeader', pax);
   ph[156] = 'x'.charCodeAt(0);
   fixChecksum(ph);
@@ -78,4 +78,27 @@ test('GNU tar reads the appended archive (when tar is installed)', { skip: spawn
 test('an archive without an end marker is an error', async () => {
   const truncated = archive().subarray(0, 1024);
   await assert.rejects(through(createTarAppender('m.json', Buffer.from('{}')), truncated, 100), /no end-of-archive marker/);
+});
+
+// A PAX header larger than the entry cap (a 200 KiB comment before its size= record) is
+// streamed, not buffered: bytes pass through unchanged, its size= still applies, and the
+// manifest after it is found and appended correctly.
+test('an oversized PAX header passes through unchanged and keeps the archive readable', async (t) => {
+  const huge = paxEntry('blobs/sha256/bbbb', Buffer.alloc(2000, 5), 'x'.repeat(200 * 1024));
+  const body = Buffer.concat([tarEntry('index.json', Buffer.from('{}')), huge, tarEntry('code-hindsight-bundle.json', Buffer.from('{"m":1}'))]);
+  const input = Buffer.concat([body, Buffer.alloc(1024)]);
+  let seen = null;
+  const passed = await through(createTarScanner('code-hindsight-bundle.json', (b) => { seen = b; }), input, 4096);
+  assert.deepEqual(passed, input, 'what docker load receives is byte-identical');
+  assert.equal(String(seen), '{"m":1}', 'the walker stayed in step after the big header');
+
+  const appended = await through(createTarAppender('extra.json', Buffer.from('{"e":2}')), input, 1000);
+  assert.deepEqual(appended.subarray(0, body.length), body);
+  if (spawnSync('tar', ['--version']).status === 0) {
+    const r = mkRoot(t);
+    const file = path.join(r.root, 'big.tar');
+    fs.writeFileSync(file, appended);
+    assert.deepEqual(spawnSync('tar', ['tf', file], { encoding: 'utf8' }).stdout.trim().split('\n'), ['index.json', 'blobs/sha256/bbbb', 'code-hindsight-bundle.json', 'extra.json']);
+    assert.equal(spawnSync('tar', ['xOf', file, 'blobs/sha256/bbbb']).stdout.length, 2000);
+  }
 });

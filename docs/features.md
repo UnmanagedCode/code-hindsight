@@ -35,7 +35,7 @@ Saved with **Save**; **Apply & restart** saves and reconciles the containers to 
 
 | Setting | Default | Notes |
 |---|---|---|
-| Image | `full` | `slim` has no local models: refused (`SLIM_NEEDS_REMOTE_EMBEDDINGS`, `SLIM_NEEDS_RERANKER`) until embeddings are remote with a key or base URL and the reranker is `rrf` |
+| Image | `full` | `slim` has no local models: refused (`SLIM_NEEDS_REMOTE_EMBEDDINGS`, `SLIM_NEEDS_RERANKER`) until embeddings are remote **with a key of their own** (`EMBEDDINGS_NEEDS_KEY` otherwise) and the reranker is `rrf` |
 | Use `sudo -n docker` when docker is refused | on | sudo docker is root on the host |
 | Bind address | automatic | the Docker host's address both ports are published on; automatic = the container's default gateway when cc runs in a container, else `127.0.0.1`. An unspecified (`0.x`), multicast, reserved or broadcast address is refused |
 | API port / Control-plane port | `DEFAULT_SETTINGS` in `src/settings.js` | fixed so clients keep a stable URL; a clash is `PORT_IN_USE`, never a silent re-pick |
@@ -56,10 +56,10 @@ Nothing is pulled, built, loaded or removed on its own: each is a button, one at
 |---|---|---|
 | Pull full image / Pull slim image | network | pulls the pinned official API image |
 | Build CP image | network (once) | builds the control-plane image from the pinned upstream commit with this plugin's base path, inside the docker CLI helper image (pulled by digest when missing; run only if its ID is pinned). The built image's ID becomes the trusted CP image |
-| Upload and import | — | streams a bundle file from the browser into `docker load`; lists each loaded image's ID and whether it will run (pinned / not pinned / trusted / needs confirmation) |
+| Upload and import | — | streams a bundle file from the browser into `docker load`; lists each loaded image's ID and whether it will run (pinned / not pinned / trusted / needs confirmation), and next to them the IDs the bundle's manifest lists (a bundle this plugin exported) |
 | Import from a path | — | the same for a `.tar` on cc's machine (absolute path) |
-| Trust this image… | a CP image that is not trusted | shows the control-plane image's ID; confirming trusts exactly that ID (for a bundle you exported yourself, compare it with the export's) |
-| Export | the images present | writes `code-hindsight-<version>-<variant>.tar` (the variant's API image + the CP image, plus a `code-hindsight-bundle.json` listing their IDs) to the plugin data dir and offers it for download; reports size, sha256 and the IDs |
+| Trust this image… | a CP image that is not trusted | shows the control-plane image's ID; confirming trusts exactly that ID (for a bundle you exported yourself, compare it with the IDs the export showed). This guards against running an unexpected image by accident — a wrong tarball, a stale import — not against a caller that can reach the plugin API, which can import and confirm an image itself ([README → Trust model](../README.md#trust-model)) |
+| Export | the images present | writes `code-hindsight-<version>-<variant>.tar` (the variant's API image + the CP image, plus a `code-hindsight-bundle.json` listing their IDs) to the plugin data dir and offers it for download; shows size, sha256 and the image IDs |
 | Remove images | Hindsight stopped; confirm | removes the pinned API images and the CP image (and this plugin's stopped containers) |
 | Delete data volume | Hindsight stopped; type the volume name | deletes every memory |
 

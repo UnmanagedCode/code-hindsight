@@ -24,6 +24,56 @@ function readName(h) {
   return prefix ? `${prefix}/${name}` : name;
 }
 
+/**
+ * A streaming PAX extended-header parser: records are `<len> <key>=<value>\n`. It keeps only
+ * the record being read, and only when that record fits in MAX_ENTRY; longer records (a huge
+ * comment, say) are skipped as they stream, so a header of any size costs bounded memory and
+ * its `size=` record is still honoured. A malformed header stops being parsed (no override).
+ */
+function paxParser() {
+  let digits = '';
+  let need = 0;
+  let got = 0;
+  let rec = null;
+  let size = null;
+  let broken = false;
+  return {
+    feed(buf) {
+      let i = 0;
+      while (i < buf.length && !broken) {
+        if (need === 0) {
+          const c = buf[i++];
+          if (c === 0x20 && digits) {
+            need = Number(digits) - digits.length - 1;
+            digits = '';
+            got = 0;
+            if (!(need > 0)) { broken = true; break; }
+            rec = need <= MAX_ENTRY ? [] : null;
+          } else if (c >= 0x30 && c <= 0x39 && digits.length < 20) {
+            digits += String.fromCharCode(c);
+          } else {
+            broken = true; // padding NULs or garbage: no more records
+          }
+          continue;
+        }
+        const n = Math.min(need - got, buf.length - i);
+        if (rec) rec.push(buf.subarray(i, i + n));
+        i += n;
+        got += n;
+        if (got === need) {
+          if (rec) {
+            const m = /^size=(\d+)\n$/.exec(Buffer.concat(rec).toString('utf8'));
+            if (m) size = Number(m[1]);
+          }
+          need = 0;
+          rec = null;
+        }
+      }
+    },
+    size: () => size,
+  };
+}
+
 /** One regular-file entry: ustar header, data, padding. */
 export function tarEntry(name, data, mtime = Math.floor(Date.now() / 1000)) {
   if (Buffer.byteLength(name) > 100) throw new Error('tar entry name too long');
@@ -47,7 +97,7 @@ export function tarEntry(name, data, mtime = Math.floor(Date.now() / 1000)) {
 /**
  * Walks a tar stream block by block. `feed(chunk)` returns how many bytes of the stream so far
  * are fully classified (a header block counts only once complete). Callbacks: `onHeader(name,
- * size)` per entry (PAX headers applied, not reported), `onData(part)` for its data, and
+ * size)` per entry (PAX headers applied, not reported; their memory is bounded, see paxParser), `onData(part)` for its data, and
  * `onEnd(offset)` at the first all-zero header block, with that block's stream offset.
  */
 function tarWalker({ onHeader = () => {}, onData = () => {}, onEnd = () => {} }) {
@@ -55,7 +105,7 @@ function tarWalker({ onHeader = () => {}, onData = () => {}, onEnd = () => {} })
   let base = 0; // stream offset of pending[0]
   let remaining = 0;
   let padding = 0;
-  let paxBuf = null;
+  let pax = null;
   let paxGlobal = false;
   let nextSize = null;
   let ended = false;
@@ -70,13 +120,12 @@ function tarWalker({ onHeader = () => {}, onData = () => {}, onEnd = () => {} })
         if (remaining > 0) {
           const n = Math.min(remaining, avail);
           const part = pending.subarray(off, off + n);
-          if (paxBuf) paxBuf.push(part); else onData(part);
+          if (pax) pax.feed(part); else onData(part);
           off += n;
           remaining -= n;
-          if (remaining === 0 && paxBuf) {
-            const m = /(?:^|\n)\d+ size=(\d+)\n/.exec(Buffer.concat(paxBuf).toString('utf8'));
-            if (m && !paxGlobal) nextSize = Number(m[1]);
-            paxBuf = null;
+          if (remaining === 0 && pax) {
+            if (pax.size() !== null && !paxGlobal) nextSize = pax.size();
+            pax = null;
           }
         } else {
           const n = Math.min(padding, avail);
@@ -92,7 +141,7 @@ function tarWalker({ onHeader = () => {}, onData = () => {}, onEnd = () => {} })
       const type = String.fromCharCode(h[156]);
       let size = readSize(h);
       if (type === 'x' || type === 'g') {
-        paxBuf = [];
+        pax = paxParser();
         paxGlobal = type === 'g';
       } else if (nextSize !== null) {
         size = nextSize;

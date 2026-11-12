@@ -210,12 +210,16 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
     /**
      * Stop containers in a process that outlives this one (own process group), so the
      * database shuts down cleanly after cc's grace period kills the backend. Uses the current
-     * invocation, else the last one that worked, else a resolve bounded by `resolveMs`.
+     * invocation, else the last one that worked (sudo only while still allowed), else a resolve
+     * bounded by `resolveMs`.
      * Returns the pid; throws when no invocation is known or the process could not start.
      */
     async stopDetached(names, seconds = 30, { resolveMs = 1500 } = {}) {
       names.forEach(assertOwnedName);
       let mode = info.mode ?? lastMode;
+      // A remembered sudo invocation is not reused once sudo is switched off: fall back to the
+      // bounded resolve, which tries plain docker and never sudo.
+      if (mode === 'sudo' && !allowSudo()) mode = null;
       if (!mode) {
         const r = await Promise.race([resolve().catch((e) => ({ error: e })), new Promise((res) => setTimeout(() => res({ error: new Error(`docker did not resolve within ${resolveMs} ms`) }), resolveMs).unref())]);
         if (r.error) throw r.error;

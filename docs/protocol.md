@@ -43,13 +43,13 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 
 | `<kind>` | Body | Result |
 |---|---|---|
-| `pull` | `{variant: "full"\|"slim"}` | `{image}` |
-| `build-cp` | `{}` | `{image}` |
+| `pull` | `{variant: "full"\|"slim"}` | `{image, id, pinned}` — `id` is the pulled image's ID (`null` if absent), `pinned` whether it is a pinned ID |
+| `build-cp` | `{}` | `{image, id}` — the built image's ID, now trusted |
 | `import` | `{path: "/abs/file.tar"}` (or the octet-stream upload) | `{loaded: [{ref, id, status: pinned\|not-pinned\|trusted\|needs-confirmation\|unused}], manifest: <code-hindsight-bundle.json> \| null}` |
 | `trust-cp` | `{confirm: "<the CP image's current ID>"}` | `{image, id}` — records it as the trusted CP image |
 | `export` | `{variant}` | `{name, path, size, sha256, images: [{ref, id}]}` |
-| `remove-images` | `{confirm: true}` | `{removed: [refs]}` |
-| `delete-volume` | `{confirm: "<volume name>"}` | `{removed}` |
+| `remove-images` | `{confirm: true}` | `{removed: [refs]}` (the pinned API refs and `CP_IMAGE` that were present) |
+| `delete-volume` | `{confirm: "<volume name>"}` | `{removed: "<volume name>" \| null}` (`null` when there was no volume) |
 
 - `remove-images` and `delete-volume` refuse `CONFIRMATION_REQUIRED` without their confirmation and fail `CONTAINERS_RUNNING` while a container of this plugin runs. `trust-cp` refuses `CONFIRMATION_REQUIRED` (with `params.expected` = the current ID) when the ID does not match.
 - `build-cp` inspects `BUILD_HELPER.ref` (a digest reference), pulls it when missing, fails `HELPER_UNTRUSTED` unless its ID is in `BUILD_HELPER.ids`, then runs `docker run --rm --name <prefix>-build -v /var/run/docker.sock:/var/run/docker.sock <helper ID> docker buildx build <repo>#<UPSTREAM_REVISION> …` (`buildCpCommand` in `src/jobs.js`) and records the built image's ID as trusted.
