@@ -1,0 +1,41 @@
+{
+  "name": "code-hindsight",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "prepare": "vite build --config frontend/vite.config.ts",
+    "dev": "vite --config frontend/vite.config.ts",
+    "typecheck": "tsc -p frontend",
+    "test": "npm run test:server && npm run typecheck && npm run test:web",
+    "test:server": "node --test \"tests/*.test.mjs\"",
+    "test:web": "vitest run --config frontend/vitest.config.ts",
+    "test:real": "node --test --test-concurrency=1 \"tests/*.real.test.mjs\""
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.10",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "happy-dom": "^21.0.4",
+    "lucide-react": "^1.72.0",
+    "playwright-core": "^1.65.0",
+    "radix-ui": "^1.8.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "tailwind-merge": "^3.7.0",
+    "tailwindcss": "^4.3.5",
+    "tw-animate-css": "^1.4.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  }
+}

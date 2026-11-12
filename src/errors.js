@@ -1,0 +1,190 @@
+// The error catalog: every named error the backend reports, with the text and the one action
+// the UI offers for it. The UI renders these entries; it holds no copy of its own.
+
+/** Actions the UI can offer for an error (the Status page maps each to a button). */
+export const ACTIONS = Object.freeze({
+  pull: 'pull',
+  build: 'build-cp',
+  import: 'import',
+  start: 'start',
+  restart: 'restart',
+  settings: 'settings',
+  stop: 'stop',
+});
+
+const s = (v) => (v === undefined || v === null ? '' : String(v));
+
+/** code → { title, message(params), action, status (HTTP status when it refuses a request) } */
+export const CATALOG = Object.freeze({
+  DOCKER_NOT_FOUND: {
+    title: 'Docker is not installed',
+    message: (p) => `The docker CLI could not be run${p.bin ? ` (${s(p.bin)})` : ''}. Install Docker in the environment cc runs in, or point CODE_HINDSIGHT_DOCKER_BIN at it.`,
+    action: null, status: 503,
+  },
+  DOCKER_DENIED: {
+    title: 'No permission to use Docker',
+    message: (p) => (p.sudoAllowed
+      ? `docker was refused and \`sudo -n docker\` failed too: ${s(p.detail)}`
+      : `docker was refused (${s(p.detail)}). Allow \`sudo -n docker\` in Settings, or give cc's user access to the Docker socket.`),
+    action: ACTIONS.settings, status: 503,
+  },
+  DOCKER_DAEMON_DOWN: {
+    title: 'The Docker daemon is not reachable',
+    message: (p) => `docker could not reach its daemon: ${s(p.detail)}`,
+    action: ACTIONS.start, status: 503,
+  },
+  DOCKER_FAILED: {
+    title: 'A docker command failed',
+    message: (p) => `\`docker ${s(p.command)}\` failed: ${s(p.detail)}`,
+    action: ACTIONS.start, status: 502,
+  },
+  IMAGE_MISSING: {
+    title: 'The Hindsight image is not on this machine',
+    message: (p) => `${s(p.image)} is missing. Pull it, or import an offline bundle on Images & data. Nothing is pulled automatically.`,
+    action: ACTIONS.pull, status: 409,
+  },
+  IMAGE_MISMATCH: {
+    title: 'The Hindsight image is a different release',
+    message: (p) => `${s(p.image)} is ${s(p.found)}, not the pinned release ${s(p.expected)}. Pull it again, or import the matching bundle.`,
+    action: ACTIONS.pull, status: 409,
+  },
+  CP_IMAGE_MISSING: {
+    title: 'The control-plane image has not been built',
+    message: (p) => `${s(p.image)} is missing. Build it once (needs network), or import a bundle that contains it.`,
+    action: ACTIONS.build, status: 409,
+  },
+  CP_IMAGE_MISMATCH: {
+    title: 'The control-plane image was built for something else',
+    message: (p) => `${s(p.image)} carries ${s(p.found)}; this plugin needs ${s(p.expected)}. Build it again.`,
+    action: ACTIONS.build, status: 409,
+  },
+  NAME_TAKEN: {
+    title: 'A Docker resource with this plugin\'s name belongs to someone else',
+    message: (p) => `${s(p.kind)} ${s(p.name)} exists but was not created by this cc. It is left untouched; remove or rename it yourself.`,
+    action: null, status: 409,
+  },
+  EMBEDDINGS_CHANGED: {
+    title: 'The embeddings no longer match the stored memories',
+    message: (p) => `Volume ${s(p.volume)} holds memories embedded with ${s(p.current)}; the settings ask for ${s(p.wanted)}. Revert the embeddings settings, or delete the data volume on Images & data.`,
+    action: ACTIONS.settings, status: 409,
+  },
+  PORT_IN_USE: {
+    title: 'A host port is already taken',
+    message: (p) => `Port ${s(p.port)} on ${s(p.address)} is in use. Change ${s(p.setting)} in Settings.`,
+    action: ACTIONS.settings, status: 409,
+  },
+  UNHEALTHY: {
+    title: 'Hindsight did not become healthy',
+    message: (p) => `The ${s(p.role)} container is running but ${s(p.url)} did not answer in time.${p.tail ? `\n${s(p.tail)}` : ''}`,
+    action: ACTIONS.restart, status: 503,
+  },
+  CRASHED: {
+    title: 'A Hindsight container stopped',
+    message: (p) => `The ${s(p.role)} container exited with code ${s(p.exitCode)}.${p.tail ? `\n${s(p.tail)}` : ''}`,
+    action: ACTIONS.restart, status: 503,
+  },
+  CP_LOGIN_FAILED: {
+    title: 'Could not sign in to the control plane',
+    message: (p) => `The control plane refused the access key (${s(p.detail)}). Restart Hindsight to recreate it.`,
+    action: ACTIONS.restart, status: 502,
+  },
+  CC_UNREACHABLE: {
+    title: 'cc could not be reached',
+    message: (p) => `Reading the cc backend list failed: ${s(p.detail)}`,
+    action: ACTIONS.settings, status: 502,
+  },
+  CC_ROUTE_CHANGED: {
+    title: 'cc\'s backend list has an unexpected shape',
+    message: (p) => `GET /api/settings/models answered in a shape this plugin does not know (${s(p.detail)}). Set the LLM manually.`,
+    action: ACTIONS.settings, status: 502,
+  },
+  CC_BACKEND_MISSING: {
+    title: 'The linked cc backend is gone',
+    message: (p) => `cc has no backend "${s(p.backendId)}" any more. Pick another one, or set the LLM manually.`,
+    action: ACTIONS.settings, status: 409,
+  },
+  CC_BACKEND_UNSUPPORTED: {
+    title: 'The linked cc backend cannot be used',
+    message: (p) => `cc backend "${s(p.backendId)}" has no ANTHROPIC_BASE_URL with ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY. Pick another one, or set the LLM manually.`,
+    action: ACTIONS.settings, status: 409,
+  },
+  CC_BACKEND_LOOPBACK: {
+    title: 'The linked cc backend points at loopback',
+    message: (p) => `cc backend "${s(p.backendId)}" talks to ${s(p.host)}, which is cc's own loopback and unreachable from a container. Pick another one, or set the LLM manually.`,
+    action: ACTIONS.settings, status: 409,
+  },
+  SLIM_NEEDS_REMOTE_EMBEDDINGS: {
+    title: 'The slim image needs remote embeddings',
+    message: () => 'The slim image ships no local embedding model. Set a remote embeddings provider with its key, or use the full image.',
+    action: ACTIONS.settings, status: 400,
+  },
+  SLIM_NEEDS_RERANKER: {
+    title: 'The slim image needs a non-local reranker',
+    message: () => 'The slim image ships no local reranker model. Choose a reranker that needs no local model, or use the full image.',
+    action: ACTIONS.settings, status: 400,
+  },
+  SETTINGS_INVALID: {
+    title: 'The settings are not valid',
+    message: (p) => (Array.isArray(p.fields) ? p.fields.map((f) => `${f.field}: ${f.message}`).join('; ') : 'invalid settings'),
+    action: ACTIONS.settings, status: 400,
+  },
+  BUSY: {
+    title: 'Another Docker action is running',
+    message: (p) => `Wait for "${s(p.job)}" to finish.`,
+    action: null, status: 409,
+  },
+  CONFIRMATION_REQUIRED: {
+    title: 'Confirmation required',
+    message: (p) => `Type ${s(p.expected)} to confirm.`,
+    action: null, status: 400,
+  },
+  CONTAINERS_RUNNING: {
+    title: 'Stop Hindsight first',
+    message: () => 'This action needs the Hindsight containers stopped.',
+    action: ACTIONS.stop, status: 409,
+  },
+  IMPORT_PATH_INVALID: {
+    title: 'That file cannot be imported',
+    message: (p) => `${s(p.path)}: ${s(p.detail)}`,
+    action: null, status: 400,
+  },
+  JOB_FAILED: {
+    title: 'The Docker action failed',
+    message: (p) => `${s(p.job)} failed: ${s(p.detail)}`,
+    action: null, status: 500,
+  },
+  BAD_REQUEST: { title: 'Bad request', message: (p) => s(p.detail), action: null, status: 400 },
+  NOT_FOUND: { title: 'Not found', message: (p) => s(p.detail), action: null, status: 404 },
+  UNSUPPORTED_MEDIA_TYPE: { title: 'Unsupported content type', message: (p) => `Send ${s(p.expected)}.`, action: null, status: 415 },
+  CROSS_SITE: { title: 'Cross-site request refused', message: () => 'State-changing requests must come from this page.', action: null, status: 403 },
+  NOT_READY: { title: 'Hindsight is not running', message: () => 'Open Status to start it.', action: ACTIONS.start, status: 503 },
+});
+
+/** A named error from the catalog. `params` fill its message and travel to the UI. */
+export class AppError extends Error {
+  constructor(code, params = {}, { cause } = {}) {
+    const entry = CATALOG[code];
+    if (!entry) throw new Error(`unknown error code ${code}`);
+    super(entry.message(params), cause ? { cause } : undefined);
+    this.name = 'AppError';
+    this.code = code;
+    this.params = params;
+    this.status = entry.status;
+  }
+
+  toJSON() {
+    return describeError(this.code, this.params);
+  }
+}
+
+/** The wire form of a catalog error: what `status` and refusals carry. */
+export function describeError(code, params = {}) {
+  const entry = CATALOG[code];
+  return { code, title: entry.title, message: entry.message(params), action: entry.action, params };
+}
+
+/** Any thrown value as a catalog error: an AppError as is, anything else as `fallbackCode` carrying its message. */
+export function toAppError(err, fallbackCode = 'JOB_FAILED', fallbackParams = {}) {
+  if (err instanceof AppError) return err;
+  return new AppError(fallbackCode, { ...fallbackParams, detail: err?.message ?? String(err) }, { cause: err });
+}

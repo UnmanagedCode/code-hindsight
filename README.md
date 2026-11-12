@@ -1,29 +1,62 @@
 # code-hindsight
 
-A code-conductor (cc) plugin that runs [Hindsight](https://hindsight.vectorize.io), an agent memory server, in Docker, shows its control-plane UI inside cc, and gives cc sessions scoped memory.
+A code-conductor (cc) plugin that runs [Hindsight](https://hindsight.vectorize.io), an agent memory server, in Docker on the cc host and shows Hindsight's control-plane UI inside cc at `/plugins/code-hindsight/`.
 
-**Status: not implemented.** This repository holds only the scaffold. There is no plugin manifest and no backend yet.
+It manages two containers (the Hindsight API with its embedded Postgres, and a control plane built for cc's mount path), keeps memories in a named Docker volume, works offline from exported image bundles, and reports every failure by name with the action that fixes it. Giving cc sessions memory through Claude Code hooks is not part of this plugin yet.
 
-## Functional description
+## Quick start
 
-Planned behavior:
+1. In cc: **Settings → Plugins → Rescan**, enable **Code Hindsight**, open it from the app switcher.
+2. **Images & data:** **Pull full image** (or import a bundle), then **Build CP image** once (needs network).
+3. **Status → Start Hindsight**, then the **Control plane** tab.
+4. Switch on **Auto-start** for the plugin (Settings → Plugins) to have Hindsight up after every cc start: Hindsight runs only while the plugin's backend runs.
 
-- Run Hindsight in Docker from either a full image or a slim image.
-- Import the Hindsight image from an offline tarball, for machines without registry access.
-- Embed the Hindsight control-plane UI in cc.
-- Give each cc session memory scoped to that session's work.
+Install hook for a Library entry: `npm install` (it builds `frontend/dist` through `prepare`).
 
-## Technical description
+## Key defaults
 
-- Stack: undecided. No code exists.
-- Components: none yet. The planned pieces are a cc plugin manifest, a backend that manages the Docker container, and the embedded UI.
-- Run, test, extend: no commands exist yet.
-- Known limitations: everything above is planned, not built.
+- Image variant **full** (local embeddings and reranker, works offline); **slim** needs remote embeddings and the `rrf` reranker.
+- LLM **none**: memories are stored as chunks; reflect and observations need an LLM (manual, or linked to one of cc's Anthropic-compatible backends).
+- Ports: fixed, configurable (`DEFAULT_SETTINGS` in `src/settings.js`); bind address automatic: the default gateway when cc runs in a container, else `127.0.0.1`.
+- `sudo -n docker` is used when docker is refused, unless switched off in Settings.
+- Nothing is pulled, built, imported or deleted without a button press.
+
+## Trust model
+
+- **`sudo docker` is root on the host.** With sudo allowed, this plugin drives the Docker daemon as root. It only ever names `code-hindsight-*` containers, volumes and networks and the pinned images, and refuses a same-named resource another cc created.
+- **The control plane runs same-origin with cc** and renders memories that agents wrote. A script injected into it would have cc's full (unauthenticated) API.
+- **Both published ports need a key** (the API key; the CP access key, used server-side). Other containers on the Docker host can reach the bind address. Hindsight leaves `/health*`, `/version`, `/metrics`, `/docs`, `/openapi.json` (API) and its login/health/version routes (CP) open; none returns memory data.
+- Keys live in `secrets.json` (0600) in the plugin data dir and are never returned by any route.
+
+## Known limitations
+
+- Inside the control plane, attachment links and images, the logo in the memory constellation and the favicon 404 (upstream builds those URLs without the base path).
+- The control plane is only usable through cc's mount (`/plugins/code-hindsight/`); its port alone has no UI session.
+- Hindsight runs only while the plugin backend runs (see Auto-start). A backend killed with SIGKILL alone leaves the containers running until the next start adopts them.
+- The cc-backend LLM link reads cc's internal `GET /api/settings/models`; a change to that route is reported as `CC_ROUTE_CHANGED`. Linked tokens are sent as Anthropic `x-api-key`; endpoints that accept only a bearer token refuse them. Loopback backends cannot be linked.
+- Changing embeddings on existing memories is refused; deleting the data volume is the way out.
+- One instance per Docker daemon per cc data dir.
+
+## Docs
+
+- [docs/features.md](docs/features.md) — the UI: tabs, settings, actions, the offline workflow, error codes.
+- [docs/protocol.md](docs/protocol.md) — routes, the error shape, data-dir files, Docker resource names and labels, container env, the CP proxy rules, the cc routes read.
+- [docs/architecture.md](docs/architecture.md) — modules, lifecycle and state machine, CP embedding, pins and bumping Hindsight, tests.
+
+## Technical summary
+
+- Stack: Node ≥ 22.12, plain ESM backend on `node:http` (no runtime dependencies); React + Vite + TypeScript + Tailwind v4 UI built into `frontend/dist`; node:test and Vitest.
+- Run standalone: `CONDUCTOR_PLUGIN_DATA_DIR=/abs/dir PORT=4747 npm start` (the UI expects cc's mount for the control plane).
+- Test: `npm test` (no Docker needed); `RUN_REAL_DOCKER=1 npm run test:real` against the real daemon.
 
 ## Layout
 
 ```
-README.md                          this file
-CLAUDE.md, CONVENTIONS.md          workspace conventions loaded into agent sessions
+conductor.plugin.json     cc manifest
+server.js                 entry point
+src/                      backend modules (docs/architecture.md)
+frontend/                 the shell UI (React + Vite)
+tests/                    node:test suites, fakes/, support/, *.real.test.mjs (gated)
+docs/                     features, protocol, architecture
 .code-conductor/post-worktree-create.sh   links the project wiki into new worktrees
 ```
