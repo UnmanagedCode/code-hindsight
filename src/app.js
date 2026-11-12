@@ -1,7 +1,8 @@
 // Builds the backend's state and its one request handler: `/` and the UI's files are the
 // shell, `/-/api/*` the plugin's API, and every other path the Hindsight control plane.
 import path from 'node:path';
-import { API_IMAGES, BUILD_HELPER_IMAGE, CP_IMAGE, RESOURCE_PREFIX, VARIANTS } from './pins.js';
+import { API_IMAGES, BUILD_HELPER, CP_IMAGE, RESOURCE_PREFIX, VARIANTS } from './pins.js';
+import { createCpTrust } from './trust.js';
 import { createDocker } from './docker.js';
 import { createSettingsStore } from './settings.js';
 import { createSecretsStore } from './secrets.js';
@@ -35,20 +36,21 @@ export function createApp(config, overrides = {}) {
   const settings = createSettingsStore(config.dataDir);
   const secrets = createSecretsStore(config.dataDir);
   secrets.get();
+  const cpTrust = createCpTrust(config.dataDir);
   const names = resourceNames(prefix);
   const owner = ownerId(config.dataDir);
   const docker = createDocker({
     env,
     allowSudo: () => settings.get().docker.allowSudo === true,
     prefix,
-    images: [...VARIANTS.map((v) => API_IMAGES[v].ref), CP_IMAGE, BUILD_HELPER_IMAGE],
+    images: [...VARIANTS.map((v) => API_IMAGES[v].ref), CP_IMAGE, BUILD_HELPER.ref],
     runDir,
   });
   const ccModels = () => fetchCcModels(config.conductorUrl);
   let supervisor;
   const cpSession = createCpSession({ target: () => supervisor.cpAddress(), accessKey: () => secrets.get().cpAccessKey });
-  supervisor = createSupervisor({ docker, settings, secrets, names, owner, dataDir: config.dataDir, detectBind, fetchCcModels: ccModels, cpSession, ...supervisorOptions });
-  const jobs = createJobs({ docker, supervisor, names, owner, dataDir: config.dataDir });
+  supervisor = createSupervisor({ docker, settings, secrets, cpTrust, names, owner, dataDir: config.dataDir, detectBind, fetchCcModels: ccModels, cpSession, ...supervisorOptions });
+  const jobs = createJobs({ docker, supervisor, cpTrust, names, owner, dataDir: config.dataDir });
   const cpProxy = createCpProxy({ target: supervisor.cpTarget, session: cpSession, notReadyError: supervisor.notReadyError });
   const api = createRoutes({
     supervisor, jobs, docker, settings, secrets, fetchCcModels: ccModels,
@@ -77,6 +79,6 @@ export function createApp(config, overrides = {}) {
         if (!res.headersSent) sendText(res, 500, 'Internal error'); else res.destroy();
       });
     },
-    supervisor, jobs, docker, settings, secrets, names, owner, cpSession,
+    supervisor, jobs, docker, settings, secrets, cpTrust, names, owner, cpSession,
   };
 }

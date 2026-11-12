@@ -30,11 +30,21 @@ test('slim with local embeddings and reranker is refused by name', () => {
   assert.deepEqual(errors.map((e) => e.code).sort(), ['SLIM_NEEDS_REMOTE_EMBEDDINGS', 'SLIM_NEEDS_RERANKER']);
 });
 
-test('slim with remote embeddings but no key or base URL is still refused', () => {
+// S4: remote embeddings without a key of their own would make Hindsight send the LLM key there.
+test('remote embeddings without their own key are refused EMBEDDINGS_NEEDS_KEY (a base URL is not enough)', () => {
   const s = withChanges({ variant: 'slim', embeddings: { provider: 'openai', model: 'text-embedding-3-small' }, reranker: { provider: 'rrf' } });
-  assert.deepEqual(validateSettings(s).errors.map((e) => e.code), ['SLIM_NEEDS_REMOTE_EMBEDDINGS']);
+  assert.deepEqual(validateSettings(s).errors.map((e) => [e.field, e.code]), [['embeddings.key', 'EMBEDDINGS_NEEDS_KEY']]);
+  assert.deepEqual(validateSettings({ ...s, embeddings: { ...s.embeddings, baseUrl: 'http://tei.example:8080/v1' } }).errors.map((e) => e.code), ['EMBEDDINGS_NEEDS_KEY']);
+  assert.deepEqual(validateSettings({ ...s, variant: 'full' }).errors.map((e) => e.code), ['EMBEDDINGS_NEEDS_KEY'], 'on the full image too');
   assert.deepEqual(validateSettings(s, { embeddingsApiKey: true }).errors, []);
-  assert.deepEqual(validateSettings({ ...s, embeddings: { ...s.embeddings, baseUrl: 'http://tei.example:8080/v1' } }).errors, []);
+});
+
+// S7: the bind address must be one host address.
+test('the bind address refuses unspecified, multicast, reserved and broadcast addresses', () => {
+  for (const bad of ['0.0.0.0', '0.1.2.3', '224.0.0.1', '239.255.255.250', '240.0.0.1', '255.255.255.255']) {
+    assert.deepEqual(validateSettings(withChanges({ network: { bindAddress: bad } })).errors.map((e) => e.field), ['network.bindAddress'], bad);
+  }
+  for (const ok of ['127.0.0.1', '172.20.0.1', '10.0.0.5', '192.168.1.10']) assert.deepEqual(validateSettings(withChanges({ network: { bindAddress: ok } })).errors, [], ok);
 });
 
 test('field errors name the field: ports, bind address, manual and cc-backend LLM, unknown keys', () => {

@@ -4,12 +4,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { apiSpec, cpSpec, embeddingsEnv, resourceNames, ownerId } from '../src/containerSpec.js';
 import { DEFAULT_SETTINGS } from '../src/settings.js';
-import { API_IMAGES, CP_IMAGE, LABELS } from '../src/pins.js';
+import { API_IMAGES, LABELS } from '../src/pins.js';
 import { defaultBindAddress, defaultGateway } from '../src/netDetect.js';
 
 const names = resourceNames('code-hindsight');
 const base = {
-  names, image: { ref: API_IMAGES.full.ref, id: 'sha256:a' }, variant: 'full', bind: '172.20.0.1', port: 18888,
+  names, image: { id: API_IMAGES.full.ids[0] }, variant: 'full', bind: '172.20.0.1', port: 18888,
   apiKey: 'k'.repeat(64), llmEnv: { HINDSIGHT_API_LLM_PROVIDER: 'none' }, embeddingsEnv: embeddingsEnv(DEFAULT_SETTINGS, {}), owner: 'o1',
 };
 const label = (args, key) => args[args.indexOf(`${key}=${args.find((a) => a.startsWith(`${key}=`))?.split('=')[1]}`)]?.split('=')[1];
@@ -26,7 +26,7 @@ test('API spec: keyed, API-only, published on the bind address, data volume, HF 
   assert.equal(s.name, 'code-hindsight-api');
   assert.deepEqual(s.args.slice(0, 12), ['-d', '--name', 'code-hindsight-api', '--network', 'code-hindsight-net', '--network-alias', 'api', '--restart', 'on-failure:3', '-p', '172.20.0.1:18888:8888', '-v']);
   assert.equal(s.args[12], 'code-hindsight-data:/home/hindsight/.pg0');
-  assert.equal(s.args.at(-1), API_IMAGES.full.ref);
+  assert.equal(s.args.at(-1), API_IMAGES.full.ids[0], 'run by the verified image ID, not a tag');
   assert.equal(s.env.HINDSIGHT_ENABLE_CP, 'false');
   assert.equal(s.env.HINDSIGHT_API_TENANT_EXTENSION, 'hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension');
   assert.equal(s.env.HINDSIGHT_API_TENANT_API_KEY, base.apiKey);
@@ -43,7 +43,7 @@ test('API spec: keyed, API-only, published on the bind address, data volume, HF 
 
 test('slim API spec carries remote embeddings and no HF offline flags', () => {
   const settings = { ...DEFAULT_SETTINGS, variant: 'slim', embeddings: { provider: 'openai', model: 'text-embedding-3-small', baseUrl: 'https://e.example/v1' }, reranker: { provider: 'rrf' } };
-  const s = apiSpec({ ...base, variant: 'slim', image: { ref: API_IMAGES.slim.ref, id: 'sha256:s' }, embeddingsEnv: embeddingsEnv(settings, { embeddingsApiKey: 'ek' }) });
+  const s = apiSpec({ ...base, variant: 'slim', image: { id: API_IMAGES.slim.ids[0] }, embeddingsEnv: embeddingsEnv(settings, { embeddingsApiKey: 'ek' }) });
   assert.equal(s.env.HF_HUB_OFFLINE, undefined);
   assert.equal(s.env.HINDSIGHT_API_EMBEDDINGS_PROVIDER, 'openai');
   assert.equal(s.env.HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL, 'text-embedding-3-small');
@@ -54,12 +54,12 @@ test('slim API spec carries remote embeddings and no HF offline flags', () => {
 
 // Spec 5/6: CP keyed, reaching the API over the private network by alias.
 test('CP spec: own access key, API key, API by alias, published on the bind address', () => {
-  const s = cpSpec({ names, image: { ref: CP_IMAGE, id: 'sha256:c' }, bind: '127.0.0.1', port: 19999, apiKey: 'a', accessKey: 'b', owner: 'o1' });
+  const s = cpSpec({ names, image: { id: 'sha256:c' }, bind: '127.0.0.1', port: 19999, apiKey: 'a', accessKey: 'b', owner: 'o1' });
   assert.equal(s.name, 'code-hindsight-cp');
   assert.ok(s.args.includes('127.0.0.1:19999:9999'));
   assert.equal(s.args[s.args.indexOf('--network') + 1], 'code-hindsight-net');
   assert.deepEqual(s.env, { HINDSIGHT_CP_DATAPLANE_API_URL: 'http://api:8888', HINDSIGHT_CP_DATAPLANE_API_KEY: 'a', HINDSIGHT_CP_ACCESS_KEY: 'b' });
-  assert.equal(s.args.at(-1), CP_IMAGE);
+  assert.equal(s.args.at(-1), 'sha256:c');
 });
 
 // Decision 9: adoption requires the same spec hash; any change in image, args or env changes it.

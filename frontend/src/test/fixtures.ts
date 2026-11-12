@@ -15,6 +15,7 @@ export const status = (over: Partial<Status> = {}): Status => ({
   startedAt: '2026-11-12T20:00:00.000Z',
   pendingRestart: false,
   volume: 'code-hindsight-data',
+  lastShutdownFailure: null,
   llmMode: 'none',
   job: null,
   bundles: [],

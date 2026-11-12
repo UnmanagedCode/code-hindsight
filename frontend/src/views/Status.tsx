@@ -36,6 +36,16 @@ export function Status({ status, onAction, busy }: { status: StatusT; onAction: 
   return (
     <div className="space-y-4">
       {status.error && <ErrorCard error={status.error} onAction={onAction} busy={busy} />}
+      {status.lastShutdownFailure && (
+        <Alert variant="warning" data-hint="shutdown-failed">
+          <InfoIcon />
+          <AlertTitle>The plugin could not stop Hindsight when it was last stopped</AlertTitle>
+          <AlertDescription>
+            <p className="font-mono text-xs whitespace-pre-wrap break-words">{status.lastShutdownFailure.error}</p>
+            The containers may have kept running until this start.
+          </AlertDescription>
+        </Alert>
+      )}
       {status.autoStart === false && (
         <Alert variant="info" data-hint="autostart">
           <InfoIcon />

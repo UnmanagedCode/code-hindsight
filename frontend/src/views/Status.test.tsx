@@ -69,3 +69,11 @@ describe('Status facts', () => {
     expect(onAction).toHaveBeenCalledWith('start');
   });
 });
+
+// C1: a previous backend's failed SIGTERM stop is shown, not silently dropped.
+describe('Shutdown failure notice', () => {
+  it('shows when the previous stop could not run', () => {
+    render(<Status status={status({ lastShutdownFailure: { at: 'x', error: 'could not start sudo' } })} onAction={() => {}} busy={false} />);
+    expect(document.querySelector('[data-hint="shutdown-failed"]')?.textContent).toContain('could not start sudo');
+  });
+});

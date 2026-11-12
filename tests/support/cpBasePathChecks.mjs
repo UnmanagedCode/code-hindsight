@@ -7,6 +7,15 @@ import assert from 'node:assert/strict';
 export const KNOWN_ROOT_LEAKS = [/^\/favicon\.(png|ico)$/, /^\/logo\.png$/, /^\/v1\/[^/]+\/banks\/[^/]+\/attachments\//];
 
 const isKnownLeak = (p) => KNOWN_ROOT_LEAKS.some((re) => re.test(p));
+/** cc serves these at its own root; the stand-in front does not (they 404 there, by design). */
+const HOST_URLS = ['/pluginBridge.js', '/pluginTheme.css', '/__host'];
+async function waitUntil(fn, timeoutMs = 15_000) {
+  const end = Date.now() + timeoutMs;
+  while (!fn()) {
+    if (Date.now() > end) throw new Error('timed out waiting for the shell URL to follow the CP');
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
 
 /**
  * @param {object} o
@@ -15,15 +24,16 @@ const isKnownLeak = (p) => KNOWN_ROOT_LEAKS.some((re) => re.test(p));
  * @param {string} o.bankId a bank that exists, with at least one memory
  * @param {() => void} o.poisonSession make the proxy's next CP request carry a rejected session
  * @param {() => number} o.relogins how many times the proxy has signed in so far
+ * @param {boolean} [o.shell] the backend serves the built shell UI: also check cc's frame → shell → CP frame
  */
-export async function runBasePathChecks({ browser, front, bankId, poisonSession, relogins }) {
+export async function runBasePathChecks({ browser, front, bankId, poisonSession, relogins, shell = false }) {
   const evidence = { steps: [], requests: [], failures: [] };
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   page.on('request', (r) => evidence.requests.push(new URL(r.url()).pathname));
   page.on('response', (r) => {
     const p = new URL(r.url()).pathname;
-    if (r.status() >= 400 && !isKnownLeak(p)) evidence.failures.push(`${r.status()} ${p}`);
+    if (r.status() >= 400 && !isKnownLeak(p) && !HOST_URLS.includes(p)) evidence.failures.push(`${r.status()} ${p}`);
   });
   const at = (p) => `${front.origin}${front.prefix}${p}`;
   const step = (name, detail) => evidence.steps.push({ name, ...detail });
@@ -70,14 +80,21 @@ export async function runBasePathChecks({ browser, front, bankId, poisonSession,
       const r = await fetch('login?returnTo=%2Fdashboard', { redirect: 'manual' });
       return { type: r.type, status: r.status };
     });
-    const viaNode = await fetch(at('/login?returnTo=%2Fbanks%2Fx'), { redirect: 'manual' });
+    const sameOrigin = { redirect: 'manual', headers: { 'sec-fetch-site': 'same-origin' } };
+    const viaNode = await fetch(at('/login?returnTo=%2Fbanks%2Fx'), sameOrigin);
     assert.equal(viaNode.status, 302);
     assert.equal(viaNode.headers.get('location'), `${front.prefix}/banks/x`);
-    const slash = await fetch(at('/dashboard/'), { redirect: 'manual' });
+    const slash = await fetch(at('/dashboard/'), sameOrigin);
     const slashLoc = slash.headers.get('location');
     assert.ok(slash.status >= 300 && slash.status < 400, `trailing-slash redirect, got ${slash.status}`);
     assert.equal(new URL(slashLoc, front.origin).pathname, `${front.prefix}/dashboard`);
     step('redirects', { login: viaNode.headers.get('location'), trailingSlash: slashLoc, browserLogin: loginRedirect });
+
+    // 5b. Requests the browser does not vouch for get no session (cross-site, or no fetch metadata).
+    const crossSite = await fetch(at('/api/banks'), { headers: { 'sec-fetch-site': 'cross-site' } });
+    const bare = await fetch(at('/api/banks'));
+    assert.deepEqual([crossSite.status, bare.status], [403, 403]);
+    step('cross-site', { crossSite: crossSite.status, noMetadata: bare.status });
 
     // 6. The CP's sign-out is answered by the proxy; the UI stays usable under the prefix.
     await page.goto(at('/dashboard'), { waitUntil: 'networkidle' });
@@ -88,7 +105,19 @@ export async function runBasePathChecks({ browser, front, bankId, poisonSession,
     await page.getByText(bankId, { exact: true }).first().waitFor({ timeout: 15_000 });
     step('logout-login', { url: new URL(page.url()).pathname });
 
-    // 7. The browser never holds the CP session cookie.
+    // 7. Inside cc's frame: the shell, its nested CP frame, and navigation within it.
+    if (shell) {
+      await page.goto(`${front.origin}/__host?src=${encodeURIComponent(`${front.prefix}/?view=cp`)}`, { waitUntil: 'networkidle' });
+      const shellFrame = page.frameLocator('iframe[data-plugin-frame]');
+      const cpFrame = shellFrame.frameLocator('iframe[data-cp-frame]');
+      await cpFrame.getByText(bankId, { exact: true }).first().waitFor({ timeout: 20_000 });
+      await cpFrame.getByText(bankId, { exact: true }).first().click();
+      const shellDoc = page.frames().find((f) => f.url().includes(`${front.prefix}/?`));
+      await waitUntil(() => shellDoc.url().includes(`cp=%2Fbanks%2F${encodeURIComponent(bankId)}`));
+      step('in-cc-frame', { shellUrl: new URL(shellDoc.url()).search });
+    }
+
+    // 8. The browser never holds the CP session cookie.
     const cookies = await ctx.cookies();
     assert.equal(cookies.some((c) => c.name === 'hindsight_cp_access'), false);
     step('cookies', { names: cookies.map((c) => `${c.name}@${c.path}`) });
@@ -96,9 +125,9 @@ export async function runBasePathChecks({ browser, front, bankId, poisonSession,
     await ctx.close();
   }
 
-  const rootRequests = [...new Set(evidence.requests.filter((p) => !p.startsWith(`${front.prefix}/`) && p !== front.prefix))];
+  const rootRequests = [...new Set(evidence.requests.filter((p) => !p.startsWith(`${front.prefix}/`) && p !== front.prefix && !HOST_URLS.includes(p)))];
   evidence.rootRequests = rootRequests;
-  evidence.unknownLeaks = rootRequests.filter((p) => !isKnownLeak(p) && p !== '/pluginBridge.js' && p !== '/pluginTheme.css');
+  evidence.unknownLeaks = rootRequests.filter((p) => !isKnownLeak(p));
   evidence.frontLeaks = front.leaks.map((l) => l.url);
   assert.deepEqual(evidence.unknownLeaks, [], 'requests outside the prefix beyond the known gap');
   assert.deepEqual(evidence.failures, [], 'failed requests under the prefix');

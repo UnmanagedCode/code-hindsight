@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { API_IMAGES, BASE_PATH, CP_IMAGE, LABELS, UPSTREAM_REVISION, UPSTREAM_TAG } from '../src/pins.js';
+import { API_IMAGES, BASE_PATH, BUILD_HELPER, CP_IMAGE, LABELS, UPSTREAM_REVISION } from '../src/pins.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const FAKE_DOCKER = path.join(here, 'fakes', 'fake-docker.mjs');
@@ -43,14 +43,22 @@ export function fakeEnv(r, { mode = '', sudoMode = 'ok' } = {}) {
 }
 
 export const goodApiImage = (variant = 'full') => ({
-  Id: `sha256:api-${variant}`,
+  Id: API_IMAGES[variant].ids[0],
   Config: { Labels: { 'org.opencontainers.image.version': API_IMAGES[variant].version, 'org.opencontainers.image.revision': UPSTREAM_REVISION } },
 });
-export const goodCpImage = () => ({ Id: 'sha256:cp', Config: { Labels: { [LABELS.basePath]: BASE_PATH, [LABELS.upstream]: UPSTREAM_TAG } } });
+export const CP_ID = `sha256:${'c'.repeat(64)}`;
+export const goodCpImage = (id = CP_ID) => ({ Id: id, Config: { Labels: { [LABELS.basePath]: BASE_PATH, [LABELS.upstream]: UPSTREAM_REVISION } } });
+export const helperImage = () => ({ Id: BUILD_HELPER.ids[0], Config: { Labels: {} } });
+
+/** Record `id` as the trusted CP image in the data dir (what a build or a confirm does). */
+export function trustCp(r, id = CP_ID) {
+  fs.mkdirSync(r.dataDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(r.dataDir, 'trusted-cp.json'), JSON.stringify({ id, source: 'build', at: 'test' }));
+}
 
 /** Seed the fake daemon: by default both API images and the CP image are present and pullable. */
 export function seedDocker(r, { images, registry, containers = {}, networks = {}, volumes = {} } = {}) {
-  const all = { [API_IMAGES.full.ref]: goodApiImage('full'), [API_IMAGES.slim.ref]: goodApiImage('slim'), [CP_IMAGE]: goodCpImage() };
+  const all = { [API_IMAGES.full.ref]: goodApiImage('full'), [API_IMAGES.slim.ref]: goodApiImage('slim'), [CP_IMAGE]: goodCpImage(), [BUILD_HELPER.ref]: helperImage() };
   fs.writeFileSync(r.statePath, JSON.stringify({ images: images ?? all, registry: registry ?? all, containers, networks, volumes }));
 }
 
@@ -92,12 +100,13 @@ export async function waitFor(fn, { timeoutMs = 5_000, stepMs = 10 } = {}) {
  * Boot the app (createApp) on 127.0.0.1:0 over the fakes and a temp data dir. Resolves
  * {url, app, r}. `cc` is an optional fake cc base URL.
  */
-export async function boot(t, { mode = '', sudoMode, seed, settings, distDir, cc = null, probe = async () => 0, start = true } = {}) {
+export async function boot(t, { mode = '', sudoMode, seed, settings, distDir, cc = null, probe = async () => 0, start = true, trusted = true } = {}) {
   const http = await import('node:http');
   const { createApp } = await import('../src/app.js');
   const r = mkRoot(t);
   seedDocker(r, seed);
   if (settings) writeSettings(r, settings);
+  if (trusted) trustCp(r);
   const config = { port: 0, dataDir: r.dataDir, conductorUrl: cc, pluginId: 'code-hindsight', distDir: distDir ?? path.join(r.root, 'no-dist') };
   const app = createApp(config, { env: fakeEnv(r, { mode, sudoMode }), detectBind: () => '127.0.0.1', supervisorOptions: { probe, clock: fakeClock(), watch: false, log: () => {} } });
   const server = http.createServer(app.handle);
@@ -105,4 +114,16 @@ export async function boot(t, { mode = '', sudoMode, seed, settings, distDir, cc
   t.after(() => { server.closeAllConnections(); server.close(); });
   if (start) await app.supervisor.ensureRunning();
   return { url: `http://127.0.0.1:${server.address().port}`, app, r };
+}
+
+/** A bundle as the fake docker reads it: a tar holding fake-images.json. */
+export function fakeBundle(images) {
+  const data = Buffer.from(JSON.stringify({ images }));
+  const h = Buffer.alloc(512);
+  h.write('fake-images.json', 0); h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116);
+  h.write(`${data.length.toString(8).padStart(11, '0')}\0`, 124); h.write('00000000000\0', 136);
+  h.write('        ', 148); h.write('0', 156); h.write('ustar\0', 257); h.write('00', 263);
+  let sum = 0; for (const b of h) sum += b;
+  h.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148);
+  return Buffer.concat([h, data, Buffer.alloc((512 - (data.length % 512)) % 512), Buffer.alloc(1024)]);
 }

@@ -8,7 +8,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { API_IMAGES, BASE_PATH, CP_IMAGE, LABELS, UPSTREAM_REVISION, UPSTREAM_TAG } from './pins.js';
+import { API_IMAGES, BASE_PATH, CP_IMAGE, LABELS, UPSTREAM_REVISION } from './pins.js';
+import { isPinnedApiImage } from './trust.js';
 import { AppError, describeError, toAppError } from './errors.js';
 import { validateSettings, embeddingsFingerprint, containerSettingsHash } from './settings.js';
 import { apiSpec, cpSpec, embeddingsEnv } from './containerSpec.js';
@@ -53,6 +54,7 @@ function pidAlive(pid) {
  * @param {ReturnType<import('./docker.js').createDocker>} o.docker
  * @param {ReturnType<import('./settings.js').createSettingsStore>} o.settings
  * @param {ReturnType<import('./secrets.js').createSecretsStore>} o.secrets
+ * @param {ReturnType<import('./trust.js').createCpTrust>} o.cpTrust
  * @param {ReturnType<import('./containerSpec.js').resourceNames>} o.names
  * @param {string} o.owner ownership label value (containerSpec.ownerId)
  * @param {string} o.dataDir
@@ -65,12 +67,15 @@ function pidAlive(pid) {
  * @param {boolean} [o.watch] poll health while ready (tests drive `checkHealth()` instead)
  */
 export function createSupervisor({
-  docker, settings: settingsStore, secrets: secretsStore, names, owner, dataDir,
+  docker, settings: settingsStore, secrets: secretsStore, cpTrust, names, owner, dataDir,
   detectBind, fetchCcModels, cpSession, probe = httpProbe, clock = realClock, timeouts = {}, watch = true,
   log = (m) => console.error(`code-hindsight: ${m}`),
 }) {
   const T = { ...DEFAULT_TIMEOUTS, ...timeouts };
   const stoppingFile = path.join(dataDir, 'stopping.json');
+  const shutdownFailedFile = path.join(dataDir, 'shutdown-failed.json');
+  /** A previous backend's failed SIGTERM stop, shown until Hindsight is next ready. */
+  let lastShutdownFailure = readJsonFile(shutdownFailedFile, null);
   let state = 'stopped';
   let error = null;
   let startedAt = null;
@@ -82,7 +87,8 @@ export function createSupervisor({
   let wantRunning = false;
   let generation = 0;
   let queue = Promise.resolve();
-  let watching = false;
+  /** Bumped to end the running watch loop; each loop runs only while its token is current. */
+  let watchToken = 0;
   let watchFailures = 0;
 
   const set = (s, e = null) => { state = s; error = e; };
@@ -121,17 +127,21 @@ export function createSupervisor({
     const cp = await docker.inspectImage(CP_IMAGE);
     const apiLabels = api?.Config?.Labels ?? {};
     const cpLabels = cp?.Config?.Labels ?? {};
+    const trusted = cpTrust.get();
+    const built = !!cp && cpLabels[LABELS.basePath] === BASE_PATH && cpLabels[LABELS.upstream] === UPSTREAM_REVISION;
     images = {
       api: {
         ref: want.ref, present: !!api, id: api?.Id ?? null,
         version: apiLabels['org.opencontainers.image.version'] ?? null,
-        revision: apiLabels['org.opencontainers.image.revision'] ?? null,
-        ok: !!api && apiLabels['org.opencontainers.image.version'] === want.version && apiLabels['org.opencontainers.image.revision'] === UPSTREAM_REVISION,
+        // Trusted by ID only: labels and tags are whatever a `docker load` said.
+        ok: !!api && isPinnedApiImage(variant, api.Id),
       },
       cp: {
         ref: CP_IMAGE, present: !!cp, id: cp?.Id ?? null,
         basePath: cpLabels[LABELS.basePath] ?? null, upstream: cpLabels[LABELS.upstream] ?? null,
-        ok: !!cp && cpLabels[LABELS.basePath] === BASE_PATH && cpLabels[LABELS.upstream] === UPSTREAM_TAG,
+        built,
+        trusted: !!cp && trusted?.id === cp.Id,
+        ok: built && trusted?.id === cp.Id,
       },
     };
     return { api, cp, want };
@@ -215,9 +225,10 @@ export function createSupervisor({
 
     const { api, cp, want } = await inspectImages(settings.variant);
     if (!api) throw new AppError('IMAGE_MISSING', { image: want.ref });
-    if (!images.api.ok) throw new AppError('IMAGE_MISMATCH', { image: want.ref, found: `${images.api.version ?? '?'} (${String(images.api.revision ?? '?').slice(0, 12)})`, expected: `${want.version} (${UPSTREAM_REVISION.slice(0, 12)})` });
+    if (!images.api.ok) throw new AppError('IMAGE_MISMATCH', { image: want.ref, id: api.Id, version: images.api.version, expected: want.version });
     if (!cp) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
-    if (!images.cp.ok) throw new AppError('CP_IMAGE_MISMATCH', { image: CP_IMAGE, found: `${images.cp.basePath ?? '?'} @ ${images.cp.upstream ?? '?'}`, expected: `${BASE_PATH} @ ${UPSTREAM_TAG}` });
+    if (!images.cp.built) throw new AppError('CP_IMAGE_MISMATCH', { image: CP_IMAGE, found: `${images.cp.basePath ?? '?'} @ ${images.cp.upstream ?? '?'}`, expected: `${BASE_PATH} @ ${UPSTREAM_REVISION}` });
+    if (!images.cp.trusted) throw new AppError('CP_IMAGE_UNTRUSTED', { image: CP_IMAGE, id: cp.Id });
 
     const baseLabels = { [LABELS.managed]: '1', [LABELS.owner]: owner };
     await ensureOwned('network', names.network, docker.inspectNetwork, () => docker.createNetwork(names.network, baseLabels));
@@ -231,9 +242,9 @@ export function createSupervisor({
     set('starting');
     const secrets = secretsStore.get();
     const llmEnv = await composeLlmEnv(settings, secrets, { fetchCcModels });
-    const apiS = apiSpec({ names, image: { ref: want.ref, id: api.Id }, variant: settings.variant, bind, port: ports.api, apiKey: secrets.apiKey, llmEnv, embeddingsEnv: embeddingsEnv(settings, secrets), owner });
+    const apiS = apiSpec({ names, image: { id: api.Id }, variant: settings.variant, bind, port: ports.api, apiKey: secrets.apiKey, llmEnv, embeddingsEnv: embeddingsEnv(settings, secrets), owner });
     await adoptOrCreate(apiS, api.Id, 'apiPort');
-    const cpS = cpSpec({ names, image: { ref: CP_IMAGE, id: cp.Id }, bind, port: ports.cp, apiKey: secrets.apiKey, accessKey: secrets.cpAccessKey, owner });
+    const cpS = cpSpec({ names, image: { id: cp.Id }, bind, port: ports.cp, apiKey: secrets.apiKey, accessKey: secrets.cpAccessKey, owner });
     await adoptOrCreate(cpS, cp.Id, 'cpPort');
     await inspectContainers();
     checkCancelled(gen);
@@ -247,6 +258,7 @@ export function createSupervisor({
     startedAt = new Date(clock.now()).toISOString();
     await inspectContainers();
     set('ready');
+    if (lastShutdownFailure) { lastShutdownFailure = null; fs.rmSync(shutdownFailedFile, { force: true }); }
     startWatch();
   }
 
@@ -265,18 +277,18 @@ export function createSupervisor({
   }
 
   function startWatch() {
-    if (!watch || watching) return;
-    watching = true;
+    if (!watch) return;
+    const token = ++watchToken; // ends any earlier loop
     watchFailures = 0;
     (async () => {
-      while (watching) {
+      for (;;) {
         await clock.sleep(T.watchMs);
-        if (!watching) break;
+        if (token !== watchToken) break;
         await checkHealth().catch((e) => log(`watch: ${e?.message ?? e}`));
       }
     })();
   }
-  function stopWatch() { watching = false; }
+  function stopWatch() { watchToken++; }
 
   /** One watch step: probe the API, and on failure tell a crash from a hang. */
   async function checkHealth() {
@@ -380,8 +392,17 @@ export function createSupervisor({
     async shutdown() {
       generation++;
       stopWatch();
-      if (!docker.info().mode) return null;
-      const pid = await docker.stopDetached([names.cp, names.api], T.stopSeconds);
+      let pid;
+      try {
+        pid = await docker.stopDetached([names.cp, names.api], T.stopSeconds);
+      } catch (e) {
+        // No pid to wait for: record the failure instead of a stopping.json the next backend
+        // would read as "a stop is under way".
+        const detail = e?.message ?? String(e);
+        log(`shutdown: could not stop the containers: ${detail}`);
+        writePrivateFileAtomic(shutdownFailedFile, JSON.stringify({ at: new Date(clock.now()).toISOString(), error: detail }));
+        return null;
+      }
       writePrivateFileAtomic(stoppingFile, JSON.stringify({ pid, at: clock.now() }));
       return pid;
     },
@@ -402,6 +423,7 @@ export function createSupervisor({
         startedAt: state === 'ready' ? startedAt : null,
         pendingRestart: state === 'ready' && appliedKey !== null && appliedKeyOf(settings) !== appliedKey,
         volume: names.volume,
+        lastShutdownFailure,
         llmMode: settings.llm.mode,
       };
     },

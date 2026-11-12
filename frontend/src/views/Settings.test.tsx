@@ -49,6 +49,26 @@ describe('Settings', () => {
     expect(putBody(calls).secrets).toEqual({ llmApiKey: 'sk-new' });
   });
 
+  // S4: the embeddings key refusal shows on the key field; a cleared key is reported.
+  it('shows EMBEDDINGS_NEEDS_KEY on the key field and reports keys removed by an endpoint change', async () => {
+    const view = settingsView({ secrets: { llmApiKey: true, embeddingsApiKey: false } });
+    view.settings.embeddings = { provider: 'openai', model: 'e', baseUrl: null };
+    let attempt = 0;
+    stubFetch((url, init) => {
+      if (url !== '-/api/settings') return undefined;
+      if (!init) return { body: view };
+      attempt++;
+      if (attempt === 1) return { status: 400, body: { code: 'SETTINGS_INVALID', message: 'x', params: { fields: [{ field: 'embeddings.key', code: 'EMBEDDINGS_NEEDS_KEY', message: 'remote embeddings need their own API key' }] } } };
+      return { body: { ...view, secrets: { llmApiKey: false, embeddingsApiKey: true }, cleared: ['llmApiKey'] } };
+    });
+    render(<Settings onSaved={() => {}} onApply={() => {}} busy={false} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(document.querySelector('[data-field="embeddings.key"] [data-error-code="EMBEDDINGS_NEEDS_KEY"]')).not.toBeNull());
+    await userEvent.type(screen.getByLabelText('Embeddings API key'), 'ek');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect((await screen.findByRole('status')).textContent).toMatch(/Removed the stored LLM key/);
+  });
+
   // Spec 7: the cc-backend picker lists cc's backends; loopback ones are disabled with the reason.
   it('lists cc backends and disables unusable ones', async () => {
     const view = settingsView();

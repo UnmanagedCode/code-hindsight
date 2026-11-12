@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
-import { boot, goodApiImage, goodCpImage, dockerCalls } from './helpers.mjs';
+import { boot, goodApiImage, goodCpImage, dockerCalls, fakeBundle } from './helpers.mjs';
 import { API_IMAGES, CP_IMAGE } from '../src/pins.js';
 import { bundleName } from '../src/jobs.js';
 
@@ -76,6 +76,38 @@ test('settings: keys are write-only and no route ever returns a key', async (t) 
   assert.equal(fs.readFileSync(path.join(r.dataDir, 'settings.json'), 'utf8').includes('sk-SECRET-LLM'), false);
 });
 
+// S4: a stored key follows its endpoint: repointing the provider or URL without the key clears it.
+test('changing the LLM URL without resending its key clears the key; resending keeps it', async (t) => {
+  const { url, app } = await boot(t, { seed: { images: {} } });
+  const view = await (await fetch(`${url}/-/api/settings`)).json();
+  const manual = (baseUrl) => ({ ...view.settings, llm: { mode: 'manual', provider: 'openai', model: 'm', baseUrl, backendId: null } });
+  assert.equal((await put(`${url}/-/api/settings`, { settings: manual('https://a.example/v1'), secrets: { llmApiKey: 'sk-A' } })).status, 200);
+  const same = await (await put(`${url}/-/api/settings`, { settings: { ...manual('https://a.example/v1'), network: { ...view.settings.network, apiPort: 18899 } } })).json();
+  assert.deepEqual(same.cleared, []);
+  assert.equal(app.secrets.get().llmApiKey, 'sk-A', 'an unrelated change keeps the key');
+
+  const moved = await (await put(`${url}/-/api/settings`, { settings: manual('https://evil.example/v1') })).json();
+  assert.deepEqual(moved.cleared, ['llmApiKey']);
+  assert.equal(moved.secrets.llmApiKey, false);
+  assert.equal(app.secrets.get().llmApiKey, undefined, 'the key never reaches the new URL');
+
+  const resent = await (await put(`${url}/-/api/settings`, { settings: manual('https://b.example/v1'), secrets: { llmApiKey: 'sk-B' } })).json();
+  assert.deepEqual(resent.cleared, []);
+  assert.equal(app.secrets.get().llmApiKey, 'sk-B');
+});
+
+test('repointing remote embeddings without their key is refused and keeps the stored key', async (t) => {
+  const { url, app } = await boot(t, { seed: { images: {} } });
+  const view = await (await fetch(`${url}/-/api/settings`)).json();
+  const emb = (baseUrl) => ({ ...view.settings, embeddings: { provider: 'openai', model: 'e', baseUrl } });
+  assert.equal((await put(`${url}/-/api/settings`, { settings: emb('https://e.example/v1'), secrets: { embeddingsApiKey: 'ek' } })).status, 200);
+  const res = await put(`${url}/-/api/settings`, { settings: emb('https://evil.example/v1') });
+  assert.equal(res.status, 400);
+  assert.deepEqual((await res.json()).params.fields.map((f) => f.code), ['EMBEDDINGS_NEEDS_KEY']);
+  assert.equal(app.secrets.get().embeddingsApiKey, 'ek', 'a refused save changes nothing');
+  assert.equal(app.settings.get().embeddings.baseUrl, 'https://e.example/v1');
+});
+
 // Spec 2: slim refusals surface by code on save.
 test('saving slim with local embeddings is refused 400 with the named field codes', async (t) => {
   const { url } = await boot(t, { seed: { images: {} } });
@@ -92,12 +124,15 @@ test('saving slim with local embeddings is refused 400 with the named field code
 // Cross-site writes are refused on every state-changing route.
 test('state-changing routes need JSON (415) and refuse cross-site requests (403)', async (t) => {
   const { url, r } = await boot(t, { seed: { images: {} } });
-  const asForm = await fetch(`${url}/-/api/stop`, { method: 'POST', headers: { 'content-type': 'text/plain' }, body: '{}' });
+  const asForm = await fetch(`${url}/-/api/stop`, { method: 'POST', headers: { 'content-type': 'text/plain', 'sec-fetch-site': 'same-origin' }, body: '{}' });
   assert.equal(asForm.status, 415);
   assert.match(asForm.headers.get('content-security-policy'), /default-src 'none'/);
   assert.equal((await post(`${url}/-/api/stop`, {}, { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' })).status, 403);
   assert.equal((await post(`${url}/-/api/jobs/pull`, { variant: 'full' }, { 'content-type': 'application/json', origin: 'https://evil.example' })).status, 403);
   assert.equal((await fetch(`${url}/-/api/jobs/import`, { method: 'POST', headers: { 'content-type': 'application/octet-stream', 'sec-fetch-site': 'cross-site' }, body: 'x' })).status, 403);
+  // S5: a mutation without Sec-Fetch-Site (no browser vouching for it) is refused too.
+  assert.equal((await post(`${url}/-/api/jobs/pull`, { variant: 'full' }, { 'content-type': 'application/json' })).status, 403);
+  assert.equal((await fetch(`${url}/-/api/status`)).status, 200, 'reads need no fetch metadata');
   assert.ok(!dockerCalls(r).some((a) => a[0] === 'pull' || a[0] === 'load'));
 });
 
@@ -118,11 +153,11 @@ test('jobs: pull, upload-import, export and bundle download', async (t) => {
   for (let i = 0; i < 100 && job?.state !== 'done'; i++) { job = await (await fetch(`${url}/-/api/jobs/${started.id}`)).json(); await new Promise((res) => setTimeout(res, 20)); }
   assert.equal(job.state, 'done');
 
-  const upload = JSON.stringify({ images: { [CP_IMAGE]: goodCpImage(), [API_IMAGES.slim.ref]: goodApiImage('slim') } });
+  const upload = fakeBundle({ [CP_IMAGE]: goodCpImage(), [API_IMAGES.slim.ref]: goodApiImage('slim') });
   const imp = await fetch(`${url}/-/api/jobs/import`, { method: 'POST', headers: { 'content-type': 'application/octet-stream', 'sec-fetch-site': 'same-origin' }, body: upload });
   const impJob = await imp.json();
   assert.equal(impJob.state, 'done', JSON.stringify(impJob.error));
-  assert.deepEqual(impJob.result.loaded.sort(), [API_IMAGES.slim.ref, CP_IMAGE].sort());
+  assert.deepEqual(impJob.result.loaded.map((l) => l.ref).sort(), [API_IMAGES.slim.ref, CP_IMAGE].sort());
 
   const exp = await (await post(`${url}/-/api/jobs/export`, { variant: 'full' })).json();
   for (let i = 0; i < 100 && (await (await fetch(`${url}/-/api/jobs/${exp.id}`)).json()).state === 'running'; i++) await new Promise((res) => setTimeout(res, 20));
@@ -177,7 +212,7 @@ test('static UI: 503 while unbuilt, host URLs 404, allowlisted files only, CSP a
     assert.ok(res.headers.get('content-security-policy'), `${p} carries a CSP`);
   }
   // A CP path while Hindsight is not running is the not-ready page, not the shell.
-  const cpPath = await fetch(`${built.url}/dashboard`);
+  const cpPath = await fetch(`${built.url}/dashboard`, { headers: { 'sec-fetch-site': 'none' } });
   assert.equal(cpPath.status, 503);
   assert.match(await cpPath.text(), /not running/);
 });

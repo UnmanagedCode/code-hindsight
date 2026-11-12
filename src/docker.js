@@ -8,8 +8,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { AppError } from './errors.js';
 import { writePrivateFileAtomic } from './fsPrivate.js';
+import { isPinnedHelper } from './trust.js';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
+/** The Docker host's socket, mounted into the build helper so its buildx drives the same daemon. */
+const HOST_DOCKER_SOCKET = '/var/run/docker.sock';
 const MAX_CAPTURE = 4 * 1024 * 1024;
 const TAIL_BYTES = 8 * 1024;
 
@@ -39,6 +42,8 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
   const pinned = new Set(images);
   let resolving = null;
   let info = { mode: null, serverVersion: null };
+  /** The last invocation that worked; survives `reset()` so a shutdown can still stop containers. */
+  let lastMode = null;
 
   function assertOwnedName(name) {
     if (typeof name !== 'string' || !(name === prefix || name.startsWith(`${prefix}-`))) {
@@ -119,7 +124,7 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
   async function resolve() {
     if (!resolving) {
       resolving = doResolve().then(
-        (r) => { info = r; return r; },
+        (r) => { info = r; lastMode = r.mode; return r; },
         (e) => { resolving = null; info = { mode: null, serverVersion: null }; throw e; },
       );
     }
@@ -204,14 +209,27 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
 
     /**
      * Stop containers in a process that outlives this one (own process group), so the
-     * database shuts down cleanly after cc's grace period kills the backend. Returns the pid.
+     * database shuts down cleanly after cc's grace period kills the backend. Uses the current
+     * invocation, else the last one that worked, else a resolve bounded by `resolveMs`.
+     * Returns the pid; throws when no invocation is known or the process could not start.
      */
-    async stopDetached(names, seconds = 30) {
+    async stopDetached(names, seconds = 30, { resolveMs = 1500 } = {}) {
       names.forEach(assertOwnedName);
-      const { mode } = await resolve();
+      let mode = info.mode ?? lastMode;
+      if (!mode) {
+        const r = await Promise.race([resolve().catch((e) => ({ error: e })), new Promise((res) => setTimeout(() => res({ error: new Error(`docker did not resolve within ${resolveMs} ms`) }), resolveMs).unref())]);
+        if (r.error) throw r.error;
+        mode = r.mode;
+      }
       const [cmd, full] = argv(mode, ['stop', '-t', String(seconds), ...names]);
-      const child = spawn(cmd, full, { detached: true, stdio: 'ignore', env });
+      let child;
+      try {
+        child = spawn(cmd, full, { detached: true, stdio: 'ignore', env });
+      } catch (e) {
+        throw new Error(`could not start ${cmd}: ${e.message}`);
+      }
       child.on('error', () => {});
+      if (child.pid === undefined) throw new Error(`could not start ${cmd}`);
       child.unref();
       return child.pid;
     },
@@ -222,10 +240,14 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
     /** `docker save` streamed into `sink` (written by this process, so a sudo docker never owns the file). */
     save: (refs, sink) => exec(['save', ...refs.map(assertPinnedImage)], { stdout: sink, timeoutMs: 60 * 60_000 }),
     removeImages: (refs) => exec(['rmi', ...refs.map(assertPinnedImage)]),
-    /** Run the pinned build helper; `args` are `docker run` arguments after the helper's own name. */
-    runHelper(name, runArgs, onLine) {
+    /**
+     * Run the build helper with the host's Docker socket mounted. Only an image whose ID is
+     * pinned (BUILD_HELPER.ids) gets the socket, and it is run by that ID, never by a tag.
+     */
+    runHelper(name, imageId, command, onLine) {
       assertOwnedName(name);
-      return exec(['run', '--rm', '--name', name, ...runArgs], { onLine, timeoutMs: 2 * 60 * 60_000 });
+      if (!isPinnedHelper(imageId)) throw new Error(`refusing to give the Docker socket to image ${imageId}: not the pinned build helper`);
+      return exec(['run', '--rm', '--name', name, '-v', `${HOST_DOCKER_SOCKET}:${HOST_DOCKER_SOCKET}`, imageId, ...command], { onLine, timeoutMs: 2 * 60 * 60_000 });
     },
   };
 }

@@ -32,6 +32,8 @@ const SHAPE = {
 
 const clone = (o) => JSON.parse(JSON.stringify(o));
 const IPV4 = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+/** An IPv4 unicast host address: not 0.0.0.0/8, multicast (224/4) or reserved/broadcast (240/4). */
+const isUnicastHost = (ip) => { const first = Number(ip.split('.')[0]); return first !== 0 && first < 224; };
 const nonEmpty = (v, max = 200) => typeof v === 'string' && v.trim() !== '' && v.length <= max;
 const isHttpUrl = (v) => {
   try { const u = new URL(v); return u.protocol === 'http:' || u.protocol === 'https:'; } catch { return false; }
@@ -40,7 +42,7 @@ const isHttpUrl = (v) => {
 /**
  * Normalize and validate a full settings object.
  * @param {unknown} input
- * @param {{embeddingsApiKey?: boolean}} [has] which write-only secrets are set
+ * @param {{embeddingsApiKey?: boolean}} [has] which write-only secrets are set (after the request)
  * @returns {{settings: object, errors: {field: string, code?: string, message: string}[]}}
  */
 export function validateSettings(input, has = {}) {
@@ -66,6 +68,7 @@ export function validateSettings(input, has = {}) {
 
   const n = settings.network;
   if (n.bindAddress !== null && !(typeof n.bindAddress === 'string' && IPV4.test(n.bindAddress))) err('network.bindAddress', 'must be an IPv4 address, or empty for automatic');
+  else if (n.bindAddress !== null && !isUnicastHost(n.bindAddress)) err('network.bindAddress', 'must be one host address: not unspecified (0.x), multicast, reserved or broadcast');
   for (const f of ['apiPort', 'cpPort']) {
     if (!Number.isInteger(n[f]) || n[f] < 1024 || n[f] > 65535) err(`network.${f}`, 'must be a port from 1024 to 65535');
   }
@@ -89,16 +92,25 @@ export function validateSettings(input, has = {}) {
   if (e.baseUrl !== null && !isHttpUrl(e.baseUrl)) err('embeddings.baseUrl', 'must be an http(s) URL, or empty');
   if (!RERANKER_PROVIDERS.includes(settings.reranker.provider)) err('reranker.provider', `must be one of ${RERANKER_PROVIDERS.join(', ')}`);
 
+  // Without a key of its own, Hindsight falls back to the LLM key for remote embeddings.
+  if (e.provider !== 'local' && !has.embeddingsApiKey) err('embeddings.key', 'remote embeddings need their own API key', 'EMBEDDINGS_NEEDS_KEY');
   if (settings.variant === 'slim') {
-    const remoteReady = e.provider === 'openai' && (has.embeddingsApiKey || e.baseUrl);
-    if (SLIM_REFUSED.embeddings.includes(e.provider) || (e.provider !== 'local' && !remoteReady)) {
-      err('embeddings.provider', 'the slim image needs remote embeddings with a key or a base URL', 'SLIM_NEEDS_REMOTE_EMBEDDINGS');
+    if (SLIM_REFUSED.embeddings.includes(e.provider)) {
+      err('embeddings.provider', 'the slim image needs remote embeddings', 'SLIM_NEEDS_REMOTE_EMBEDDINGS');
     }
     if (SLIM_REFUSED.reranker.includes(settings.reranker.provider)) {
       err('reranker.provider', 'the slim image needs a reranker without a local model', 'SLIM_NEEDS_RERANKER');
     }
   }
   return { settings, errors };
+}
+
+/** The settings each user key is bound to: changing them without resending the key clears it. */
+export function keyEndpoints(settings) {
+  return {
+    llmApiKey: JSON.stringify([settings.llm.mode, settings.llm.provider, settings.llm.baseUrl]),
+    embeddingsApiKey: JSON.stringify([settings.embeddings.provider, settings.embeddings.baseUrl]),
+  };
 }
 
 /** What the stored memories' vectors depend on: switching it on an existing volume breaks recall. */

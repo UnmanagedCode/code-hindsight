@@ -12,7 +12,6 @@ import { securityHeaders } from './http.js';
 const CONNECT_TIMEOUT_MS = 10_000;
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'te', 'trailer', 'upgrade', 'host']);
 const DROP_UPSTREAM = /^(x-forwarded-|forwarded$|x-real-ip$)/;
-const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 /** A CP `Location` as cc expects to receive it: root-relative without the base path, or untouched. */
 export function rewriteLocation(location, upstreamOrigin) {
@@ -49,12 +48,14 @@ export function rewriteSetCookies(lines) {
   return out;
 }
 
-/** True for a request a cross-site page could have made: refuse it before injecting credentials. */
+/**
+ * True unless the browser says the request comes from this origin (`Sec-Fetch-Site:
+ * same-origin`) or from the user (`none`: typed URL, bookmark). A request without the header
+ * (a non-browser client, or a browser too old to send it) counts as cross-site.
+ */
 export function isCrossSite(req) {
-  if (SAFE_METHODS.has(req.method)) return false;
   const site = req.headers['sec-fetch-site'];
-  if (site !== undefined) return site !== 'same-origin' && site !== 'none';
-  return req.headers.origin !== undefined;
+  return site !== 'same-origin' && site !== 'none';
 }
 
 const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -90,9 +91,11 @@ const needsLogin = (up) => (up.statusCode === 401 && up.headers['x-hindsight-ses
  */
 export function createCpProxy({ target, session, notReadyError = () => null }) {
   return async function proxy(req, res) {
+    // The proxy adds the CP session to what it forwards, and some CP GETs act (an export), so
+    // every method is refused unless the browser vouches it comes from this origin.
+    if (isCrossSite(req)) return sendJson(res, 403, describeError('CROSS_SITE'));
     const t = target();
     if (!t) return sendNotReady(res, notReadyError());
-    if (isCrossSite(req)) return sendJson(res, 403, describeError('CROSS_SITE'));
 
     const q = req.url.indexOf('?');
     const pathname = q === -1 ? req.url : req.url.slice(0, q);

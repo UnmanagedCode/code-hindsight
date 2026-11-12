@@ -10,6 +10,7 @@ export const ACTIONS = Object.freeze({
   restart: 'restart',
   settings: 'settings',
   stop: 'stop',
+  trust: 'trust-cp',
 });
 
 const s = (v) => (v === undefined || v === null ? '' : String(v));
@@ -44,8 +45,8 @@ export const CATALOG = Object.freeze({
     action: ACTIONS.pull, status: 409,
   },
   IMAGE_MISMATCH: {
-    title: 'The Hindsight image is a different release',
-    message: (p) => `${s(p.image)} is ${s(p.found)}, not the pinned release ${s(p.expected)}. Pull it again, or import the matching bundle.`,
+    title: 'The Hindsight image is not the pinned one',
+    message: (p) => `${s(p.image)} has image ID ${s(p.id)}${p.version ? ` (version label ${s(p.version)})` : ''}, which is not a pinned ID of release ${s(p.expected)}. It is not run. Pull it again, or import a bundle of the pinned release.`,
     action: ACTIONS.pull, status: 409,
   },
   CP_IMAGE_MISSING: {
@@ -57,6 +58,16 @@ export const CATALOG = Object.freeze({
     title: 'The control-plane image was built for something else',
     message: (p) => `${s(p.image)} carries ${s(p.found)}; this plugin needs ${s(p.expected)}. Build it again.`,
     action: ACTIONS.build, status: 409,
+  },
+  CP_IMAGE_UNTRUSTED: {
+    title: 'The control-plane image is not one this plugin built or you trusted',
+    message: (p) => `${s(p.image)} has image ID ${s(p.id)}. An image from an import or another build runs only after you confirm its ID on Images & data — or build it here.`,
+    action: ACTIONS.trust, status: 409,
+  },
+  HELPER_UNTRUSTED: {
+    title: 'The build helper image is not the pinned one',
+    message: (p) => `${s(p.image)} resolved to image ID ${s(p.id)}, which is not pinned. It is not given the Docker socket. Remove that image and build again.`,
+    action: null, status: 409,
   },
   NAME_TAKEN: {
     title: 'A Docker resource with this plugin\'s name belongs to someone else',
@@ -123,6 +134,11 @@ export const CATALOG = Object.freeze({
     message: () => 'The slim image ships no local reranker model. Choose a reranker that needs no local model, or use the full image.',
     action: ACTIONS.settings, status: 400,
   },
+  EMBEDDINGS_NEEDS_KEY: {
+    title: 'Remote embeddings need their own key',
+    message: () => 'Set an embeddings API key. Hindsight would otherwise send the LLM key to the embeddings endpoint.',
+    action: ACTIONS.settings, status: 400,
+  },
   SETTINGS_INVALID: {
     title: 'The settings are not valid',
     message: (p) => (Array.isArray(p.fields) ? p.fields.map((f) => `${f.field}: ${f.message}`).join('; ') : 'invalid settings'),
@@ -156,7 +172,7 @@ export const CATALOG = Object.freeze({
   BAD_REQUEST: { title: 'Bad request', message: (p) => s(p.detail), action: null, status: 400 },
   NOT_FOUND: { title: 'Not found', message: (p) => s(p.detail), action: null, status: 404 },
   UNSUPPORTED_MEDIA_TYPE: { title: 'Unsupported content type', message: (p) => `Send ${s(p.expected)}.`, action: null, status: 415 },
-  CROSS_SITE: { title: 'Cross-site request refused', message: () => 'State-changing requests must come from this page.', action: null, status: 403 },
+  CROSS_SITE: { title: 'Cross-site request refused', message: () => 'This request must come from the plugin page (Sec-Fetch-Site: same-origin or none).', action: null, status: 403 },
   NOT_READY: { title: 'Hindsight is not running', message: () => 'Open Status to start it.', action: ACTIONS.start, status: 503 },
 });
 

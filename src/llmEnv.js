@@ -2,6 +2,7 @@
 // (provider, model, URL and key from Settings), and cc-backend: a live link to one of cc's
 // Anthropic-compatible backend rows, read from cc at each container (re)create. A linked
 // token goes straight into the container env; it is never stored, logged or returned.
+import net from 'node:net';
 import { AppError } from './errors.js';
 
 const FETCH_TIMEOUT_MS = 10_000;
@@ -23,9 +24,46 @@ export async function fetchCcModels(conductorUrl, { fetchImpl = fetch } = {}) {
   }
 }
 
-export function isLoopbackHost(host) {
-  const h = String(host).toLowerCase().replace(/^\[|\]$/g, '');
-  return h === 'localhost' || h.endsWith('.localhost') || h === '::1' || /^127\.\d+\.\d+\.\d+$/.test(h) || h === '0.0.0.0';
+/** IPv6 text → its eight 16-bit words (an embedded dotted IPv4 tail included), or null. */
+function ipv6Words(h) {
+  let text = h;
+  const v4 = /(\d+\.\d+\.\d+\.\d+)$/.exec(text);
+  if (v4) {
+    const o = v4[1].split('.').map(Number);
+    text = `${text.slice(0, -v4[1].length)}${((o[0] << 8) | o[1]).toString(16)}:${((o[2] << 8) | o[3]).toString(16)}`;
+  }
+  const [head, tail, extra] = text.split('::');
+  if (extra !== undefined) return null;
+  const a = head ? head.split(':') : [];
+  const b = tail === undefined ? [] : tail ? tail.split(':') : [];
+  const fill = tail === undefined ? 0 : 8 - a.length - b.length;
+  const words = [...a, ...Array(fill).fill('0'), ...b].map((w) => parseInt(w, 16));
+  return words.length === 8 && words.every((w) => w >= 0 && w <= 0xffff) ? words : null;
+}
+
+/**
+ * Whether a URL hostname names this machine's loopback (or the unspecified address).
+ * Best-effort over literal addresses and `localhost`: pass a WHATWG `URL().hostname`, which
+ * already normalizes IPv4 shorthand (`127.1`, `2130706433`, `0x7f000001`) and IPv6 forms.
+ * Names are not resolved through DNS.
+ */
+export function isLoopbackHost(hostname) {
+  let h = String(hostname).toLowerCase();
+  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  if (h.endsWith('.')) h = h.slice(0, -1);
+  if (h === 'localhost' || h.endsWith('.localhost')) return true;
+  const kind = net.isIP(h);
+  if (kind === 4) return h.startsWith('127.') || h === '0.0.0.0';
+  if (kind !== 6) return false;
+  const w = ipv6Words(h);
+  if (!w) return false;
+  if (w.slice(0, 7).every((x) => x === 0) && (w[7] === 1 || w[7] === 0)) return true; // ::1, ::
+  // IPv4-mapped (::ffff:a.b.c.d) and IPv4-compatible (::a.b.c.d): judge the IPv4 address.
+  if (w.slice(0, 5).every((x) => x === 0) && (w[5] === 0xffff || w[5] === 0)) {
+    const v4 = `${w[6] >> 8}.${w[6] & 0xff}.${w[7] >> 8}.${w[7] & 0xff}`;
+    return v4.startsWith('127.') || v4 === '0.0.0.0';
+  }
+  return false;
 }
 
 /** cc's registry rows, checked for the shape this module reads. */

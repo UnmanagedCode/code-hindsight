@@ -3,6 +3,9 @@
 // Browser: CODE_HINDSIGHT_CDP_URL (a Code Browser CDP endpoint, connectOverCDP) or
 // CODE_HINDSIGHT_CHROMIUM (a local Chromium/Chrome executable, launched headless).
 import { test } from 'node:test';
+import fs from 'node:fs';
+import path from 'node:path';
+import { REPO } from './helpers.mjs';
 import assert from 'node:assert/strict';
 import { bootRealStack, hindsightApi, realSkipReason } from './support/realStack.mjs';
 import { startCcFront } from './support/ccFront.mjs';
@@ -15,7 +18,10 @@ const skip = realSkipReason('full') ?? (!cdp && !chromium ? 'set CODE_HINDSIGHT_
 // Spec 6: the CP UI works at /plugins/code-hindsight/ from the basePath build — fetches,
 // redirects and navigation stay under the prefix beyond the documented raw-URL gap.
 test('control plane under the cc prefix in a real browser', { skip, timeout: 15 * 60_000 }, async (t) => {
-  const { app, url, prefix } = await bootRealStack(t);
+  const dist = path.join(REPO, 'frontend', 'dist');
+  const shell = fs.existsSync(path.join(dist, 'index.html'));
+  if (!shell) t.diagnostic('frontend/dist not built: the cc-frame → shell → CP-frame step is skipped (npm run prepare)');
+  const { app, url, prefix } = await bootRealStack(t, { distDir: shell ? dist : undefined });
   await app.supervisor.ensureRunning();
   assert.equal(app.supervisor.status().state, 'ready', JSON.stringify(app.supervisor.status().error));
   const conn = app.supervisor.connection();
@@ -37,7 +43,7 @@ test('control plane under the cc prefix in a real browser', { skip, timeout: 15 
   const browser = cdp ? await pw.connectOverCDP(cdp) : await pw.launch({ executablePath: chromium });
   t.after(() => browser.close());
 
-  const evidence = await runBasePathChecks({ browser, front, bankId, poisonSession: () => { poisoned = true; }, relogins: () => relogins });
+  const evidence = await runBasePathChecks({ browser, front, bankId, poisonSession: () => { poisoned = true; }, relogins: () => relogins, shell });
   t.diagnostic(`steps: ${evidence.steps.map((s) => s.name).join(', ')}`);
   t.diagnostic(`requests outside the prefix (known gap): ${evidence.rootRequests.join(', ') || 'none'}`);
 });

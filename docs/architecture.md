@@ -16,14 +16,16 @@ browser ── cc /plugins/code-hindsight/* ──► backend (node:http, 127.0.
 
 | Module | Responsibility |
 |---|---|
-| `pins.js` | the single source of the Hindsight release, image refs, CP build inputs, base path, resource prefix, label keys |
+| `pins.js` | the single source of the Hindsight release, image refs and pinned image IDs, the build helper's digest, CP build inputs, base path, resource prefix, label keys |
+| `trust.js` | which images may run: pinned-ID checks, the trusted CP image record (`trusted-cp.json`) |
+| `tarStream.js` | streaming tar: append the bundle manifest on export, read it on import |
 | `config.js` | env → `{port, dataDir, conductorUrl, pluginId, distDir}` |
 | `fsPrivate.js` | 0700 dirs, atomic 0600 files |
 | `settings.js` | settings shape, defaults, validation (incl. the slim rule), embeddings fingerprint, store |
 | `secrets.js` | generated and user keys in `secrets.json`; `has()` for the UI |
 | `netDetect.js` | automatic bind address from `/.dockerenv` and `/proc/net/route` |
 | `errors.js` | the error catalog (`CATALOG`), `AppError` |
-| `docker.js` | the only module that runs docker: invocation resolution (direct → `sudo -n`), error classification, name and image guards, env files, detached stop |
+| `docker.js` | the only module that runs docker: invocation resolution (direct → `sudo -n`), error classification, name and image guards, env files, detached stop, the socket-mounting helper run (pinned IDs only) |
 | `llmEnv.js` | LLM env for none / manual / cc-backend; cc backend summary for the picker |
 | `containerSpec.js` | pure builders of both containers' run args, env, labels and spec hash; resource names; owner id |
 | `supervisor.js` | Hindsight's state machine: start/adopt/recreate, health wait, watch, stop, restart, SIGTERM shutdown |
@@ -42,19 +44,26 @@ browser ── cc /plugins/code-hindsight/* ──► backend (node:http, 127.0.
   1. wait for a pending detached stop (`stopping.json`, pid alive and recent);
   2. resolve docker (`DOCKER_*`);
   3. validate the saved settings (`SETTINGS_INVALID`, `SLIM_*`);
-  4. check the API image's version/revision labels and the CP image's base-path/upstream labels (`IMAGE_*`, `CP_IMAGE_*`) — never pull;
+  4. check the API image's ID against the pins (`IMAGE_*`), the CP image's base-path/upstream labels (`CP_IMAGE_MISMATCH`) and its ID against `trusted-cp.json` (`CP_IMAGE_UNTRUSTED`) — never pull;
   5. network and volume: create with labels, or verify the owner (`NAME_TAKEN`) and the volume's embeddings fingerprint (`EMBEDDINGS_CHANGED`);
   6. compose the LLM env (cc-backend reads cc now);
-  7. API then CP container: missing → `run`; another owner → `NAME_TAKEN`; spec hash or image ID differs → stop, rm, `run` (volume kept); exited → `start`; running and matching → adopt;
+  7. API then CP container, run by the verified image ID: missing → `run`; another owner → `NAME_TAKEN`; spec hash or image ID differs → stop, rm, `run` (volume kept); exited → `start`; running and matching → adopt;
   8. wait for API `/health` 200 (detecting an exited container → `CRASHED`, timeout → `UNHEALTHY` with a log tail), then CP `<base path>/api/health`, then sign in to the CP → `ready`.
 - **Boot = apply.** Every backend start reconciles to the saved settings, so containers never run a spec the Settings page does not show. `pendingRestart` flags saved-but-not-applied settings while ready.
-- **Watch.** While ready, API `/health` is polled; an exited API or CP container is `CRASHED`, a running API failing several consecutive probes is `UNHEALTHY` (`DEFAULT_TIMEOUTS` in `src/supervisor.js`). Docker's `on-failure` restart policy handles transient crashes first.
+- **Watch.** While ready, one loop polls API `/health` (each start bumps a token that ends any earlier loop at its next wake, so restarts never stack loops); an exited API or CP container is `CRASHED`, a running API failing several consecutive probes is `UNHEALTHY` (`DEFAULT_TIMEOUTS` in `src/supervisor.js`). Docker's `on-failure` restart policy handles transient crashes first.
 - **Stop paths.**
   - *Stop button:* `docker stop` of both, containers and volume kept.
-  - *SIGTERM* (cc Stop, Disable, Restart, Update): cc SIGKILLs the process group after a short grace period, too short for Postgres. `shutdown()` spawns `docker stop -t 30 cp api` **detached** (own process group, outlives the backend), writes `stopping.json {pid, at}`, and the process exits. The next backend waits for that pid before reconciling.
+  - *SIGTERM* (cc Stop, Disable, Restart, Update): cc SIGKILLs the process group after a short grace period, too short for Postgres. `shutdown()` spawns `docker stop -t 30 cp api` **detached** (own process group, outlives the backend), writes `stopping.json {pid, at}`, and the process exits. The next backend waits for that pid before reconciling. The stop uses the current docker invocation, else the last one that worked (a settings save or a `DOCKER_DENIED` resets the current one), else a resolve bounded well inside the grace period. When the stop cannot start, `shutdown-failed.json` records why (no pid-less `stopping.json`), and Status shows it until Hindsight is next ready.
   - *cc restart:* cc re-adopts its running backends without signalling them; nothing happens.
   - *SIGKILL of the backend alone:* containers keep running until the next backend start adopts them.
-- **No implicit network or destructive operation.** The start path only inspects, creates the network/volume, and runs/starts/stops/removes this plugin's own containers. Pull, build, load, save, rmi and volume rm happen only in jobs.
+- **No implicit network or destructive operation.** The start path only inspects, creates the network/volume, and runs/starts/stops/removes this plugin's own containers. Pull, build, load, save, rmi and volume rm happen only in jobs, and only precondition jobs (pull, build-cp, import, trust-cp) may start Hindsight afterwards.
+
+## Image trust
+
+- Tags and labels are whatever the last `docker pull`, `load` or `tag` said, so neither decides what runs. An image's `.Id` is content-addressed: the API images and the build helper are pinned by ID in `pins.js`; the CP image, built locally, is trusted on first use (`build-cp` records the ID it built) or by an explicit confirm of a shown ID (`trust-cp`).
+- `.Id` is the index digest under the containerd image store and the per-platform config digest under the classic store; the pins list both forms.
+- The build helper is the only image given the Docker socket (root on the host): it is resolved by a digest reference, verified by ID, and run by ID (`runHelper` refuses any other).
+- Containers run by the verified ID, so a retag between the check and `docker run` cannot swap the image.
 
 ## CP embedding
 
@@ -64,7 +73,7 @@ browser ── cc /plugins/code-hindsight/* ──► backend (node:http, 127.0.
 
 ## Pins and bumping Hindsight
 
-`src/pins.js` holds the version, the upstream tag and its commit (the official images' `org.opencontainers.image.revision`), the per-variant image refs and version labels, the CP image tag, the build helper image (`docker:<version>-cli`, which carries buildx; it must not be newer than the daemon's API), and the base path. To bump: update those, run **Build CP image** and **Pull** (or import a bundle), then Start: the label checks refuse any image of another release.
+`src/pins.js` holds the version, the upstream commit (the official images' `org.opencontainers.image.revision`, which the CP is built from), the per-variant image refs, version labels and image IDs, the CP image tag, the build helper (`docker:<version>-cli` by digest with its IDs; it carries buildx and must not be newer than the daemon's API), and the base path. To bump: update those (an image's IDs: `docker image inspect` for the index digest, `docker buildx imagetools inspect --raw` of each platform manifest for the config digests), run **Build CP image** and **Pull** (or import a bundle), then Start: the ID checks refuse any image of another release.
 
 ## Tests
 
@@ -72,10 +81,11 @@ browser ── cc /plugins/code-hindsight/* ──► backend (node:http, 127.0.
 |---|---|
 | `npm test` | `test:server` (node:test, `tests/*.test.mjs`), `typecheck` (`tsc -p frontend`), `test:web` (Vitest, `frontend/src/**/*.test.tsx`). Needs no Docker |
 | `RUN_REAL_DOCKER=1 npm run test:real` | `tests/*.real.test.mjs` against the real daemon with the locally present pinned images (never pulls) |
-| + `CODE_HINDSIGHT_CHROMIUM=<chrome binary>` or `CODE_HINDSIGHT_CDP_URL=<CDP endpoint>` | also runs `tests/cp-basepath.real.test.mjs`, the CP under the base path in a real browser |
+| + `CODE_HINDSIGHT_CHROMIUM=<chrome binary>` or `CODE_HINDSIGHT_CDP_URL=<CDP endpoint>` | also runs `tests/cp-basepath.real.test.mjs`, the CP under the base path in a real browser (with `frontend/dist` built, also inside a cc-style frame through the shell's nested frame) |
+| + `CODE_HINDSIGHT_TEST_EMBEDDINGS_KEY` (optional `_MODEL`, `_BASE_URL`) | also runs the slim-image test with remote embeddings and the `rrf` reranker |
 
-- **Fakes.** `tests/fakes/fake-docker.mjs` implements the docker subcommands the plugin uses over a JSON state file and logs every call; `FAKE_DOCKER_MODE` injects `denied`, `daemon-down`, `port-clash`, `crash`, `fail-<subcommand>`. `tests/fakes/fake-sudo.mjs` honours only `-n` (`FAKE_SUDO_MODE=password` refuses). They are wired in through `CODE_HINDSIGHT_DOCKER_BIN` / `CODE_HINDSIGHT_SUDO_BIN`.
+- **Fakes.** `tests/fakes/fake-docker.mjs` implements the docker subcommands the plugin uses over a JSON state file (images found by ref or ID; `save`/`load` speak real tar holding a `fake-images.json`) and logs every call; `FAKE_DOCKER_MODE` injects `denied`, `daemon-down`, `port-clash`, `crash`, `fail-<subcommand>`. `tests/fakes/fake-sudo.mjs` honours only `-n` (`FAKE_SUDO_MODE=password` refuses). They are wired in through `CODE_HINDSIGHT_DOCKER_BIN` / `CODE_HINDSIGHT_SUDO_BIN`.
 - **Isolation.** `tests/helpers.mjs` `mkRoot` gives each test a temp projects root and data dir; `boot` runs `createApp` over the fakes on port 0 with an injected clock and probe. Tests never use the real data dir.
 - **No live cc.** `tests/support/ccFront.mjs` reproduces cc's plugin proxy (prefix strip, `X-Forwarded-*`, prefix re-added to every root-relative `Location`, `X-Frame-Options`) for the proxy and browser tests.
-- **Real stacks** (`tests/support/realStack.mjs`) use a random `code-hindsight-test-<hex>` prefix and random host ports, and remove their containers, network and volume afterwards, even on failure.
+- **Real stacks** (`tests/support/realStack.mjs`) use a random `code-hindsight-test-<hex>` prefix and random host ports, trust the local CP image through the `trust-cp` job, and remove their containers, network and volume afterwards, even on failure.
 - **Guards.** `tests/supervisor.test.mjs` checks over a full lifecycle that every docker call names only prefixed resources and none connects a network; `tests/frontend-source.test.mjs` scans the UI for HTML sinks, root-relative URLs and the head order.

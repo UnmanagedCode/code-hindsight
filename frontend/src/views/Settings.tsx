@@ -22,9 +22,9 @@ function Field({ id, label, error, hint, children }: { id: string; label: string
 }
 
 /** A write-only key: never shown, only replaced or cleared. */
-function KeyField({ id, label, isSet, value, clear, onValue, onClear }: { id: string; label: string; isSet: boolean; value: string; clear: boolean; onValue: (v: string) => void; onClear: (c: boolean) => void }) {
+function KeyField({ id, label, isSet, value, clear, onValue, onClear, error }: { id: string; label: string; isSet: boolean; value: string; clear: boolean; onValue: (v: string) => void; onClear: (c: boolean) => void; error?: FieldError }) {
   return (
-    <Field id={id} label={label} hint={isSet ? 'A key is stored. Type a new one to replace it.' : 'No key stored.'}>
+    <Field id={id} label={label} error={error} hint={isSet ? 'A key is stored. Type a new one to replace it. Changing the provider or URL removes it unless you enter it again.' : 'No key stored.'}>
       <Input id={id} type="password" autoComplete="off" value={value} placeholder={isSet ? '••••••••' : ''} onChange={(e) => onValue(e.target.value)} />
       {isSet && (
         <label className="flex items-center gap-2 text-xs">
@@ -79,7 +79,9 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
       setForm(v.settings);
       setKeys({ llmApiKey: '', embeddingsApiKey: '' });
       setClear({ llmApiKey: false, embeddingsApiKey: false });
-      setMessage(apply ? 'Saved. Restarting Hindsight with the new settings…' : 'Saved. Apply & restart to use them.');
+      const cleared = v.cleared ?? [];
+      const note = cleared.length ? ` Removed the stored ${cleared.map((k) => (k === 'llmApiKey' ? 'LLM' : 'embeddings')).join(' and ')} key: its provider or URL changed.` : '';
+      setMessage((apply ? 'Saved. Restarting Hindsight with the new settings…' : 'Saved. Apply & restart to use them.') + note);
       onSaved();
       if (apply) onApply();
     } catch (e) {
@@ -158,7 +160,7 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
               <Field id="llm.baseUrl" label="Base URL" error={err('llm.baseUrl')} hint="Optional">
                 <Input id="llm.baseUrl" value={form.llm.baseUrl ?? ''} onChange={(e) => set('llm', { baseUrl: nul(e.target.value) })} />
               </Field>
-              <KeyField id="llm.key" label="API key" isSet={view.secrets.llmApiKey} value={keys.llmApiKey} clear={clear.llmApiKey}
+              <KeyField id="llm.key" label="API key" error={err('llm.key')} isSet={view.secrets.llmApiKey} value={keys.llmApiKey} clear={clear.llmApiKey}
                 onValue={(v) => setKeys({ ...keys, llmApiKey: v })} onClear={(c) => setClear({ ...clear, llmApiKey: c })} />
             </div>
           )}
@@ -215,7 +217,7 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
               <Field id="embeddings.baseUrl" label="Embeddings base URL" error={err('embeddings.baseUrl')} hint="Optional">
                 <Input id="embeddings.baseUrl" value={form.embeddings.baseUrl ?? ''} onChange={(e) => set('embeddings', { baseUrl: nul(e.target.value) })} />
               </Field>
-              <KeyField id="embeddings.key" label="Embeddings API key" isSet={view.secrets.embeddingsApiKey} value={keys.embeddingsApiKey} clear={clear.embeddingsApiKey}
+              <KeyField id="embeddings.key" label="Embeddings API key" error={err('embeddings.key')} isSet={view.secrets.embeddingsApiKey} value={keys.embeddingsApiKey} clear={clear.embeddingsApiKey}
                 onValue={(v) => setKeys({ ...keys, embeddingsApiKey: v })} onClear={(c) => setClear({ ...clear, embeddingsApiKey: c })} />
             </>
           )}

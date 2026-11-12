@@ -5,6 +5,7 @@
 //   - every root-relative Location from the backend gets the prefix added (even one that
 //     already carries it);
 //   - X-Frame-Options: SAMEORIGIN when the backend sends no framing policy.
+// `/__host?src=<path>` is a stand-in for cc's page: it frames the plugin same-origin, as cc does.
 // Every other path is cc's own: it answers 404 and is recorded in `leaks`.
 import http from 'node:http';
 
@@ -17,6 +18,11 @@ export async function startCcFront({ pluginId, backendPort, host = '127.0.0.1' }
     if (req.url === prefix || req.url.startsWith(`${prefix}?`)) {
       res.writeHead(301, { location: `${prefix}/${req.url.slice(prefix.length)}` });
       return res.end();
+    }
+    if (req.url.startsWith('/__host')) {
+      const src = new URL(req.url, 'http://x').searchParams.get('src') ?? `${prefix}/`;
+      res.writeHead(200, { 'content-type': 'text/html' });
+      return res.end(`<!doctype html><title>cc</title><iframe data-plugin-frame="shared" style="width:1100px;height:700px" src="${src.replace(/[^\w/?=&%.-]/g, '')}"></iframe>`);
     }
     if (!req.url.startsWith(`${prefix}/`)) {
       leaks.push({ method: req.method, url: req.url });

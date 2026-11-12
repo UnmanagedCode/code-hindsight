@@ -74,7 +74,22 @@ test('the backend summary carries no token and flags unusable rows with their re
   assert.deepEqual(list[1].models, [{ model: 'glm-5', label: 'GLM 5' }]);
 });
 
-test('loopback detection covers 127/8, localhost and ::1', () => {
-  for (const h of ['127.0.0.1', '127.9.9.9', 'localhost', 'LOCALHOST', 'api.localhost', '::1', '[::1]', '0.0.0.0']) assert.equal(isLoopbackHost(h), true, h);
-  for (const h of ['172.20.0.1', 'example.com', '10.0.0.1']) assert.equal(isLoopbackHost(h), false, h);
+// S6: best-effort over literal addresses and localhost, after WHATWG URL normalization.
+test('loopback detection covers 127/8 in every literal spelling, localhost, ::1 and IPv4-mapped IPv6', () => {
+  const host = (u) => new URL(u).hostname;
+  for (const u of ['http://127.0.0.1', 'http://127.9.9.9', 'http://127.1', 'http://2130706433', 'http://0x7f000001', 'http://0177.0.0.1',
+    'http://localhost', 'http://LOCALHOST', 'http://localhost.', 'http://api.localhost', 'http://0.0.0.0', 'http://0',
+    'http://[::1]', 'http://[0:0:0:0:0:0:0:1]', 'http://[::]', 'http://[::ffff:127.0.0.1]', 'http://[::ffff:7f00:2]', 'http://[::127.0.0.1]']) {
+    assert.equal(isLoopbackHost(host(u)), true, u);
+  }
+  for (const u of ['http://172.20.0.1', 'http://example.com', 'http://10.0.0.1', 'http://[2001:db8::1]', 'http://[::ffff:10.0.0.1]', 'http://128.0.0.1']) {
+    assert.equal(isLoopbackHost(host(u)), false, u);
+  }
+});
+
+test('a cc backend on an obfuscated loopback URL is refused CC_BACKEND_LOOPBACK', async () => {
+  for (const base of ['http://127.1:18765', 'http://[::ffff:127.0.0.1]:18765', 'http://2130706433/x']) {
+    const data = { backends: [{ id: 'b', env: [{ key: 'ANTHROPIC_BASE_URL', value: base }, { key: 'ANTHROPIC_AUTH_TOKEN', value: 't' }] }] };
+    await assert.rejects(composeLlmEnv(llm({ mode: 'cc-backend', backendId: 'b', model: 'm' }), {}, fromData(data)), { code: 'CC_BACKEND_LOOPBACK' }, base);
+  }
 });

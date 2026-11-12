@@ -1,7 +1,7 @@
 // Shapes of the backend's /-/api/ responses (docs/protocol.md).
 
 export type HindsightState = 'stopped' | 'checking' | 'starting' | 'ready' | 'stopping' | 'error';
-export type ErrorAction = 'pull' | 'build-cp' | 'import' | 'start' | 'restart' | 'settings' | 'stop';
+export type ErrorAction = 'pull' | 'build-cp' | 'import' | 'start' | 'restart' | 'settings' | 'stop' | 'trust-cp';
 export type Variant = 'full' | 'slim';
 
 export interface CatalogError {
@@ -16,6 +16,11 @@ export interface ImageInfo {
   ref: string;
   present: boolean;
   ok: boolean;
+  id?: string | null;
+  /** CP image only: carries this plugin's base-path and upstream labels. */
+  built?: boolean;
+  /** CP image only: its ID is the one this plugin built or the user confirmed. */
+  trusted?: boolean;
   version?: string | null;
   revision?: string | null;
   basePath?: string | null;
@@ -53,6 +58,8 @@ export interface Status {
   pendingRestart: boolean;
   /** The data volume's name (typed to confirm its deletion). */
   volume: string;
+  /** A previous backend could not stop the containers on SIGTERM. */
+  lastShutdownFailure: { at: string; error: string } | null;
   llmMode: string;
   autoStart?: boolean;
   job: Job | null;
@@ -75,7 +82,12 @@ export interface SettingsView {
   detectedBindAddress: string;
   choices: { variants: Variant[]; llmModes: Settings['llm']['mode'][]; embeddingsProviders: string[]; rerankerProviders: string[] };
   images: { api: Record<Variant, { ref: string; version: string }>; cp: string; version: string };
+  /** On a save: user keys removed because their provider or URL changed. */
+  cleared?: string[];
 }
+
+/** One image a bundle import loaded, with its trust standing. */
+export interface LoadedImage { ref: string; id: string; status: 'pinned' | 'not-pinned' | 'trusted' | 'needs-confirmation' | 'unused' }
 
 export interface FieldError { field: string; code?: string; message: string }
 

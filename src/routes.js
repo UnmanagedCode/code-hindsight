@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { AppError, describeError } from './errors.js';
 import { sendJson, readJson, securityHeaders } from './http.js';
 import { isCrossSite } from './cpProxy.js';
-import { validateSettings, LLM_MODES, EMBEDDINGS_PROVIDERS, RERANKER_PROVIDERS, SLIM_REFUSED, DEFAULT_SETTINGS } from './settings.js';
+import { validateSettings, keyEndpoints, LLM_MODES, EMBEDDINGS_PROVIDERS, RERANKER_PROVIDERS, SLIM_REFUSED, DEFAULT_SETTINGS } from './settings.js';
 import { USER_SECRETS } from './secrets.js';
 import { summarizeCcBackends } from './llmEnv.js';
 import { VARIANTS, API_IMAGES, CP_IMAGE, HINDSIGHT_VERSION } from './pins.js';
@@ -66,14 +66,23 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
       for (const k of Object.keys(patch)) if (!USER_SECRETS.includes(k)) throw new AppError('BAD_REQUEST', { detail: `unknown secret "${k}"` });
       for (const [k, v] of Object.entries(patch)) if (v !== null && typeof v !== 'string') throw new AppError('BAD_REQUEST', { detail: `${k} must be a string or null` });
       const has = secrets.has();
-      const hasAfter = Object.fromEntries(USER_SECRETS.map((k) => [k, patch[k] === undefined ? has[k] : !!patch[k]]));
+      // A stored key is bound to where it is sent: repointing the provider or URL without
+      // resending the key clears it, so a changed endpoint can never receive the old key.
+      const before = keyEndpoints(settingsStore.get());
+      const after = keyEndpoints(validateSettings(body.settings).settings);
+      const effective = { ...patch };
+      const cleared = [];
+      for (const k of USER_SECRETS) {
+        if (has[k] && before[k] !== after[k] && effective[k] === undefined) { effective[k] = null; cleared.push(k); }
+      }
+      const hasAfter = Object.fromEntries(USER_SECRETS.map((k) => [k, effective[k] === undefined ? has[k] : !!effective[k]]));
       const { settings, errors } = validateSettings(body.settings, hasAfter);
       if (errors.length) throw new AppError('SETTINGS_INVALID', { fields: errors });
       const sudoChanged = settings.docker.allowSudo !== settingsStore.get().docker.allowSudo;
       settingsStore.save(settings);
-      if (Object.keys(patch).length) secrets.setUserSecrets(patch);
+      if (Object.keys(effective).length) secrets.setUserSecrets(effective);
       if (sudoChanged) docker.reset();
-      return { ...settingsView(), status: supervisor.status() };
+      return { ...settingsView(), cleared, status: supervisor.status() };
     }],
     ['GET', '/-/api/cc-backends', async () => ({ backends: summarizeCcBackends(await fetchCcModels()) })],
     ['POST', '/-/api/start', async () => { supervisor.ensureRunning(); return status(false); }],

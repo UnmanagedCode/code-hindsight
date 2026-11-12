@@ -58,7 +58,8 @@ async function stack(t, { ready = true, error } = {}) {
   await new Promise((r) => backend.listen(0, '127.0.0.1', r));
   const front = await startCcFront({ pluginId: 'code-hindsight', backendPort: backend.address().port });
   t.after(async () => { backend.closeAllConnections(); backend.close(); await front.close(); });
-  const at = (p, init) => fetch(`${front.origin}${BP}${p}`, { redirect: 'manual', ...init });
+  // What a browser sends for the CP page's own requests.
+  const at = (p, init = {}) => fetch(`${front.origin}${BP}${p}`, { redirect: 'manual', ...init, headers: { 'sec-fetch-site': 'same-origin', ...init.headers } });
   return { cp, front, at, state, relogins: () => relogins };
 }
 
@@ -109,7 +110,7 @@ test('a POST with an expired session is not replayed: it fails once, and the nex
   const { cp, at } = await stack(t);
   await at('/api/x');
   cp.expireAll();
-  const post = () => at('/api/memories/retain', { method: 'POST', headers: { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' }, body: '{"a":1}' });
+  const post = () => at('/api/memories/retain', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"a":1}' });
   const first = await post();
   assert.equal(first.status, 401);
   await new Promise((r) => setTimeout(r, 50));
@@ -128,14 +129,19 @@ test('the CP\'s sign-out is answered locally; /login goes back to the app', asyn
   assert.equal((await at('/login')).headers.get('location'), `${BP}/dashboard`);
 });
 
-// Credentials are injected server-side, so a cross-site write must be refused before it is forwarded.
-test('state-changing requests from another site are refused 403 before reaching the CP', async (t) => {
-  const { cp, at } = await stack(t);
+// S5: credentials are injected server-side and some CP GETs act, so every method needs the
+// browser's word that the request comes from this origin (or the user); none gets a session otherwise.
+test('every method from another site, or without Sec-Fetch-Site, is refused 403 before reaching the CP', async (t) => {
+  const { cp, front, at } = await stack(t);
   const before = cp.seen.length;
-  assert.equal((await at('/api/banks/x', { method: 'DELETE', headers: { 'sec-fetch-site': 'cross-site' } })).status, 403);
-  assert.equal((await at('/api/banks/x', { method: 'POST', headers: { origin: 'https://evil.example' } })).status, 403);
-  assert.equal(cp.seen.length, before);
-  assert.equal((await at('/api/banks/x', { method: 'POST', headers: { 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' }, body: '{}' })).status, 200);
+  for (const [method, site] of [['GET', 'cross-site'], ['GET', 'same-site'], ['HEAD', 'cross-site'], ['OPTIONS', 'cross-site'], ['DELETE', 'cross-site'], ['POST', 'same-site']]) {
+    assert.equal((await at('/api/documents/transfer?bank_id=b', { method, headers: { 'sec-fetch-site': site } })).status, 403, `${method} ${site}`);
+  }
+  const bare = await fetch(`${front.origin}${BP}/api/banks`, { redirect: 'manual' });
+  assert.equal(bare.status, 403, 'no Sec-Fetch-Site: no session');
+  assert.equal(cp.seen.length, before, 'nothing was forwarded');
+  assert.equal((await at('/api/banks/x', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })).status, 200);
+  assert.equal((await at('/dashboard', { headers: { 'sec-fetch-site': 'none' } })).status, 200, 'a typed URL or bookmark');
 });
 
 test('while Hindsight is not ready, CP paths answer a 503 page with escaped error text and our CSP', async (t) => {

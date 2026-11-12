@@ -18,14 +18,14 @@ Every response the backend itself produces carries `CSP` (`src/http.js`) and `X-
 
 ## `/-/api/*`
 
-State-changing requests (`POST`, `PUT`) need `Content-Type: application/json` (else `415 UNSUPPORTED_MEDIA_TYPE`), except the upload import (`application/octet-stream`). All of them are refused `403 CROSS_SITE` when `Sec-Fetch-Site` is present and not `same-origin`/`none`, or when it is absent and `Origin` is present.
+State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec-Fetch-Site` is `same-origin` or `none` (an absent header is refused too), then need `Content-Type: application/json` (else `415 UNSUPPORTED_MEDIA_TYPE`), except the upload import (`application/octet-stream`). `GET`s need neither.
 
 | Method | Path | Body → answer |
 |---|---|---|
 | GET | `/-/api/health` | `{ok: true}` — always 200, whatever Hindsight's state (the manifest's `healthPath`) |
-| GET | `/-/api/status[?refresh=1]` | `{state, error, docker: {mode, serverVersion}, variant, bindAddress, bindAuto, ports: {api, cp}, images: {api, cp} \| null, containers: {api, cp} \| null, startedAt, pendingRestart, volume, llmMode, autoStart?, job, bundles: [{name, size}], bundleNames: {full, slim}}`. `refresh=1` re-inspects images and containers first. `autoStart` is cc's flag for this plugin, omitted when cc cannot be asked |
+| GET | `/-/api/status[?refresh=1]` | `{state, error, docker: {mode, serverVersion}, variant, bindAddress, bindAuto, ports: {api, cp}, images: {api: {ref, present, id, version, ok}, cp: {ref, present, id, basePath, upstream, built, trusted, ok}} \| null, containers: {api, cp} \| null, startedAt, pendingRestart, volume, lastShutdownFailure: {at, error} \| null, llmMode, autoStart?, job, bundles: [{name, size}], bundleNames: {full, slim}}`. `refresh=1` re-inspects images and containers first. `autoStart` is cc's flag for this plugin, omitted when cc cannot be asked |
 | GET | `/-/api/settings` | `{settings, secrets: {llmApiKey: bool, embeddingsApiKey: bool}, defaults, detectedBindAddress, choices, images}` |
-| PUT | `/-/api/settings` | `{settings, secrets?: {llmApiKey?, embeddingsApiKey?}}` — the whole settings object; a secret string sets, `null`/`""` clears, absent keeps. `400 SETTINGS_INVALID` with `params.fields: [{field, code?, message}]`. Answers the settings view plus `status` |
+| PUT | `/-/api/settings` | `{settings, secrets?: {llmApiKey?, embeddingsApiKey?}}` — the whole settings object; a secret string sets, `null`/`""` clears, absent keeps — except that an absent key whose endpoint changed is cleared (`keyEndpoints` in `src/settings.js`: LLM mode/provider/base URL; embeddings provider/base URL). `400 SETTINGS_INVALID` with `params.fields: [{field, code?, message}]` changes nothing. Answers the settings view plus `cleared: [key names]` and `status` |
 | GET | `/-/api/cc-backends` | `{backends: [{id, label, host, usable, refusal, models: [{model, label}]}]}` — never a token |
 | POST | `/-/api/start` | start / reconcile to the saved settings; answers status at once |
 | POST | `/-/api/restart` | stop, then start; answers status at once |
@@ -45,12 +45,30 @@ State-changing requests (`POST`, `PUT`) need `Content-Type: application/json` (e
 |---|---|---|
 | `pull` | `{variant: "full"\|"slim"}` | `{image}` |
 | `build-cp` | `{}` | `{image}` |
-| `import` | `{path: "/abs/file.tar"}` (or the octet-stream upload) | `{loaded: [refs]}` |
-| `export` | `{variant}` | `{name, path, size, sha256}` |
+| `import` | `{path: "/abs/file.tar"}` (or the octet-stream upload) | `{loaded: [{ref, id, status: pinned\|not-pinned\|trusted\|needs-confirmation\|unused}], manifest: <code-hindsight-bundle.json> \| null}` |
+| `trust-cp` | `{confirm: "<the CP image's current ID>"}` | `{image, id}` — records it as the trusted CP image |
+| `export` | `{variant}` | `{name, path, size, sha256, images: [{ref, id}]}` |
 | `remove-images` | `{confirm: true}` | `{removed: [refs]}` |
 | `delete-volume` | `{confirm: "<volume name>"}` | `{removed}` |
 
-`remove-images` and `delete-volume` refuse `CONFIRMATION_REQUIRED` without their confirmation and fail `CONTAINERS_RUNNING` while a container of this plugin runs.
+- `remove-images` and `delete-volume` refuse `CONFIRMATION_REQUIRED` without their confirmation and fail `CONTAINERS_RUNNING` while a container of this plugin runs. `trust-cp` refuses `CONFIRMATION_REQUIRED` (with `params.expected` = the current ID) when the ID does not match.
+- `build-cp` inspects `BUILD_HELPER.ref` (a digest reference), pulls it when missing, fails `HELPER_UNTRUSTED` unless its ID is in `BUILD_HELPER.ids`, then runs `docker run --rm --name <prefix>-build -v /var/run/docker.sock:/var/run/docker.sock <helper ID> docker buildx build <repo>#<UPSTREAM_REVISION> …` (`buildCpCommand` in `src/jobs.js`) and records the built image's ID as trusted.
+- After a successful `pull`, `build-cp`, `import` or `trust-cp`, Hindsight starts if it was asked to run and is in `error`; other jobs only re-read images and containers.
+
+### Image trust (`src/trust.js`)
+
+| Image | Runs when |
+|---|---|
+| API (`API_IMAGES[variant]`) | its `.Id` is in `API_IMAGES[variant].ids` (else `IMAGE_MISMATCH`); labels are shown, never trusted |
+| CP (`CP_IMAGE`) | it carries the base-path and upstream-revision labels (else `CP_IMAGE_MISMATCH`) **and** its `.Id` equals `trusted-cp.json`'s (else `CP_IMAGE_UNTRUSTED`) |
+| Build helper (`BUILD_HELPER`) | its `.Id` is in `BUILD_HELPER.ids` (else `HELPER_UNTRUSTED`); only then is it given the Docker socket |
+
+- Each pinned image lists its index digest (what `.Id` is under the containerd image store) and its linux/amd64 and linux/arm64 config digests (what `.Id` is under the classic store).
+- Containers run by the verified ID, never by tag.
+
+### Bundles
+
+An export is the `docker save` archive with one extra root file, `code-hindsight-bundle.json` (`BUNDLE_MANIFEST`): `{format: 1, hindsight, variant, images: [{ref, id}], createdAt}`. `docker load` ignores it; the import job reads it back. It is informational: what runs is decided by the loaded images' own IDs.
 
 ## Hindsight states
 
@@ -63,6 +81,8 @@ State-changing requests (`POST`, `PUT`) need `Content-Type: application/json` (e
 | `settings.json` (0600) | the settings; never a key |
 | `secrets.json` (0600) | `apiKey`, `cpAccessKey` (generated once), `llmApiKey`, `embeddingsApiKey` |
 | `stopping.json` (0600) | `{pid, at}` of the detached `docker stop` a SIGTERM left running; the next backend waits for that pid |
+| `shutdown-failed.json` (0600) | `{at, error}` when a SIGTERM could not start that stop; shown as `status.lastShutdownFailure` and removed when Hindsight is next ready |
+| `trusted-cp.json` (0600) | `{id, source: build\|confirmed, at}`: the CP image ID allowed to run |
 | `run/` | short-lived `--env-file`s for `docker run`, removed after each run |
 | `logs/jobs/<id>.log` | each job's output |
 | `bundles/code-hindsight-<version>-<variant>.tar` (0600) | exported bundles |
@@ -80,10 +100,11 @@ Labels (`LABELS` in `src/pins.js`):
 | `io.code-hindsight.role` | containers | `api` / `cp` |
 | `io.code-hindsight.spec` | containers | hash of image ID, run arguments and env; a mismatch recreates the container |
 | `io.code-hindsight.embeddings` | volume | `local` or `<provider>:<model>`; a mismatch with the settings is `EMBEDDINGS_CHANGED` |
-| `io.code-hindsight.basePath`, `io.code-hindsight.upstream` | CP image | the base path and upstream tag it was built with; checked before start (`CP_IMAGE_MISMATCH`) |
+| `io.code-hindsight.basePath`, `io.code-hindsight.upstream` | CP image | the base path and upstream commit it was built with; checked before start (`CP_IMAGE_MISMATCH`), but trust comes from the ID |
 
 ### Container environment (`apiSpec` / `cpSpec` in `src/containerSpec.js`)
 
+- Both run by image ID (the last `docker run` argument).
 - **API** (`<prefix>-api`, alias `api` on `<prefix>-net`, `-p <bind>:<apiPort>:8888`, volume at `/home/hindsight/.pg0`, `--restart on-failure:3`): `HINDSIGHT_ENABLE_CP=false`, `HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension`, `HINDSIGHT_API_TENANT_API_KEY`; full image: `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`; LLM: `HINDSIGHT_API_LLM_PROVIDER` (`none` by default), `_MODEL`, `_BASE_URL`, `_API_KEY`; `HINDSIGHT_API_EMBEDDINGS_PROVIDER` (+ `_OPENAI_MODEL`, `_OPENAI_BASE_URL`, `_OPENAI_API_KEY`), `HINDSIGHT_API_RERANKER_PROVIDER`.
 - **CP** (`<prefix>-cp`, on `<prefix>-net`, `-p <bind>:<cpPort>:9999`, `--restart on-failure:3`): `HINDSIGHT_CP_DATAPLANE_API_URL=http://api:8888`, `HINDSIGHT_CP_DATAPLANE_API_KEY`, `HINDSIGHT_CP_ACCESS_KEY`.
 - Env reaches `docker run` through a 0600 `--env-file`, never the command line.
@@ -102,7 +123,7 @@ Both published ports need a key except: API `/health*`, `/version`, `/metrics`, 
 - **Cookies:** the browser's `hindsight_cp_access` is dropped and the backend's session is added; a `Set-Cookie` for `hindsight_cp_access` is removed; other CP cookies get `Path=<BASE_PATH>`.
 - **Session:** the backend signs in with `POST <BASE_PATH>/api/auth/login {key}` and renews before the CP's 24 h expiry. A `401` carrying `x-hindsight-session-required`, or a redirect to `/login`, signs in again; `GET`/`HEAD` are retried once, other methods pass the `401` through.
 - **Local answers:** `/api/auth/logout` → `200 {success: true}`; `/login?returnTo=<app path>` → `302` to that path (else `/dashboard`).
-- **CSRF:** non-`GET`/`HEAD`/`OPTIONS` requests get the same cross-site refusal as `/-/api/*`, before credentials are added.
+- **Fetch metadata:** every request, whatever its method, is refused `403 CROSS_SITE` unless `Sec-Fetch-Site` is `same-origin` or `none`; a request without the header is refused, not forwarded without credentials (some CP `GET`s act, e.g. a document export, and the proxy adds the session). cc's frame, the shell's nested frame and navigation inside it are all `same-origin`.
 - **Not ready:** while Hindsight is not `ready`, `503` HTML naming the current error (text-escaped).
 - Bodies stream both ways; an aborted client aborts the upstream request; connect timeout 10 s, no total timeout.
 
@@ -110,7 +131,7 @@ Both published ports need a key except: API `/health*`, `/version`, `/metrics`, 
 
 | Route | Used for | On failure |
 |---|---|---|
-| `GET $CONDUCTOR_URL/api/settings/models` (`backends[].{id,label,env:[{key,value}]}`, `backendModels`) | the cc-backend link and its picker | `CC_UNREACHABLE` / `CC_ROUTE_CHANGED` |
+| `GET $CONDUCTOR_URL/api/settings/models` (`backends[].{id,label,env:[{key,value}]}`, `backendModels`) | the cc-backend link and its picker; a row whose `ANTHROPIC_BASE_URL` host is loopback (`isLoopbackHost` in `src/llmEnv.js`, over the WHATWG-normalized host; best-effort, literal addresses and `localhost`) is refused `CC_BACKEND_LOOPBACK` | `CC_UNREACHABLE` / `CC_ROUTE_CHANGED` |
 | `GET $CONDUCTOR_URL/api/plugins/code-hindsight/status` (`autoStart`) | the Auto-start hint | hint omitted |
 
 ## For clients of the Hindsight API

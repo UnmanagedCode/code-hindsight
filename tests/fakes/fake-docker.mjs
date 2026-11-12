@@ -32,7 +32,33 @@ const labelsFrom = (list) => {
   for (let i = 0; i < list.length; i++) if (list[i] === '--label') { const [k, ...v] = list[++i].split('='); labels[k] = v.join('='); }
   return labels;
 };
-const readStdin = () => { try { return fs.readFileSync(0, 'utf8'); } catch { return ''; } };
+const readStdin = () => { try { return fs.readFileSync(0); } catch { return Buffer.alloc(0); } };
+/** An image by reference or by ID. */
+const findImage = (s, key) => s.images[key] ?? Object.values(s.images).find((i) => i.Id === key);
+
+// Bundles are real tar archives holding one fake-images.json, so the plugin's tar handling is
+// exercised; any other entry (the plugin's own manifest) is ignored, as docker load does.
+function tarFile(name, data) {
+  const h = Buffer.alloc(512);
+  h.write(name, 0); h.write('0000644\0', 100); h.write('0000000\0', 108); h.write('0000000\0', 116);
+  h.write(`${data.length.toString(8).padStart(11, '0')}\0`, 124); h.write('00000000000\0', 136);
+  h.write('        ', 148); h.write('0', 156); h.write('ustar\0', 257); h.write('00', 263);
+  let sum = 0; for (const b of h) sum += b;
+  h.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148);
+  return Buffer.concat([h, data, Buffer.alloc((512 - (data.length % 512)) % 512)]);
+}
+function tarRead(buf) {
+  const files = {};
+  for (let off = 0; off + 512 <= buf.length;) {
+    const h = buf.subarray(off, off + 512);
+    if (h.every((b) => b === 0)) break;
+    const name = h.subarray(0, 100).toString().replace(/\0.*$/s, '');
+    const size = parseInt(h.subarray(124, 136).toString().replace(/\0.*$/s, '').trim() || '0', 8);
+    files[name] = buf.subarray(off + 512, off + 512 + size);
+    off += 512 + Math.ceil(size / 512) * 512;
+  }
+  return files;
+}
 
 let [cmd, ...rest] = args;
 if (cmd === 'container' && rest[0] === 'inspect') { cmd = 'inspect-container'; rest = rest.slice(1); }
@@ -47,7 +73,7 @@ const runState = { Status: 'running', Running: true, Restarting: false, ExitCode
 switch (cmd) {
   case 'version': out(process.env.FAKE_DOCKER_SERVER_VERSION ?? '29.9.2'); break;
   case 'inspect-image': {
-    const img = s.images[rest[0]];
+    const img = findImage(s, rest[0]);
     if (!img) fail(`Error response from daemon: No such image: ${rest[0]}`);
     out(JSON.stringify([img]));
     break;
@@ -83,8 +109,9 @@ switch (cmd) {
       // The CP build helper.
       if (rest.includes('buildx')) {
         out('#1 [internal] load git source'); out('#2 DONE');
+        if (!findImage(s, rest[rest.indexOf('--rm') + 5])) fail('Unable to find image locally', 125);
         const tag = rest[rest.indexOf('-t') + 1];
-        s.images[tag] = s.registry[tag] ?? { Id: 'sha256:built', Config: { Labels: labelsFrom(rest.slice(rest.indexOf('buildx'))) } };
+        s.images[tag] = s.registry[tag] ?? { Id: `sha256:${'b'.repeat(64)}`, Config: { Labels: labelsFrom(rest.slice(rest.indexOf('buildx'))) } };
         save(s);
       }
       break;
@@ -92,13 +119,13 @@ switch (cmd) {
     const opt = (flag) => { const i = rest.indexOf(flag); return i === -1 ? null : rest[i + 1]; };
     const name = opt('--name');
     const image = rest[rest.length - 1];
-    if (!s.images[image]) fail(`Unable to find image '${image}' locally`, 125);
+    if (!findImage(s, image)) fail(`Unable to find image '${image}' locally`, 125);
     if (s.containers[name]) fail(`docker: Error response from daemon: Conflict. The container name "/${name}" is already in use by container "x".`, 125);
     const envFile = opt('--env-file');
     const Env = envFile ? fs.readFileSync(envFile, 'utf8').split('\n').filter(Boolean) : [];
     const ports = []; const mounts = [];
     for (let i = 0; i < rest.length; i++) { if (rest[i] === '-p') ports.push(rest[i + 1]); if (rest[i] === '-v') mounts.push(rest[i + 1].split(':')[0]); }
-    const c = { Id: `cid-${name}`, Name: `/${name}`, Image: s.images[image].Id, Config: { Image: image, Labels: labelsFrom(rest), Env }, Ports: ports, Mounts: mounts, Network: opt('--network'), RunArgs: rest, State: runState };
+    const c = { Id: `cid-${name}`, Name: `/${name}`, Image: findImage(s, image).Id, Config: { Image: image, Labels: labelsFrom(rest), Env }, Ports: ports, Mounts: mounts, Network: opt('--network'), RunArgs: rest, State: runState };
     if (modes.has('port-clash')) {
       c.State = { Status: 'created', Running: false, Restarting: false, ExitCode: 128 };
       s.containers[name] = c; save(s);
@@ -138,7 +165,7 @@ switch (cmd) {
   }
   case 'load': {
     let bundle;
-    try { bundle = JSON.parse(readStdin()); } catch { fail('Error: archive/tar: invalid tar header'); }
+    try { bundle = JSON.parse(tarRead(readStdin())['fake-images.json'].toString()); } catch { fail('Error: archive/tar: invalid tar header'); }
     for (const [ref, img] of Object.entries(bundle.images ?? {})) { s.images[ref] = img; out(`Loaded image: ${ref}`); }
     save(s);
     break;
@@ -146,7 +173,7 @@ switch (cmd) {
   case 'save': {
     const images = {};
     for (const ref of rest) { if (!s.images[ref]) fail(`Error response from daemon: reference does not exist: ${ref}`); images[ref] = s.images[ref]; }
-    process.stdout.write(JSON.stringify({ images }));
+    process.stdout.write(Buffer.concat([tarFile('fake-images.json', Buffer.from(JSON.stringify({ images }))), Buffer.alloc(1024), Buffer.alloc(8192)]));
     break;
   }
   case 'rmi': {

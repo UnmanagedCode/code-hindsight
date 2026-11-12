@@ -1,10 +1,30 @@
 import { useEffect, useRef, useState } from 'react';
 import { LoaderCircleIcon } from 'lucide-react';
 import { api } from '@/lib/api';
-import type { Job } from '@/lib/types';
+import type { Job, LoadedImage } from '@/lib/types';
 import { Badge } from '@/components/ui/badge';
 
 const STATE_BADGE = { running: 'info', done: 'success', failed: 'destructive' } as const;
+const STANDING: Record<LoadedImage['status'], string> = {
+  pinned: 'pinned release',
+  'not-pinned': 'not the pinned release — will not run',
+  trusted: 'trusted',
+  'needs-confirmation': 'needs your confirmation before it runs',
+  unused: 'not used by this plugin',
+};
+
+/** What an import loaded: each image's ID and whether it will run. */
+function Loaded({ loaded }: { loaded: LoadedImage[] }) {
+  return (
+    <ul className="space-y-1 text-xs" aria-label="Loaded images">
+      {loaded.map((l) => (
+        <li key={`${l.ref}${l.id}`} data-standing={l.status}>
+          <span className="font-medium">{l.ref}</span> <code className="break-all">{l.id}</code> — {STANDING[l.status]}
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 /** One job's progress, polled until it ends; `onEnd` fires once when it does. */
 export function JobPanel({ jobId, onEnd, intervalMs = 1000 }: { jobId: string; onEnd?: (j: Job) => void; intervalMs?: number }) {
@@ -34,6 +54,7 @@ export function JobPanel({ jobId, onEnd, intervalMs = 1000 }: { jobId: string; o
         <span className="font-medium">{job.kind}</span>
         <Badge variant={STATE_BADGE[job.state]}>{job.state}</Badge>
       </div>
+      {Array.isArray(job.result?.loaded) && <Loaded loaded={job.result.loaded as LoadedImage[]} />}
       {job.error && <p className="text-sm text-destructive">{job.error.title}: {job.error.message}</p>}
       {job.tail && <pre className="max-h-64 overflow-auto rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap break-words">{job.tail}</pre>}
     </div>

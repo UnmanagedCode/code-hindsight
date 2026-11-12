@@ -40,7 +40,7 @@ export function embeddingsEnv(settings, secrets) {
 /**
  * @param {object} o
  * @param {ReturnType<typeof resourceNames>} o.names
- * @param {{ref: string, id: string}} o.image
+ * @param {{id: string}} o.image a verified image ID: containers run by ID, never by a tag
  * @param {string} o.variant full | slim
  * @param {string} o.bind host address the port is published on
  * @param {number} o.port host port
@@ -67,15 +67,15 @@ export function apiSpec({ names, image, variant, bind, port, apiKey, llmEnv, emb
     '-p', `${bind}:${port}:${API_CONTAINER_PORT}`,
     '-v', `${names.volume}:${API_DATA_PATH}`,
   ];
-  const hash = specHash(image.id, [...base, image.ref], env);
+  const hash = specHash(image.id, base, env);
   const labels = { [LABELS.managed]: '1', [LABELS.owner]: owner, [LABELS.role]: 'api', [LABELS.spec]: hash };
-  return { name: names.api, args: [...base, ...labelArgs(labels), image.ref], env, hash };
+  return { name: names.api, args: [...base, ...labelArgs(labels), image.id], env, hash };
 }
 
 /**
  * @param {object} o
  * @param {ReturnType<typeof resourceNames>} o.names
- * @param {{ref: string, id: string}} o.image
+ * @param {{id: string}} o.image a verified image ID: containers run by ID, never by a tag
  * @param {string} o.bind
  * @param {number} o.port
  * @param {string} o.apiKey the API key the CP sends to the API
@@ -94,7 +94,7 @@ export function cpSpec({ names, image, bind, port, apiKey, accessKey, owner }) {
     '--restart', 'on-failure:3',
     '-p', `${bind}:${port}:${CP_CONTAINER_PORT}`,
   ];
-  const hash = specHash(image.id, [...base, image.ref], env);
+  const hash = specHash(image.id, base, env);
   const labels = { [LABELS.managed]: '1', [LABELS.owner]: owner, [LABELS.role]: 'cp', [LABELS.spec]: hash };
-  return { name: names.cp, args: [...base, ...labelArgs(labels), image.ref], env, hash };
+  return { name: names.cp, args: [...base, ...labelArgs(labels), image.id], env, hash };
 }

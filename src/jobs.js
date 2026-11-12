@@ -5,31 +5,34 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import {
-  API_IMAGES, BASE_PATH, BUILD_HELPER_IMAGE, CP_DOCKERFILE, CP_IMAGE, CP_TARGET, HINDSIGHT_VERSION,
-  LABELS, UPSTREAM_REPO, UPSTREAM_TAG, VARIANTS,
+  API_IMAGES, BASE_PATH, BUILD_HELPER, CP_DOCKERFILE, CP_IMAGE, CP_TARGET, HINDSIGHT_VERSION,
+  LABELS, UPSTREAM_REPO, UPSTREAM_REVISION, VARIANTS,
 } from './pins.js';
 import { AppError, toAppError } from './errors.js';
 import { ensurePrivateDir } from './fsPrivate.js';
+import { IMAGE_ID_RE, isPinnedApiImage, isPinnedHelper } from './trust.js';
+import { createTarAppender, createTarScanner } from './tarStream.js';
 
-export const JOB_KINDS = Object.freeze(['pull', 'build-cp', 'import', 'export', 'remove-images', 'delete-volume']);
-/** The Docker host's socket, mounted into the build helper so its buildx drives the same daemon. */
-const HOST_DOCKER_SOCKET = '/var/run/docker.sock';
+export const JOB_KINDS = Object.freeze(['pull', 'build-cp', 'import', 'trust-cp', 'export', 'remove-images', 'delete-volume']);
+/** Jobs that can fix a start precondition; only these may start Hindsight when they succeed. */
+const PRECONDITION_JOBS = new Set(['pull', 'build-cp', 'import', 'trust-cp']);
+/** The file inside an exported bundle that lists the image IDs it carries. */
+export const BUNDLE_MANIFEST = 'code-hindsight-bundle.json';
 const TAIL_LINES = 200;
 const KEEP_JOBS = 20;
 
-/** The `docker run` arguments of the CP image build (after `--rm --name <name>`). */
-export function buildCpArgs() {
+/** The command the build helper runs: buildx over the upstream source at the pinned commit. */
+export function buildCpCommand() {
   return [
-    '-v', `${HOST_DOCKER_SOCKET}:${HOST_DOCKER_SOCKET}`,
-    BUILD_HELPER_IMAGE,
     'docker', 'buildx', 'build', '--progress', 'plain',
-    `${UPSTREAM_REPO}#${UPSTREAM_TAG}`,
+    `${UPSTREAM_REPO}#${UPSTREAM_REVISION}`,
     '-f', CP_DOCKERFILE,
     '--target', CP_TARGET,
     '--build-arg', `NEXT_PUBLIC_BASE_PATH=${BASE_PATH}`,
     '--label', `${LABELS.basePath}=${BASE_PATH}`,
-    '--label', `${LABELS.upstream}=${UPSTREAM_TAG}`,
+    '--label', `${LABELS.upstream}=${UPSTREAM_REVISION}`,
     '-t', CP_IMAGE,
     '--load',
   ];
@@ -41,12 +44,13 @@ const BUNDLE_RE = /^code-hindsight-[0-9A-Za-z.-]+-(full|slim)\.tar$/;
 /**
  * @param {object} o
  * @param {ReturnType<import('./docker.js').createDocker>} o.docker
- * @param {{afterPrecondition(): Promise<void>}} o.supervisor
+ * @param {{afterPrecondition(): Promise<void>, refresh(): Promise<void>}} o.supervisor
+ * @param {ReturnType<import('./trust.js').createCpTrust>} o.cpTrust
  * @param {ReturnType<import('./containerSpec.js').resourceNames>} o.names
  * @param {string} o.owner
  * @param {string} o.dataDir
  */
-export function createJobs({ docker, supervisor, names, owner, dataDir, now = () => Date.now() }) {
+export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir, now = () => Date.now() }) {
   const logDir = path.join(dataDir, 'logs', 'jobs');
   const bundleDir = path.join(dataDir, 'bundles');
   const jobs = new Map();
@@ -71,41 +75,67 @@ export function createJobs({ docker, supervisor, names, owner, dataDir, now = ()
 
   const loadedFrom = (lines) => lines.map((l) => /^Loaded image(?: ID)?: (.+)$/.exec(l.trim())?.[1]).filter(Boolean);
 
+  /** A loaded image's trust standing, for the import result. */
+  function standing(ref, id) {
+    const variant = VARIANTS.find((v) => API_IMAGES[v].ref === ref);
+    if (variant) return { ref, id, status: isPinnedApiImage(variant, id) ? 'pinned' : 'not-pinned' };
+    if (ref === CP_IMAGE) return { ref, id, status: cpTrust.get()?.id === id ? 'trusted' : 'needs-confirmation' };
+    return { ref, id, status: 'unused' };
+  }
+
   async function exportBundle(variant, line) {
     const want = API_IMAGES[variant];
-    if (!(await docker.inspectImage(want.ref))) throw new AppError('IMAGE_MISSING', { image: want.ref });
-    if (!(await docker.inspectImage(CP_IMAGE))) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
+    const api = await docker.inspectImage(want.ref);
+    if (!api) throw new AppError('IMAGE_MISSING', { image: want.ref });
+    const cp = await docker.inspectImage(CP_IMAGE);
+    if (!cp) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
     ensurePrivateDir(bundleDir);
     const name = bundleName(variant);
     const final = path.join(bundleDir, name);
     const partial = `${final}.partial`;
+    const manifest = { format: 1, hindsight: HINDSIGHT_VERSION, variant, images: [{ ref: want.ref, id: api.Id }, { ref: CP_IMAGE, id: cp.Id }], createdAt: new Date(now()).toISOString() };
+    const appender = createTarAppender(BUNDLE_MANIFEST, Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`));
     const hash = crypto.createHash('sha256');
     let size = 0;
     const hasher = new Transform({ transform(chunk, _e, cb) { hash.update(chunk); size += chunk.length; cb(null, chunk); } });
-    const file = fs.createWriteStream(partial, { mode: 0o600 });
-    hasher.pipe(file);
+    const written = pipeline(appender, hasher, fs.createWriteStream(partial, { mode: 0o600 }));
     line(`docker save ${want.ref} ${CP_IMAGE} → ${final}`);
     try {
-      await docker.save([want.ref, CP_IMAGE], hasher);
-      if (!file.writableFinished) await new Promise((r, j) => { file.once('finish', r); file.once('error', j); });
+      await docker.save([want.ref, CP_IMAGE], appender);
+      await written;
     } catch (e) {
+      appender.destroy();
+      await written.catch(() => {});
       fs.rmSync(partial, { force: true });
       throw e;
     }
     fs.renameSync(partial, final);
     const sha256 = hash.digest('hex');
     line(`wrote ${size} bytes, sha256 ${sha256}`);
-    return { name, path: final, size, sha256 };
+    return { name, path: final, size, sha256, images: manifest.images };
   }
 
   const handlers = {
     async pull({ variant }, line) {
       await docker.pull(API_IMAGES[variant].ref, line);
-      return { image: API_IMAGES[variant].ref };
+      const img = await docker.inspectImage(API_IMAGES[variant].ref);
+      return { image: API_IMAGES[variant].ref, id: img?.Id ?? null, pinned: !!img && isPinnedApiImage(variant, img.Id) };
     },
     async 'build-cp'(_p, line) {
-      await docker.runHelper(names.build, buildCpArgs(), line);
-      return { image: CP_IMAGE };
+      // The helper gets the Docker socket: resolve it by digest, verify its ID, run it by ID.
+      let helper = await docker.inspectImage(BUILD_HELPER.ref);
+      if (!helper) {
+        line(`docker pull ${BUILD_HELPER.ref}`);
+        await docker.pull(BUILD_HELPER.ref, line);
+        helper = await docker.inspectImage(BUILD_HELPER.ref);
+      }
+      if (!helper || !isPinnedHelper(helper.Id)) throw new AppError('HELPER_UNTRUSTED', { image: BUILD_HELPER.ref, id: helper?.Id ?? 'none' });
+      await docker.runHelper(names.build, helper.Id, buildCpCommand(), line);
+      const built = await docker.inspectImage(CP_IMAGE);
+      if (!built) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
+      cpTrust.set(built.Id, 'build');
+      line(`trusted ${CP_IMAGE} as ${built.Id}`);
+      return { image: CP_IMAGE, id: built.Id };
     },
     async import({ stdin, path: file }, line) {
       let input = stdin;
@@ -113,9 +143,28 @@ export function createJobs({ docker, supervisor, names, owner, dataDir, now = ()
         input = fs.createReadStream(file);
         line(`docker load < ${file}`);
       }
+      let manifest = null;
+      const scanner = createTarScanner(BUNDLE_MANIFEST, (buf) => {
+        try { manifest = JSON.parse(buf.toString('utf8')); } catch { manifest = null; }
+      });
+      input.on('error', (e) => scanner.destroy(e));
+      input.pipe(scanner);
       const lines = [];
-      await docker.load(input, (l) => { lines.push(l); line(l); });
-      return { loaded: loadedFrom(lines) };
+      await docker.load(scanner, (l) => { lines.push(l); line(l); });
+      const loaded = [];
+      for (const ref of loadedFrom(lines)) {
+        const img = await docker.inspectImage(ref);
+        loaded.push(standing(ref, img?.Id ?? ref));
+      }
+      return { loaded, manifest };
+    },
+    async 'trust-cp'({ confirm }, line) {
+      const cp = await docker.inspectImage(CP_IMAGE);
+      if (!cp) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
+      if (cp.Id !== confirm) throw new AppError('CONFIRMATION_REQUIRED', { expected: cp.Id });
+      cpTrust.set(cp.Id, 'confirmed');
+      line(`trusted ${CP_IMAGE} as ${cp.Id}`);
+      return { image: CP_IMAGE, id: cp.Id };
     },
     export: ({ variant }, line) => exportBundle(variant, line),
     async 'remove-images'(_p, line) {
@@ -154,6 +203,10 @@ export function createJobs({ docker, supervisor, names, owner, dataDir, now = ()
       if (!st.isFile()) throw new AppError('IMPORT_PATH_INVALID', { path: p.path, detail: 'not a regular file' });
       try { fs.accessSync(p.path, fs.constants.R_OK); } catch { throw new AppError('IMPORT_PATH_INVALID', { path: p.path, detail: 'not readable' }); }
       return { path: p.path };
+    }
+    if (kind === 'trust-cp') {
+      if (typeof p.confirm !== 'string' || !IMAGE_ID_RE.test(p.confirm)) throw new AppError('CONFIRMATION_REQUIRED', { expected: 'the control-plane image ID (sha256:…)' });
+      return { confirm: p.confirm };
     }
     if (kind === 'remove-images') {
       if (p.confirm !== true) throw new AppError('CONFIRMATION_REQUIRED', { expected: 'confirm: true' });
@@ -202,7 +255,8 @@ export function createJobs({ docker, supervisor, names, owner, dataDir, now = ()
           fs.closeSync(fd);
           running = null;
         }
-        if (job.state === 'done') await supervisor.afterPrecondition().catch(() => {});
+        // Only a job that can fix a start precondition may start Hindsight; the others re-read.
+        if (job.state === 'done') await (PRECONDITION_JOBS.has(kind) ? supervisor.afterPrecondition() : supervisor.refresh()).catch(() => {});
         return view(job);
       })();
       return { job: view(job), done };
