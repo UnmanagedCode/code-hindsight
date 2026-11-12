@@ -102,3 +102,33 @@ test('an oversized PAX header passes through unchanged and keeps the archive rea
     assert.equal(spawnSync('tar', ['xOf', file, 'blobs/sha256/bbbb']).stdout.length, 2000);
   }
 });
+
+// Round 3: an empty PAX header (x or g, size 0) ends at once: the next entry's data is data,
+// even when it looks like a PAX size= record.
+for (const type of ['x', 'g']) {
+  test(`an empty ${type} PAX header does not swallow the next entry`, async () => {
+    const empty = tarEntry('PaxHeader', Buffer.alloc(0));
+    empty[156] = type.charCodeAt(0);
+    fixChecksum(empty);
+    const decoy = Buffer.from('30 size=999999999999\nmore text');
+    const body = Buffer.concat([
+      empty,
+      tarEntry('code-hindsight-bundle.json', Buffer.from('{"m":1}')),
+      tarEntry('decoy.txt', decoy),
+      tarEntry('after.txt', Buffer.from('tail')),
+    ]);
+    const input = Buffer.concat([body, Buffer.alloc(1024), Buffer.alloc(4096)]);
+    let seen = null;
+    const passed = await through(createTarScanner('code-hindsight-bundle.json', (b) => { seen = b; }), input, 300);
+    assert.deepEqual(passed, input, 'passthrough bytes unchanged');
+    assert.equal(String(seen), '{"m":1}', 'the manifest is reported');
+    let afterSeen = null;
+    await through(createTarScanner('after.txt', (b) => { afterSeen = b; }), input, 300);
+    assert.equal(String(afterSeen), 'tail', 'the PAX-looking payload changed no entry size');
+    const appended = await through(createTarAppender('extra.json', Buffer.from('{"e":2}')), input, 300);
+    assert.deepEqual(appended.subarray(0, body.length), body);
+    let extra = null;
+    await through(createTarScanner('extra.json', (b) => { extra = b; }), appended, 300);
+    assert.equal(String(extra), '{"e":2}', 'the appender found the real end-of-archive marker');
+  });
+}

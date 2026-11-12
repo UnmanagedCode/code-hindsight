@@ -149,6 +149,9 @@ function tarWalker({ onHeader = () => {}, onData = () => {}, onEnd = () => {} })
       }
       remaining = size;
       padding = (BLOCK - (size % BLOCK)) % BLOCK;
+      // An empty PAX header has no data to finish it: drop it now, or the next entry's data
+      // would be read as its records.
+      if (pax && size === 0) pax = null;
       if (type !== 'x' && type !== 'g') onHeader(readName(h), size);
     }
     base += off;
