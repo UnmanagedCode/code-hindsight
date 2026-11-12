@@ -1,0 +1,233 @@
+// jobs.js over the fake docker: each explicit action's docker arguments, one job at a time,
+// streamed import, bundle export, and the confirmations destructive actions need.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { Readable } from 'node:stream';
+import { createDocker } from '../src/docker.js';
+import { createJobs, buildCpCommand, bundleName, BUNDLE_MANIFEST } from '../src/jobs.js';
+import { createCpTrust } from '../src/trust.js';
+import { createTarScanner } from '../src/tarStream.js';
+import { resourceNames, ownerId } from '../src/containerSpec.js';
+import { API_IMAGES, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, UPSTREAM_REVISION } from '../src/pins.js';
+import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, goodApiImage, goodCpImage, helperImage, CP_ID, fakeBundle } from './helpers.mjs';
+
+const names = resourceNames('code-hindsight');
+
+function make(t, { seed, mode } = {}) {
+  const r = mkRoot(t);
+  seedDocker(r, seed);
+  fs.mkdirSync(r.dataDir, { recursive: true, mode: 0o700 });
+  const docker = createDocker({ env: fakeEnv(r, { mode }), allowSudo: () => true, prefix: 'code-hindsight', images: [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE, BUILD_HELPER.ref], runDir: r.dataDir });
+  const after = [];
+  const refreshed = [];
+  const supervisor = { afterPrecondition: async () => { after.push(1); }, refresh: async () => { refreshed.push(1); } };
+  const owner = ownerId(r.dataDir);
+  const cpTrust = createCpTrust(r.dataDir);
+  const jobs = createJobs({ docker, supervisor, cpTrust, names, owner, dataDir: r.dataDir });
+  return { r, docker, jobs, after, refreshed, owner, cpTrust };
+}
+const ourContainer = (owner, running) => ({ Name: '/x', Image: 'i', Config: { Labels: { [LABELS.owner]: owner } }, State: { Status: running ? 'running' : 'exited', Running: running } });
+
+// Spec 3: pull is an explicit job; it runs `docker pull` of the pinned ref only, then re-checks.
+test('pull pulls the pinned image of the variant and re-checks the preconditions', async (t) => {
+  const { r, jobs, after } = make(t, { seed: { images: {} } });
+  const { job, done } = jobs.start('pull', { variant: 'slim' });
+  assert.equal(job.state, 'running');
+  const end = await done;
+  assert.equal(end.state, 'done', JSON.stringify(end.error));
+  assert.deepEqual(dockerCalls(r).find((a) => a[0] === 'pull'), ['pull', API_IMAGES.slim.ref]);
+  assert.ok(dockerState(r).images[API_IMAGES.slim.ref]);
+  assert.match(end.tail, /Downloaded/);
+  assert.equal(after.length, 1);
+  assert.match(fs.readFileSync(path.join(r.dataDir, 'logs', 'jobs', `${job.id}.log`), 'utf8'), /Pulling/);
+});
+
+// Spec 6 + S8: the CP image is built from the pinned upstream commit with our base path.
+// S1: the helper gets the Docker socket only as the pinned image, run by its verified ID.
+// S2: a successful build records the built image's ID as the trusted CP image.
+test('build-cp runs buildx at the pinned commit in the verified helper, by ID, and trusts the result', async (t) => {
+  const { r, jobs, cpTrust, after } = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage(), [BUILD_HELPER.ref]: helperImage() }, registry: { [CP_IMAGE]: goodCpImage() } } });
+  const end = await jobs.start('build-cp').done;
+  assert.equal(end.state, 'done', JSON.stringify(end.error));
+  const run = dockerCalls(r).find((a) => a[0] === 'run');
+  assert.deepEqual(run.slice(0, 7), ['run', '--rm', '--name', 'code-hindsight-build', '-v', '/var/run/docker.sock:/var/run/docker.sock', BUILD_HELPER.ids[0]]);
+  assert.deepEqual(run.slice(7), buildCpCommand());
+  const cmd = buildCpCommand();
+  assert.ok(cmd.includes(`https://github.com/vectorize-io/hindsight.git#${UPSTREAM_REVISION}`));
+  assert.equal(cmd[cmd.indexOf('--target') + 1], 'cp-only');
+  assert.equal(cmd[cmd.indexOf('-f') + 1], 'docker/standalone/Dockerfile');
+  assert.equal(cmd[cmd.indexOf('--build-arg') + 1], `NEXT_PUBLIC_BASE_PATH=${BASE_PATH}`);
+  assert.ok(cmd.includes(`${LABELS.basePath}=${BASE_PATH}`) && cmd.includes(`${LABELS.upstream}=${UPSTREAM_REVISION}`));
+  assert.equal(cmd[cmd.indexOf('-t') + 1], CP_IMAGE);
+  assert.deepEqual(cpTrust.get().id, CP_ID);
+  assert.equal(cpTrust.get().source, 'build');
+  assert.equal(end.result.id, CP_ID);
+  assert.equal(after.length, 1, 'a precondition job re-checks the start');
+});
+
+test('build-cp pulls a missing helper by its pinned digest, never by tag', async (t) => {
+  const { r, jobs } = make(t, { seed: { images: {}, registry: { [BUILD_HELPER.ref]: helperImage(), [CP_IMAGE]: goodCpImage() } } });
+  const end = await jobs.start('build-cp').done;
+  assert.equal(end.state, 'done', JSON.stringify(end.error));
+  assert.deepEqual(dockerCalls(r).find((a) => a[0] === 'pull'), ['pull', BUILD_HELPER.ref]);
+  assert.match(BUILD_HELPER.ref, /@sha256:[0-9a-f]{64}$/);
+});
+
+test('a helper image whose ID is not pinned never gets the Docker socket', async (t) => {
+  const forged = { Id: `sha256:${'e'.repeat(64)}`, Config: { Labels: {} } };
+  const { r, jobs, docker } = make(t, { seed: { images: { [BUILD_HELPER.ref]: forged } } });
+  const end = await jobs.start('build-cp').done;
+  assert.equal(end.error.code, 'HELPER_UNTRUSTED');
+  assert.equal(end.error.params.id, forged.Id);
+  assert.ok(!dockerCalls(r).some((a) => a[0] === 'run'));
+  await docker.resolve();
+  assert.throws(() => docker.runHelper('code-hindsight-build', forged.Id, ['true']), /refusing to give the Docker socket/);
+  assert.throws(() => docker.runHelper('code-hindsight-build', 'docker:29.9.2-cli', ['true']), /refusing to give the Docker socket/);
+});
+
+// S2: an imported or otherwise unknown CP image ID runs only after the user confirms that ID.
+test('trust-cp records the CP image ID only when the confirmation names the current ID', async (t) => {
+  const { jobs, cpTrust, after } = make(t);
+  assert.throws(() => jobs.start('trust-cp', {}), { code: 'CONFIRMATION_REQUIRED' });
+  assert.throws(() => jobs.start('trust-cp', { confirm: 'yes' }), { code: 'CONFIRMATION_REQUIRED' });
+  const wrong = await jobs.start('trust-cp', { confirm: `sha256:${'0'.repeat(64)}` }).done;
+  assert.equal(wrong.error.code, 'CONFIRMATION_REQUIRED');
+  assert.equal(wrong.error.params.expected, CP_ID);
+  assert.equal(cpTrust.get(), null);
+  const ok = await jobs.start('trust-cp', { confirm: CP_ID }).done;
+  assert.equal(ok.state, 'done');
+  assert.deepEqual([cpTrust.get().id, cpTrust.get().source], [CP_ID, 'confirmed']);
+  assert.equal(after.length, 1);
+});
+
+// Decision 14: one job at a time.
+test('a second job while one runs is refused BUSY', async (t) => {
+  const { jobs } = make(t);
+  const first = jobs.start('pull', { variant: 'full' });
+  assert.throws(() => jobs.start('pull', { variant: 'slim' }), (e) => e.code === 'BUSY' && e.params.job === 'pull');
+  await first.done;
+  assert.equal((await jobs.start('pull', { variant: 'slim' }).done).state, 'done');
+});
+
+test('a failed job reports its error and frees the runner', async (t) => {
+  const { jobs, after } = make(t, { seed: { registry: {} } });
+  const end = await jobs.start('pull', { variant: 'full' }).done;
+  assert.equal(end.state, 'failed');
+  assert.match(end.error.message, /pull access denied/);
+  assert.equal(after.length, 0);
+  assert.equal(jobs.current(), null);
+});
+
+// Spec 3: import from an upload streams the body into `docker load`.
+test('import streams an upload into docker load and reports the loaded tags', async (t) => {
+  const { jobs, r } = make(t, { seed: { images: {} } });
+  const bundle = { [API_IMAGES.full.ref]: goodApiImage(), [CP_IMAGE]: goodCpImage() };
+  const end = await jobs.start('import', { stdin: Readable.from(chunks(fakeBundle(bundle), 700)) }).done;
+  assert.equal(end.state, 'done', JSON.stringify(end.error));
+  // Each loaded image with its ID and standing: the API image is pinned, the CP image needs confirming.
+  assert.deepEqual(end.result.loaded, [
+    { ref: API_IMAGES.full.ref, id: API_IMAGES.full.ids[0], status: 'pinned' },
+    { ref: CP_IMAGE, id: CP_ID, status: 'needs-confirmation' },
+  ]);
+  assert.equal(end.result.manifest, null, 'a plain docker save has no bundle manifest');
+  assert.deepEqual(dockerCalls(r).find((a) => a[0] === 'load'), ['load']);
+});
+
+test('import from a host path validates the path, then loads the file', async (t) => {
+  const { jobs, r } = make(t, { seed: { images: {} } });
+  assert.throws(() => jobs.start('import', { path: 'relative.tar' }), { code: 'IMPORT_PATH_INVALID' });
+  assert.throws(() => jobs.start('import', { path: path.join(r.root, 'missing.tar') }), (e) => e.code === 'IMPORT_PATH_INVALID' && /no such file/.test(e.message));
+  assert.throws(() => jobs.start('import', { path: r.root }), (e) => /not a regular file/.test(e.message));
+  const file = path.join(r.root, 'bundle.tar');
+  fs.writeFileSync(file, fakeBundle({ [API_IMAGES.slim.ref]: { ...goodApiImage('slim'), Id: `sha256:${'9'.repeat(64)}` } }));
+  const end = await jobs.start('import', { path: file }).done;
+  assert.deepEqual(end.result.loaded, [{ ref: API_IMAGES.slim.ref, id: `sha256:${'9'.repeat(64)}`, status: 'not-pinned' }]);
+});
+
+// Spec 3: export writes a bundle of the API image and the CP image, with size and sha256.
+test('export saves the variant\'s API image and the CP image to a 0600 bundle with its sha256', async (t) => {
+  const { jobs, r } = make(t);
+  const end = await jobs.start('export', { variant: 'full' }).done;
+  assert.equal(end.state, 'done', JSON.stringify(end.error));
+  assert.deepEqual(dockerCalls(r).find((a) => a[0] === 'save'), ['save', API_IMAGES.full.ref, CP_IMAGE]);
+  const file = end.result.path;
+  assert.equal(path.basename(file), bundleName('full'));
+  const bytes = fs.readFileSync(file);
+  assert.equal(end.result.size, bytes.length);
+  assert.equal(end.result.sha256, crypto.createHash('sha256').update(bytes).digest('hex'));
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.equal(jobs.bundlePath(bundleName('full')), file);
+  assert.equal(jobs.bundlePath('../secrets.json'), null);
+  assert.equal(jobs.bundlePath(bundleName('slim')), null, 'only bundles that exist');
+  assert.deepEqual(jobs.bundles().map((b) => b.name), [bundleName('full')]);
+  // The bundle carries a manifest of the image IDs inside it, and stays loadable.
+  let manifest = null;
+  await new Promise((res, rej) => Readable.from([bytes]).pipe(createTarScanner(BUNDLE_MANIFEST, (b) => { manifest = JSON.parse(b); })).on('finish', res).on('error', rej).resume());
+  assert.deepEqual(manifest.images, [{ ref: API_IMAGES.full.ref, id: API_IMAGES.full.ids[0] }, { ref: CP_IMAGE, id: CP_ID }]);
+  assert.deepEqual(end.result.images, manifest.images);
+  const reimport = await jobs.start('import', { path: file }).done;
+  assert.equal(reimport.state, 'done', JSON.stringify(reimport.error));
+  assert.deepEqual(reimport.result.manifest.images, manifest.images, 'the import reads the manifest back');
+});
+
+test('export of a missing image is refused before anything is written', async (t) => {
+  const { jobs, r } = make(t, { seed: { images: { [CP_IMAGE]: goodCpImage() } } });
+  const end = await jobs.start('export', { variant: 'slim' }).done;
+  assert.equal(end.error.code, 'IMAGE_MISSING');
+  assert.ok(!dockerCalls(r).some((a) => a[0] === 'save'));
+  assert.equal(fs.existsSync(path.join(r.dataDir, 'bundles', bundleName('slim'))), false);
+});
+
+// Spec 4: the volume is deleted only on a confirmed action, with the containers stopped.
+test('delete-volume needs the typed volume name and stopped containers', async (t) => {
+  const { jobs, r, owner } = make(t);
+  assert.throws(() => jobs.start('delete-volume', {}), (e) => e.code === 'CONFIRMATION_REQUIRED' && e.params.expected === names.volume);
+  assert.throws(() => jobs.start('delete-volume', { confirm: 'yes' }), { code: 'CONFIRMATION_REQUIRED' });
+  seedDocker(r, { containers: { [names.api]: ourContainer(owner, true) }, volumes: { [names.volume]: { Name: names.volume, Labels: { [LABELS.owner]: owner } } } });
+  const refused = await jobs.start('delete-volume', { confirm: names.volume }).done;
+  assert.equal(refused.error.code, 'CONTAINERS_RUNNING');
+  assert.ok(dockerState(r).volumes[names.volume]);
+  seedDocker(r, { containers: { [names.api]: ourContainer(owner, false) }, volumes: { [names.volume]: { Name: names.volume, Labels: { [LABELS.owner]: owner } } } });
+  const end = await jobs.start('delete-volume', { confirm: names.volume }).done;
+  assert.equal(end.state, 'done', JSON.stringify(end.error));
+  assert.equal(dockerState(r).volumes[names.volume], undefined);
+});
+
+test('remove-images needs confirmation and stopped containers, and removes only pinned tags', async (t) => {
+  const { jobs, r, owner } = make(t);
+  assert.throws(() => jobs.start('remove-images', {}), { code: 'CONFIRMATION_REQUIRED' });
+  seedDocker(r, { containers: { [names.cp]: ourContainer(owner, true) } });
+  assert.equal((await jobs.start('remove-images', { confirm: true }).done).error.code, 'CONTAINERS_RUNNING');
+  seedDocker(r);
+  setStateExtra(r);
+  const end = await jobs.start('remove-images', { confirm: true }).done;
+  assert.deepEqual(end.result.removed, [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE]);
+  assert.deepEqual(Object.keys(dockerState(r).images).sort(), [BUILD_HELPER.ref, 'node:24'].sort(), 'the build helper and unpinned images stay');
+});
+
+function setStateExtra(r) {
+  const s = dockerState(r);
+  s.images['node:24'] = { Id: 'n' };
+  fs.writeFileSync(r.statePath, JSON.stringify(s));
+}
+
+test('unknown kinds and bad variants are refused', (t) => {
+  const { jobs } = make(t);
+  assert.throws(() => jobs.start('format-disk'), { code: 'NOT_FOUND' });
+  assert.throws(() => jobs.start('pull', { variant: 'mega' }), { code: 'BAD_REQUEST' });
+});
+
+// C5: only jobs that fix a start precondition may start Hindsight; the others only re-read.
+test('export, delete-volume and remove-images never trigger a start', async (t) => {
+  const { jobs, after, refreshed } = make(t);
+  await jobs.start('export', { variant: 'full' }).done;
+  await jobs.start('delete-volume', { confirm: names.volume }).done;
+  await jobs.start('remove-images', { confirm: true }).done;
+  assert.equal(after.length, 0);
+  assert.equal(refreshed.length, 3);
+});
+
+const chunks = (buf, n) => { const out = []; for (let i = 0; i < buf.length; i += n) out.push(buf.subarray(i, i + n)); return out; };
