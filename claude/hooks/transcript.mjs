@@ -1,0 +1,120 @@
+// Claude Code transcript (JSONL) → the turns worth remembering. Mirrors Hindsight's own
+// coding-agents reader (`readClaudeTranscript` in core/transcript.ts and the helpers in
+// core/transcript-util.ts): user and assistant prose, plus one compact `action` turn per tool
+// call (tool name and primary target). Tool results, other tool arguments, thinking, sidechain
+// lines, `isMeta` lines and compaction summaries are dropped; injected-memory tags are stripped.
+// Pure apart from `readTranscriptTail`; imported by the hook and the tests.
+import fs from 'node:fs';
+
+/** Injected context removed from retained text, so a retain never re-ingests its own recall. */
+export const MEMORY_TAG_RE =
+  /<(hook_prompt|task-notification|system-reminder|hindsight_memory|hindsight_memories|hindsight_bank|relevant_memories|user_feedback|hindsight_pages|hindsight_page_refresh|hindsight_knowledge|hindsight_knowledge_refresh)\b[\s\S]*?<\/\1>/g;
+
+/** Keys tried, in order, to find a tool call's primary target. */
+const TARGET_KEYS = ['file_path', 'path', 'notebook_path', 'command', 'pattern', 'query', 'url', 'name', 'id'];
+export const ACTION_TARGET_CAP = 100;
+/** Only this much of a transcript's end is read; a longer file is cut at a line boundary. */
+export const TRANSCRIPT_READ_BYTES = 8 * 1024 * 1024;
+
+export const stripInjectedMemory = (s) => s.replace(MEMORY_TAG_RE, '');
+
+export function actionLine(tool, input) {
+  let target = '';
+  if (input && typeof input === 'object') {
+    for (const k of TARGET_KEYS) {
+      const v = input[k];
+      if (typeof v === 'string' && v.trim()) { target = v.trim().split('\n')[0]; break; }
+    }
+  } else if (typeof input === 'string') {
+    target = input.trim().split('\n')[0];
+  }
+  if (target.length > ACTION_TARGET_CAP) target = `${target.slice(0, ACTION_TARGET_CAP)}…`;
+  return target ? `${tool} ${target}` : tool;
+}
+
+function render(content, type) {
+  if (typeof content === 'string') {
+    const text = stripInjectedMemory(content).trim();
+    return text ? [{ role: type, content: text }] : [];
+  }
+  if (!Array.isArray(content)) return [];
+  const texts = [];
+  const actions = [];
+  for (const b of content) {
+    if (!b || typeof b !== 'object') continue;
+    if (b.type === 'text' && typeof b.text === 'string') {
+      const t = stripInjectedMemory(b.text).trim();
+      if (t) texts.push(t);
+    } else if (b.type === 'tool_use' && typeof b.name === 'string') {
+      actions.push({ role: 'action', content: actionLine(b.name, b.input) });
+    }
+  }
+  const out = [];
+  const joined = texts.join('\n').trim();
+  if (joined) out.push({ role: type, content: joined });
+  return out.concat(actions);
+}
+
+/**
+ * Turns of a transcript's text: `{id, role: 'user'|'assistant'|'action', content, timestamp}`.
+ * `id` is the entry's uuid (an action's is `<uuid>#<n>`). Unparsable lines (a partial last line
+ * is normal while the file is being written) and lines that are not real messages are skipped.
+ */
+export function parseTranscript(text) {
+  const turns = [];
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i].trim();
+    if (!raw) continue;
+    let line;
+    try { line = JSON.parse(raw); } catch { continue; }
+    if (!line || typeof line !== 'object') continue;
+    if (line.type !== 'user' && line.type !== 'assistant') continue;
+    if (line.isMeta === true || line.isSidechain === true || line.isCompactSummary === true) continue;
+    if (!line.message || typeof line.message !== 'object') continue;
+    const base = typeof line.uuid === 'string' && line.uuid ? line.uuid : `line-${i}`;
+    let actionN = 0;
+    for (const r of render(line.message.content, line.type)) {
+      turns.push({
+        id: r.role === 'action' ? `${base}#${actionN++}` : base,
+        role: r.role,
+        content: r.content,
+        timestamp: typeof line.timestamp === 'string' ? line.timestamp : null,
+      });
+    }
+  }
+  return turns;
+}
+
+/** Turns of the transcript file's end; [] when it cannot be read. */
+export function readTranscriptTail(file) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const { size } = fs.fstatSync(fd);
+      const len = Math.min(size, TRANSCRIPT_READ_BYTES);
+      const buf = Buffer.alloc(len);
+      fs.readSync(fd, buf, 0, len, size - len);
+      let text = buf.toString('utf8');
+      if (size > len) text = text.slice(text.indexOf('\n') + 1);
+      return parseTranscript(text);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return [];
+  }
+}
+
+/** The newest turns whose JSON stays within `maxBytes` (oldest dropped first). */
+export function trimTurnsToBytes(turns, maxBytes) {
+  let used = 0;
+  let from = turns.length;
+  while (from > 0) {
+    const size = Buffer.byteLength(JSON.stringify(turns[from - 1])) + 1;
+    if (used + size > maxBytes) break;
+    used += size;
+    from--;
+  }
+  return turns.slice(from);
+}

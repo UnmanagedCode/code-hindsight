@@ -4,5 +4,22 @@
   "version": "0.1.0",
   "pluginApi": 1,
   "backend": { "start": "node server.js", "healthPath": "/-/api/health" },
-  "frontend": { "path": "/", "navLabel": "Code Hindsight" }
+  "frontend": { "path": "/", "navLabel": "Code Hindsight" },
+  "claudePlugin": "claude",
+  "mcp": {
+    "endpoint": "/-/mcp",
+    "timeoutMs": 15000,
+    "tools": [
+      {
+        "name": "recall",
+        "description": "Search the notes earlier cc sessions left in Hindsight memory. Searches only the banks this session's memory scopes allow; returns the matching notes as text, or says there is no recall scope.",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "query": { "type": "string", "minLength": 1, "maxLength": 2000, "description": "What to look for, in natural language." } },
+          "required": ["query"],
+          "additionalProperties": false
+        }
+      }
+    ]
+  }
 }

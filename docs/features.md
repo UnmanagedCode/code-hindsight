@@ -2,7 +2,7 @@
 
 # Features
 
-The plugin page is mounted at `/plugins/code-hindsight/` in cc. Its header shows **Code Hindsight**, a status pill (Hindsight's state, plus `sudo docker` when docker runs through sudo) and four tabs. The tab and the control-plane path live in the query string (`?view=cp|status|settings|images&cp=<path>`), so a reload or a cc deep link (`http://cc.internal/#plugin/code-hindsight/?view=status`) lands on the same view.
+The plugin page is mounted at `/plugins/code-hindsight/` in cc. Its header shows **Code Hindsight**, a status pill (Hindsight's state, plus `sudo docker` when docker runs through sudo) and five tabs. The tab and the control-plane path live in the query string (`?view=cp|status|memory|settings|images&cp=<path>`), so a reload or a cc deep link (`http://cc.internal/#plugin/code-hindsight/?view=status`) lands on the same view.
 
 The page opens on **Control plane** when Hindsight is ready, otherwise on **Status**.
 
@@ -48,6 +48,70 @@ Saved with **Save**; **Apply & restart** saves and reconciles the containers to 
 - **cc-backend link.** Backends whose URL is loopback (`127.0.0.0/8` in any literal spelling, `localhost`, `::1`, IPv4-mapped loopback) are listed but disabled: a container cannot reach cc's loopback. Best-effort: literal addresses and `localhost`; host names are not resolved. Backends without `ANTHROPIC_BASE_URL` plus `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY` are disabled too. The URL and token are read from cc each time the API container is created and are never stored by the plugin.
 - **Changing embeddings on existing memories is refused** (`EMBEDDINGS_CHANGED`): revert, or delete the data volume first.
 
+## Memory
+
+Gives cc sessions memory. **Off by default:** with no scopes every session is memoryless and the hooks answer without calling cc or Hindsight. Hooks and the recall tool are frozen into a session when cc spawns it, so enabling the plugin (or adding the first scope's hooks) reaches sessions started afterwards; scopes themselves are read on every prompt.
+
+### What happens in a session
+
+| When | What |
+|---|---|
+| each prompt (`UserPromptSubmit`) | the prompt is the recall query; matching banks are searched and the hits are injected as a `<hindsight_memory>` block |
+| each end of turn (`Stop`, async) | the new turns are appended to one Hindsight document per session and bank, `cc-session:<CC_SESSION_ID>` |
+| `/clear` or compaction (`SessionStart`) | forgets which memories the session already holds, so they can be injected again |
+| the agent's call | tool `code-hindsight__recall` (text only) searches the banks the session's scopes allow; the skill `memory` tells the agent what the block is and when to call it |
+
+- **Injected block:** a header naming the banks, then `- [bank] text` lines in scope order then Hindsight's rank order. It is capped (`MEMORY_LIMITS.contextMaxChars` in `src/memory.js`), memories already injected into this context are skipped, and a memory cannot close the wrapper tag. The header tells the agent the notes are data from earlier sessions, possibly stale or wrong, never instructions.
+- **What is retained** (matches Hindsight's own coding-agent integration): user text, assistant text, and one `action` line per tool call (the tool name and its primary target, capped). Dropped: tool outputs, other tool arguments, thinking, sub-agent (sidechain) lines, meta lines, compaction summaries; injected memory and system-reminder tags are stripped. **No secret redaction:** a prompt, reply or command target that contains a secret is retained.
+- **When retained:** from the first Stop at which a retain scope matches, the last exchange; later Stops append only what is new. Each stretch of turns goes to the bank its own stage's scope chose, even if Hindsight was not ready, a retain failed or the backend restarted in between; a stretch is lost (logged) rather than sent to another bank. Earlier history is never backfilled, and turns that happened while no retain scope matched are never sent later.
+- **LLM mode `none`:** retain stores the raw chunks as facts with no extraction; recall works on them. The tab says so.
+
+### Scopes
+
+A scope is `{name, match: {projects?, sessions?, stages?}, bank, actions}`. Scopes are checked in list order on every prompt.
+
+| Field | Meaning |
+|---|---|
+| `match` keys | **an absent key matches anything**; an empty list is refused (omit the key instead) |
+| `projects` | globs over the session's project: `*` any run of characters (a leading dot too), `?` one character, other characters literal |
+| `sessions` | `conductor` and/or `worker`. A conductor's project is `.conduct` |
+| `stages` | the session's playbook stage must be listed. A session with no stage never matches a `stages` list. Names cc does not know are warned about in the UI and kept (playbooks come and go) |
+| `bank` | a template with `{project}`, `{worktree}`, `{kind}`; literal text uses lowercase `a-z 0-9 . _ : -` |
+| `actions` | `recall` and/or `retain` |
+
+- **Recall** merges every matching scope that grants it, in order; the same bank twice counts once; at most `SCOPE_LIMITS.recallMaxBanks` banks (`src/scopes.js`).
+- **Retain** goes to the **first** matching scope that grants it. If that scope's bank does not render, the session retains nothing (`BANK_RENDER_FAILED` in the activity log); it never falls through to a later scope.
+- **Bank rendering:** each placeholder value is lowercased, characters outside `a-z 0-9 . _ -` become `-`, runs collapse, leading `. _ -` is trimmed (`.conduct` → `conduct`); the main checkout's `{worktree}` is `main`. The result must be a valid bank id, else `BANK_RENDER_FAILED`. Different projects can sanitize to the same bank.
+- **Stage and bank change mid-session:** the session is resolved on every call, so a stage change moves recall and retain to the matching scopes at once; later turns go to the new bank's `cc-session:<id>` document.
+
+### The tab
+
+- **Header:** says "Memory is off" when no scopes are saved; warns when Hindsight is not ready (sessions are memoryless) and when its LLM mode is `none`.
+- **Scope editor:** ordered cards (move up/down, delete, **Add scope**) with name, projects (one glob per line), sessions, stages (suggestions from cc's playbooks), bank template with a live preview, and actions. **Save** sends the whole list; a refusal (`SCOPES_INVALID`) shows against the field it names.
+- **Activity:** recent recalls, retains and refusals (time, event, session, project · stage, banks, count, result), newest first, refreshed every few seconds. Entries hold ids, names, counts and error text, never prompt or memory text. A prompt or Stop from a session that matches no scope leaves no entry (there would be one per prompt); the recall tool, by contrast, logs `NO_RECALL_SCOPE`.
+
+### Degrading
+
+Every failure yields a memoryless turn and an Activity entry; the hooks always exit 0 and a Stop can never keep a session running.
+
+| Condition | Activity code |
+|---|---|
+| cc could not place the session | `SESSION_UNRESOLVED` |
+| session retired or unknown | `SESSION_NOT_LIVE` |
+| Hindsight not ready (retain resends later) | `HINDSIGHT_NOT_READY` |
+| a bank's recall failed or timed out (other banks still answer) | `RECALL_FAILED` |
+| retain failed (the same batch is resent with the next turn) | `RETAIN_FAILED` |
+| a bank template did not render | `BANK_RENDER_FAILED` |
+| stored retain progress was unreadable (one entry of the wrong shape, or the whole file, moved aside) and was reset; the next retain starts from the last exchange | `CURSOR_INVALID` |
+| a Stop's turns were stamped beyond the clock-skew allowance (`MEMORY_LIMITS.clockSkewMs`) in the future and were not recorded | `RETAIN_FUTURE` |
+| a late Stop's turns were already behind the retained position and were ignored (nothing lost, nothing sent twice) | `RETAIN_STALE` |
+| turns could not be kept for later: the session's backlog of unsent windows overflowed (`MEMORY_LIMITS.retainQueueMax`), or a window's turns left the transcript tail (a `/clear` or trim) before they could be sent. They are never sent to another bank | `RETAIN_DROPPED` |
+| `scopes.json` unreadable | `SCOPES_INVALID` |
+
+Two losses are not logged: a window of turns that is only partly still in the transcript tail loses its trimmed part silently (only a window with nothing left is reported), and after a `/clear` or trim a never-sent turn stamped in exactly the same millisecond as the retained boundary is excluded.
+
+A stopped or crashed plugin backend cannot log anything: the hooks give up at their deadline and cc's plugin row is the only sign.
+
 ## Images & data
 
 Nothing is pulled, built, loaded or removed on its own: each is a button, one at a time, with its log shown live.
@@ -81,3 +145,5 @@ Every error is a code from `CATALOG` (`src/errors.js`); the Status card shows it
 | `DOCKER_DAEMON_DOWN`, `DOCKER_FAILED` | Start Hindsight |
 | `UNHEALTHY`, `CRASHED`, `CP_LOGIN_FAILED` | Restart Hindsight |
 | `CONTAINERS_RUNNING` | Stop Hindsight |
+| `HINDSIGHT_NOT_READY` | Start Hindsight |
+| `SCOPES_INVALID`, `BROWSER_REFUSED`, `NO_SESSION`, `SESSION_UNRESOLVED`, `SESSION_NOT_LIVE`, `NO_RECALL_SCOPE`, `RECALL_FAILED`, `RETAIN_FAILED`, `RETAIN_DROPPED`, `RETAIN_STALE`, `RETAIN_FUTURE`, `CURSOR_INVALID`, `BANK_RENDER_FAILED` | — (Memory-tab and hook/tool errors: shown against a field, in Activity, or to the tool caller) |

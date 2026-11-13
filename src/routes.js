@@ -9,6 +9,7 @@ import { USER_SECRETS } from './secrets.js';
 import { summarizeCcBackends } from './llmEnv.js';
 import { VARIANTS, API_IMAGES, CP_IMAGE, HINDSIGHT_VERSION } from './pins.js';
 import { bundleName } from './jobs.js';
+import { validateScopes, renderBank, templateProblem, SCOPE_ACTIONS, SESSION_KINDS, PLACEHOLDERS, SCOPE_LIMITS } from './scopes.js';
 
 const AUTOSTART_CACHE_MS = 10_000;
 
@@ -22,11 +23,14 @@ const isJson = (req) => /^application\/json\b/i.test(String(req.headers['content
  * @param {ReturnType<import('./settings.js').createSettingsStore>} o.settings
  * @param {ReturnType<import('./secrets.js').createSecretsStore>} o.secrets
  * @param {() => Promise<unknown>} o.fetchCcModels
+ * @param {ReturnType<import('./scopes.js').createScopesStore>} o.scopes
+ * @param {ReturnType<import('./activity.js').createActivityLog>} o.activity
+ * @param {ReturnType<import('./ccSession.js').createCcClient>} o.cc
  * @param {() => Promise<{autoStart?: boolean} | null>} o.fetchPluginRow cc's row for this plugin
  * @param {() => string} o.detectBind
  * @param {{api: string, cp: string}} o.containerNames
  */
-export function createRoutes({ supervisor, jobs, docker, settings: settingsStore, secrets, fetchCcModels, fetchPluginRow, detectBind, containerNames, now = () => Date.now() }) {
+export function createRoutes({ supervisor, jobs, docker, settings: settingsStore, secrets, fetchCcModels, fetchPluginRow, detectBind, containerNames, scopes, activity, cc, now = () => Date.now() }) {
   let autoStart = { at: 0, value: undefined };
 
   async function readAutoStart() {
@@ -83,6 +87,28 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
       if (Object.keys(effective).length) secrets.setUserSecrets(effective);
       if (sudoChanged) docker.reset();
       return { ...settingsView(), cleared, status: supervisor.status() };
+    }],
+    ['GET', '/-/api/scopes', () => ({
+      scopes: scopes.get(),
+      choices: { actions: SCOPE_ACTIONS, kinds: SESSION_KINDS, placeholders: PLACEHOLDERS, limits: SCOPE_LIMITS },
+    })],
+    ['PUT', '/-/api/scopes', async (req) => {
+      const body = await readJson(req);
+      const { scopes: valid, errors } = validateScopes(body.scopes);
+      if (errors.length) throw new AppError('SCOPES_INVALID', { fields: errors });
+      scopes.save(valid);
+      return { scopes: valid };
+    }],
+    ['POST', '/-/api/memory/preview-bank', async (req) => {
+      const { template, sample } = await readJson(req);
+      const problem = templateProblem(template);
+      if (problem) return { error: problem };
+      const s = sample && typeof sample === 'object' ? sample : {};
+      return renderBank(template, { project: String(s.project ?? 'example'), worktree: String(s.worktree ?? 'main'), kind: String(s.kind ?? 'worker') });
+    }],
+    ['GET', '/-/api/memory/activity', () => ({ entries: activity.list() })],
+    ['GET', '/-/api/memory/stages', async () => {
+      try { return { stages: await cc.fetchStages(), error: null }; } catch (e) { return { stages: [], error: e?.message ?? String(e) }; }
     }],
     ['GET', '/-/api/cc-backends', async () => ({ backends: summarizeCcBackends(await fetchCcModels()) })],
     ['POST', '/-/api/start', async () => { supervisor.ensureRunning(); return status(false); }],

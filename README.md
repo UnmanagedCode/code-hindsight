@@ -2,14 +2,15 @@
 
 A code-conductor (cc) plugin that runs [Hindsight](https://hindsight.vectorize.io), an agent memory server, in Docker on the cc host and shows Hindsight's control-plane UI inside cc at `/plugins/code-hindsight/`.
 
-It manages two containers (the Hindsight API with its embedded Postgres, and a control plane built for cc's mount path), keeps memories in a named Docker volume, works offline from exported image bundles, and reports every failure by name with the action that fixes it. Giving cc sessions memory through Claude Code hooks is not part of this plugin yet.
+It manages two containers (the Hindsight API with its embedded Postgres, and a control plane built for cc's mount path), keeps memories in a named Docker volume, works offline from exported image bundles, and reports every failure by name with the action that fixes it. It also gives cc sessions memory: Claude Code hooks recall from and retain into Hindsight banks chosen by user-configured scopes. Memory is off until a scope exists.
 
 ## Quick start
 
 1. In cc: **Settings → Plugins → Rescan**, enable **Code Hindsight**, open it from the app switcher.
 2. **Images & data:** **Pull full image** (or import a bundle), then **Build CP image** once (needs network). An imported control-plane image runs only after you confirm its ID there (a guard against running an unexpected image by accident; see [Trust model](#trust-model)).
 3. **Status → Start Hindsight**, then the **Control plane** tab.
-4. Switch on **Auto-start** for the plugin (Settings → Plugins) to have Hindsight up after every cc start: Hindsight runs only while the plugin's backend runs.
+4. **Memory** tab → **Add scope** and Save to switch memory on (it is off with no scopes). Sessions started afterwards use it.
+5. Switch on **Auto-start** for the plugin (Settings → Plugins) to have Hindsight up after every cc start: Hindsight runs only while the plugin's backend runs.
 
 Install hook for a Library entry: `npm install` (it builds `frontend/dist` through `prepare`).
 
@@ -28,10 +29,23 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 - **The plugin's own API (`/-/api/*`) is unauthenticated**, like cc's: any local process, or any script running on cc's origin, can drive it — and could already drive cc itself, which can do more. State-changing requests and every control-plane request must carry browser fetch metadata from this origin (`Sec-Fetch-Site: same-origin` or `none`), so other websites cannot.
 - **The control plane runs same-origin with cc** and renders memories that agents wrote. A script injected into it would have cc's full (unauthenticated) API.
 - **Both published ports need a key** (the API key; the CP access key, used server-side). Other containers on the Docker host can reach the bind address. Hindsight leaves `/health*`, `/version`, `/metrics`, `/docs`, `/openapi.json` (API) and its login/health/version routes (CP) open; none returns memory data.
+- **Session identity for memory is advisory, and scopes are not an isolation boundary.** The backend trusts the session id a hook or the recall tool claims (it must be a live cc session) and an agent can claim another live session's id. Every session also runs as the same OS user as the backend, so an agent with a shell can read `secrets.json` and query Hindsight directly. Scopes keep cooperating agents' memory in its lane; they do not contain an adversarial one.
+- **Retained content is not redacted.** Prompts, replies and tool-call targets (a command line, a path) that contain secrets reach Hindsight and, with an LLM configured, its provider.
+- **Recalled memory is other sessions' text.** It is wrapped and labelled as data, but a memory that tries to instruct the agent remains a risk.
+- **Every prompt is also sent to Hindsight (and, with an LLM configured, its provider) as a recall query** whenever a recall scope matches the session, whether or not the turn is retained.
+- **The hook and tool routes** (`/-/hook/*`, `/-/mcp`) refuse requests that look like a browser's, so a web page cannot read memories or inject retains through them.
 - Keys live in `secrets.json` (0600) in the plugin data dir and are never returned by any route. A key is cleared when its provider or URL changes without it being entered again.
 
 ## Known limitations
 
+- Hooks, the skill and the recall tool are fixed into a session when cc spawns it: enabling the plugin reaches only sessions started afterwards.
+- A stopped or crashed backend cannot log its own absence: hooks give up silently (a memoryless turn) and only cc's plugin row shows it.
+- The recall tool is text-only (no JSON format).
+- Bank names are sanitized, so different projects can map to the same bank.
+- If `memory/cursors.json` is lost, turns already retained can be retained again.
+- `memory/cursors.json` is one file, rewritten synchronously on each Stop and each drain step, and it holds each session's unacknowledged batch. Hundreds of sessions blocked at once on large batches make it large, and writing it can slow concurrent recalls.
+- With LLM mode `none`, retain stores raw chunks without fact extraction.
+- If Hindsight stays unavailable long enough that a session's backlog of unsent turns overflows, or the turns leave the transcript tail the hook sends, they are dropped (logged as `RETAIN_DROPPED`), never sent to another bank.
 - Inside the control plane, attachment links and images, the logo in the memory constellation and the favicon 404 (upstream builds those URLs without the base path).
 - The control plane is only usable through cc's mount (`/plugins/code-hindsight/`); its port alone has no UI session.
 - Hindsight runs only while the plugin backend runs (see Auto-start). A backend killed with SIGKILL alone leaves the containers running until the next start adopts them.
@@ -58,6 +72,7 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 conductor.plugin.json     cc manifest
 server.js                 entry point
 src/                      backend modules (docs/architecture.md)
+claude/                   Claude Code plugin root: hooks, transcript reader, memory skill
 frontend/                 the shell UI (React + Vite)
 tests/                    node:test suites, fakes/, support/, *.real.test.mjs (gated)
 docs/                     features, protocol, architecture

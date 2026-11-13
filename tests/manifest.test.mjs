@@ -21,3 +21,35 @@ test('the manifest healthPath answers 200 even when Docker is unusable', async (
   const { url } = await boot(t, { mode: 'daemon-down' });
   assert.equal((await fetch(url + manifest.backend.healthPath)).status, 200);
 });
+
+test('claudePlugin resolves to a Claude Code plugin root that is not cc\'s own', () => {
+  const root = path.join(REPO, manifest.claudePlugin);
+  const plugin = JSON.parse(fs.readFileSync(path.join(root, '.claude-plugin', 'plugin.json'), 'utf8'));
+  assert.notEqual(plugin.name, 'code-conductor');
+  assert.ok(fs.existsSync(path.join(root, 'skills', 'memory', 'SKILL.md')));
+});
+
+test('the hooks: recall, an async retain and a clear|compact reset, each timeout above the hook deadline above the backend budget', async () => {
+  const { HOOK_TIMEOUTS } = await import('../claude/hooks/limits.mjs');
+  const { DESCRIBE_TIMEOUT_MS } = await import('../src/ccSession.js');
+  const { MEMORY_LIMITS } = await import('../src/memory.js');
+  const hooks = JSON.parse(fs.readFileSync(path.join(REPO, 'claude', 'hooks', 'hooks.json'), 'utf8')).hooks;
+  assert.deepEqual(Object.keys(hooks).sort(), ['SessionStart', 'Stop', 'UserPromptSubmit']);
+  const one = (ev) => { assert.equal(hooks[ev].length, 1); assert.equal(hooks[ev][0].hooks.length, 1); return hooks[ev][0].hooks[0]; };
+  assert.equal(one('Stop').async, true, 'Stop must run async so it can neither delay nor continue the turn');
+  assert.equal(hooks.SessionStart[0].matcher, 'clear|compact');
+  assert.match(one('UserPromptSubmit').command, /hook\.mjs" recall$/);
+  assert.match(one('Stop').command, /hook\.mjs" retain$/);
+  assert.match(one('SessionStart').command, /hook\.mjs" reset$/);
+  const seconds = { recall: one('UserPromptSubmit').timeout, retain: one('Stop').timeout, reset: one('SessionStart').timeout };
+  for (const [event, s] of Object.entries(seconds)) assert.ok(s * 1000 > HOOK_TIMEOUTS[event], `${event}: hooks.json timeout must exceed the hook's own deadline`);
+  assert.ok(DESCRIBE_TIMEOUT_MS + MEMORY_LIMITS.recallTimeoutMs < HOOK_TIMEOUTS.recall, 'the backend budget fits inside the recall hook deadline');
+});
+
+test('the manifest mcp.tools are exactly the tools the backend serves, at the endpoint it serves', async (t) => {
+  assert.deepEqual(manifest.mcp.tools.map((x) => x.name), ['recall']);
+  const { url } = await boot(t, { start: false });
+  const post = (body) => fetch(url + manifest.mcp.endpoint, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.json());
+  assert.match((await post({ tool: 'recall', arguments: { query: 'x' }, caller: {} })).code, /NO_SESSION/);
+  assert.match((await post({ tool: 'nope', arguments: {}, caller: {} })).error, /unknown tool/);
+});

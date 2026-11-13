@@ -30,16 +30,16 @@ export function realSkipReason(variant = 'full') {
 
 /**
  * @param {import('node:test').TestContext} t
- * @param {{settings?: object, secrets?: object, distDir?: string}} [o]
+ * @param {{settings?: object, secrets?: object, distDir?: string, conductorUrl?: string|null}} [o]
  */
-export async function bootRealStack(t, { settings = {}, secrets = null, distDir } = {}) {
+export async function bootRealStack(t, { settings = {}, secrets = null, distDir, conductorUrl = null } = {}) {
   const prefix = `code-hindsight-test-${crypto.randomBytes(3).toString('hex')}`;
   const r = mkRoot(t);
   const port = () => 30000 + crypto.randomInt(0, 9999);
   const s = { ...JSON.parse(JSON.stringify(DEFAULT_SETTINGS)), ...settings };
   s.network = { bindAddress: null, apiPort: port(), cpPort: port() };
   writeSettings(r, s);
-  const config = { port: 0, dataDir: r.dataDir, conductorUrl: null, pluginId: 'code-hindsight', distDir: distDir ?? `${r.root}/no-dist` };
+  const config = { port: 0, dataDir: r.dataDir, conductorUrl, pluginId: 'code-hindsight', distDir: distDir ?? `${r.root}/no-dist` };
   const apps = [];
   const servers = [];
   const make = async () => {

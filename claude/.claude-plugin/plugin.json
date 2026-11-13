@@ -1,0 +1,5 @@
+{
+  "name": "code-hindsight",
+  "version": "0.1.0",
+  "description": "Scoped Hindsight memory for cc sessions: recalls relevant memories into each prompt and retains each turn."
+}

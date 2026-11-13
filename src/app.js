@@ -15,6 +15,13 @@ import { createJobs } from './jobs.js';
 import { createCpSession } from './cpSession.js';
 import { createCpProxy } from './cpProxy.js';
 import { createRoutes } from './routes.js';
+import { createScopesStore } from './scopes.js';
+import { createCcClient } from './ccSession.js';
+import { createHindsightClient } from './hindsightClient.js';
+import { createRetainCursors } from './retainCursor.js';
+import { createActivityLog } from './activity.js';
+import { createMemory } from './memory.js';
+import { createHookRoutes } from './hookRoutes.js';
 import { serveStatic, sendText } from './http.js';
 
 /** cc's row for this plugin (best effort: only the Auto-start hint reads it). */
@@ -52,8 +59,17 @@ export function createApp(config, overrides = {}) {
   supervisor = createSupervisor({ docker, settings, secrets, cpTrust, names, owner, dataDir: config.dataDir, detectBind, fetchCcModels: ccModels, cpSession, ...supervisorOptions });
   const jobs = createJobs({ docker, supervisor, cpTrust, names, owner, dataDir: config.dataDir });
   const cpProxy = createCpProxy({ target: supervisor.cpTarget, session: cpSession, notReadyError: supervisor.notReadyError });
+  const scopes = createScopesStore(config.dataDir);
+  const cc = createCcClient({ conductorUrl: config.conductorUrl });
+  const activity = createActivityLog({ dataDir: config.dataDir });
+  const memory = createMemory({
+    scopes, cc, activity,
+    hindsight: createHindsightClient({ connection: () => supervisor.connection() }),
+    cursors: createRetainCursors(config.dataDir),
+  });
+  const hookRoutes = createHookRoutes({ memory });
   const api = createRoutes({
-    supervisor, jobs, docker, settings, secrets, fetchCcModels: ccModels,
+    supervisor, jobs, docker, settings, secrets, fetchCcModels: ccModels, scopes, activity, cc,
     fetchPluginRow: () => fetchPluginRow(config.conductorUrl, config.pluginId),
     detectBind, containerNames: { api: names.api, cp: names.cp },
   });
@@ -63,6 +79,7 @@ export function createApp(config, overrides = {}) {
     try { url = new URL(req.url, 'http://plugin.local'); } catch { return sendText(res, 400, 'Bad request'); }
     const p = url.pathname;
     if (p.startsWith('/-/api/')) return api(req, res, url);
+    if (p.startsWith('/-/hook/') || p === '/-/mcp') return hookRoutes(req, res, url);
     if (p.startsWith('/-/')) return sendText(res, 404, 'Not found');
     // The host URLs exist only under cc; standalone they are a real 404.
     if (p === '/pluginBridge.js' || p === '/pluginTheme.css') return sendText(res, 404, 'Not found');
@@ -79,6 +96,6 @@ export function createApp(config, overrides = {}) {
         if (!res.headersSent) sendText(res, 500, 'Internal error'); else res.destroy();
       });
     },
-    supervisor, jobs, docker, settings, secrets, cpTrust, names, owner, cpSession,
+    supervisor, jobs, docker, settings, secrets, cpTrust, names, owner, cpSession, scopes, memory, activity,
   };
 }
