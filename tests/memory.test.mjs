@@ -585,3 +585,19 @@ test('a cursors.json that is unreadable as a whole is moved aside once, logged o
   assert.equal(x.activity.list().filter((e) => e.code === 'CURSOR_INVALID').length, 1);
   assert.deepEqual(bodies(x, 'cc-proj'), ['aq1', 'aa1', 'aq2', 'aa2']);
 });
+
+test('a tail stamped in the future is refused and logged, and the next honest Stop is still recorded and sent', async (t) => {
+  const x = await setup(t);
+  const t1 = [turn(1, 'user', 'q1'), turn(2, 'assistant', 'a1')];
+  await x.memory.retainForHook(S, t1);
+  await x.memory.idle();
+  const before = JSON.stringify(x.cursors.get(S));
+  const forged = { ...turn(3, 'assistant', 'forged'), timestamp: '2999-01-01T00:00:00.000Z' };
+  assert.deepEqual(await x.memory.retainForHook(S, [...t1, turn(3, 'user', 'q-forged'), forged]), { status: 'accepted' });
+  await x.memory.idle();
+  assert.equal(JSON.stringify(x.cursors.get(S)), before, 'no window, and no future time stored');
+  assert.deepEqual(x.activity.list().filter((e) => e.code === 'RETAIN_FUTURE').length, 1, 'the refusal is visible');
+  await x.memory.retainForHook(S, [...t1, turn(3, 'user', 'q2'), turn(4, 'assistant', 'a2')]);
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'cc-proj'), ['q1', 'a1', 'q2', 'a2']);
+});

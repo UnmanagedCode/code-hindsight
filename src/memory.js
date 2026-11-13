@@ -15,6 +15,8 @@ export const MEMORY_LIMITS = Object.freeze({
   injectedSessionsMax: 500,
   /** Per session: the oldest injected ids are forgotten beyond this. */
   injectedIdsMax: 2000,
+  /** How far ahead of the backend's clock a transcript timestamp may be (cc and the backend share one clock). */
+  clockSkewMs: 60_000,
   /** Per session: windows of unsent turns waiting in the cursor behind the batch in flight. */
   retainQueueMax: 8,
 });
@@ -163,6 +165,13 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
       const start = lastExchangeBoundary(turns);
       if (!start) return false;
       cursor = { ...start, pending: [] };
+    }
+    // A timestamp from the future would be stored as the cursor's time and make every later,
+    // honest Stop look older than it: refuse such a tail, visibly.
+    const horizon = now() + limits.clockSkewMs;
+    if (turns.some((t) => Date.parse(t.timestamp) > horizon)) {
+      fail('retain', session, sessionId, new AppError('RETAIN_FUTURE'));
+      return false;
     }
     const pending = [...cursor.pending];
     const boundary = cursor.inflight ? { lastId: cursor.inflight.lastId, lastTs: cursor.inflight.lastTs } : { lastId: cursor.lastId, lastTs: cursor.lastTs };

@@ -103,6 +103,7 @@ Every failure yields a memoryless turn and an Activity entry; the hooks always e
 | retain failed (the same batch is resent with the next turn) | `RETAIN_FAILED` |
 | a bank template did not render | `BANK_RENDER_FAILED` |
 | stored retain progress was unreadable (one entry of the wrong shape, or the whole file, moved aside) and was reset; the next retain starts from the last exchange | `CURSOR_INVALID` |
+| a Stop's turns were stamped beyond the clock-skew allowance (`MEMORY_LIMITS.clockSkewMs`) in the future and were not recorded | `RETAIN_FUTURE` |
 | a late Stop's turns were already behind the retained position and were ignored (nothing lost, nothing sent twice) | `RETAIN_STALE` |
 | turns could not be kept for later: the session's backlog of unsent windows overflowed (`MEMORY_LIMITS.retainQueueMax`), or a window's turns left the transcript tail (a `/clear` or trim) before they could be sent. They are never sent to another bank | `RETAIN_DROPPED` |
 | `scopes.json` unreadable | `SCOPES_INVALID` |
@@ -145,4 +146,4 @@ Every error is a code from `CATALOG` (`src/errors.js`); the Status card shows it
 | `UNHEALTHY`, `CRASHED`, `CP_LOGIN_FAILED` | Restart Hindsight |
 | `CONTAINERS_RUNNING` | Stop Hindsight |
 | `HINDSIGHT_NOT_READY` | Start Hindsight |
-| `SCOPES_INVALID`, `BROWSER_REFUSED`, `NO_SESSION`, `SESSION_UNRESOLVED`, `SESSION_NOT_LIVE`, `NO_RECALL_SCOPE`, `RECALL_FAILED`, `RETAIN_FAILED`, `RETAIN_DROPPED`, `RETAIN_STALE`, `CURSOR_INVALID`, `BANK_RENDER_FAILED` | — (Memory-tab and hook/tool errors: shown against a field, in Activity, or to the tool caller) |
+| `SCOPES_INVALID`, `BROWSER_REFUSED`, `NO_SESSION`, `SESSION_UNRESOLVED`, `SESSION_NOT_LIVE`, `NO_RECALL_SCOPE`, `RECALL_FAILED`, `RETAIN_FAILED`, `RETAIN_DROPPED`, `RETAIN_STALE`, `RETAIN_FUTURE`, `CURSOR_INVALID`, `BANK_RENDER_FAILED` | — (Memory-tab and hook/tool errors: shown against a field, in Activity, or to the tool caller) |
