@@ -99,3 +99,34 @@ export interface CcBackend {
   refusal: string | null;
   models: { model: string; label: string }[];
 }
+
+/** A memory scope as the backend stores it (docs/protocol.md → /-/api/scopes). An absent match key matches anything. */
+export interface Scope {
+  name: string;
+  match: { projects?: string[]; sessions?: ('conductor' | 'worker')[]; stages?: string[] };
+  bank: string;
+  actions: ('recall' | 'retain')[];
+}
+
+export interface ScopesView {
+  scopes: Scope[];
+  choices: { actions: string[]; kinds: string[]; placeholders: string[]; limits: { maxScopes: number; nameMax: number; templateMax: number } };
+}
+
+export interface StagesView { stages: { name: string; playbooks: string[] }[]; error: string | null }
+
+/** One memory activity entry; never holds prompt or memory text. */
+export interface ActivityEntry {
+  at: string;
+  event: string;
+  outcome: 'ok' | 'error' | 'skipped';
+  sessionId?: string;
+  project?: string;
+  worktree?: string;
+  stage?: string;
+  kind?: string;
+  banks?: string[];
+  count?: number;
+  code?: string;
+  message?: string;
+}

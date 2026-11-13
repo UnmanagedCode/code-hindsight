@@ -1,7 +1,7 @@
 // The page's route lives in the query string (?view=…&cp=…): the bridge demotes pushState to
 // replaceState and mirrors the query into cc's URL, so a reload or a deep link lands here.
 
-export const VIEWS = ['cp', 'status', 'settings', 'images'] as const;
+export const VIEWS = ['cp', 'status', 'memory', 'settings', 'images'] as const;
 export type View = (typeof VIEWS)[number];
 
 export interface Route { view: View | null; cp: string | null }

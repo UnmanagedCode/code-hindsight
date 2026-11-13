@@ -8,12 +8,14 @@ import type { ErrorAction, HindsightState, Status as StatusT } from '@/lib/types
 import { useStatus } from '@/lib/useStatus';
 import { ControlPlane } from '@/views/ControlPlane';
 import { Images } from '@/views/Images';
+import { Memory } from '@/views/Memory';
 import { Settings } from '@/views/Settings';
 import { Status } from '@/views/Status';
 
 const TABS: { view: View; label: string }[] = [
   { view: 'cp', label: 'Control plane' },
   { view: 'status', label: 'Status' },
+  { view: 'memory', label: 'Memory' },
   { view: 'settings', label: 'Settings' },
   { view: 'images', label: 'Images & data' },
 ];
@@ -91,6 +93,7 @@ export function App() {
         <main className={view === 'cp' && status.state === 'ready' ? 'min-h-0 flex-1' : 'mx-auto w-full max-w-[var(--cc-session-width,56rem)] flex-1 overflow-auto p-4'}>
           {view === 'cp' && (status.state === 'ready' ? <ControlPlane cp={route.cp} onCpPath={onCpPath} /> : <NotRunning status={status} onAction={onAction} busy={busy} />)}
           {view === 'status' && <Status status={status} onAction={onAction} busy={busy} />}
+          {view === 'memory' && <Memory status={status} />}
           {view === 'settings' && <Settings busy={busy} onSaved={() => void refresh(false)} onApply={() => void onAction('start')} />}
           {view === 'images' && <Images status={status} onChanged={() => void refresh(true)} />}
         </main>
