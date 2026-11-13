@@ -4,11 +4,8 @@
 // or garbage input can only ever cost a turn its memory. Stop must print nothing (stdout or exit 2
 // on Stop would keep the session running).
 import { readTranscriptTail, stripInjectedMemory, trimTurnsToBytes } from './transcript.mjs';
+import { HOOK_TIMEOUTS, RECALL_QUERY_MAX_CHARS, RETAIN_TAIL_BYTES } from './limits.mjs';
 
-/** Per-request deadlines (ms); each is below the matching `timeout` in hooks.json. */
-export const HOOK_TIMEOUTS = Object.freeze({ recall: 4000, retain: 5000, reset: 1500 });
-export const RECALL_QUERY_MAX_CHARS = 2000;
-export const RETAIN_TAIL_BYTES = 256 * 1024;
 /** How long `retain` waits for the transcript to hold the final assistant message. */
 const TRANSCRIPT_WAIT_MS = 1000;
 

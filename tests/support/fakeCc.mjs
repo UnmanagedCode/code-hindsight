@@ -1,0 +1,46 @@
+// A fake cc for the memory tests: `describe_session` answers programmable per call, and
+// `/api/playbooks[/:id]` serves the given playbooks. Every request is logged.
+import http from 'node:http';
+
+/**
+ * @param {import('node:test').TestContext} t
+ * @param {{playbooks?: Record<string, string[]>}} [o] playbook id → stage names
+ */
+export async function startFakeCc(t, { playbooks = { solo: ['plan', 'review'], relay: ['plan', 'implement', 'review', 'refine'] } } = {}) {
+  const calls = [];
+  /** sessionId → answers, consumed in order (the last repeats). An answer is a `live` object, 'retired' or a raw body. */
+  const sessions = new Map();
+  const server = http.createServer(async (req, res) => {
+    const chunks = [];
+    for await (const c of req) chunks.push(c);
+    const raw = Buffer.concat(chunks).toString('utf8');
+    const body = raw ? JSON.parse(raw) : undefined;
+    calls.push({ method: req.method, url: req.url, body });
+    const send = (status, payload) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(payload)); };
+    if (req.url === '/mcp/tools/describe_session') {
+      const queue = sessions.get(body.sessionId);
+      if (!queue) return send(200, { ok: false, code: 'SESSION_UNKNOWN', sessionId: body.sessionId, reason: 'unknown' });
+      const answer = queue.length > 1 ? queue.shift() : queue[0];
+      if (typeof answer === 'function') return answer(send);
+      if (answer === 'retired') return send(200, { sessionId: body.sessionId, retired: { reason: 'pruned' } });
+      if (answer.ok === false) return send(200, answer);
+      return send(200, { sessionId: body.sessionId, live: answer });
+    }
+    if (req.url === '/api/playbooks') return send(200, { playbooks: Object.keys(playbooks).map((id) => ({ id })) });
+    const m = /^\/api\/playbooks\/([^/]+)$/.exec(req.url);
+    if (m && playbooks[m[1]]) return send(200, { id: m[1], stages: Object.fromEntries(playbooks[m[1]].map((s) => [s, {}])) });
+    return send(404, { error: 'not found' });
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  return {
+    url: `http://127.0.0.1:${server.address().port}`,
+    calls,
+    describeCalls: () => calls.filter((c) => c.url === '/mcp/tools/describe_session').length,
+    /** Program a session: answers are consumed per call, the last repeats. */
+    session(id, ...answers) { sessions.set(id, answers); },
+  };
+}
+
+/** A `live` object as describe_session answers it. */
+export const live = (over = {}) => ({ project: 'proj', worktree: { worktreeName: 'wt' }, playbook: 'relay', stage: 'implement', ...over });

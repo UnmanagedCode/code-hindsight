@@ -144,6 +144,32 @@ export const CATALOG = Object.freeze({
     message: (p) => (Array.isArray(p.fields) ? p.fields.map((f) => `${f.field}: ${f.message}`).join('; ') : 'invalid settings'),
     action: ACTIONS.settings, status: 400,
   },
+  SCOPES_INVALID: {
+    title: 'The memory scopes are not valid',
+    message: (p) => (Array.isArray(p.fields) ? p.fields.map((f) => `${f.field}: ${f.message}`).join('; ') : 'invalid scopes'),
+    action: null, status: 400,
+  },
+  BROWSER_REFUSED: {
+    title: 'Browser request refused',
+    message: () => 'The hook and memory-tool routes answer only non-browser callers (no Origin or Sec-Fetch-Site/-Dest/-User headers, no proxy prefix on the tool route).',
+    action: null, status: 403,
+  },
+  NO_SESSION: { title: 'No calling session', message: () => 'The memory tool needs to know which cc session is calling; anonymous callers get nothing.', action: null, status: 403 },
+  SESSION_UNRESOLVED: {
+    title: 'The session could not be resolved',
+    message: (p) => `cc did not say which project and stage this session is in (${s(p.detail)}); it is treated as memoryless.`,
+    action: null, status: 502,
+  },
+  SESSION_NOT_LIVE: {
+    title: 'The session is not live',
+    message: (p) => `cc has no live session ${s(p.sessionId)}; memory is only served to live sessions.`,
+    action: null, status: 403,
+  },
+  NO_RECALL_SCOPE: { title: 'No scope allows recall', message: () => 'No memory scope grants recall to this session (project, kind and stage are matched against Memory → scopes).', action: null, status: 403 },
+  HINDSIGHT_NOT_READY: { title: 'Hindsight is not ready', message: () => 'Hindsight is not running, so this turn has no memory. Open Status to start it.', action: ACTIONS.start, status: 503 },
+  RECALL_FAILED: { title: 'Recall failed', message: (p) => `Recall from bank ${s(p.bank)} failed: ${s(p.detail)}`, action: null, status: 502 },
+  RETAIN_FAILED: { title: 'Retain failed', message: (p) => `Retaining into bank ${s(p.bank)} failed: ${s(p.detail)}; the turns are resent with the next turn.`, action: null, status: 502 },
+  BANK_RENDER_FAILED: { title: 'A bank template did not render to a valid bank id', message: (p) => `Scope ${s(p.scope)}: ${s(p.detail)}.`, action: null, status: 409 },
   BUSY: {
     title: 'Another Docker action is running',
     message: (p) => `Wait for "${s(p.job)}" to finish.`,
