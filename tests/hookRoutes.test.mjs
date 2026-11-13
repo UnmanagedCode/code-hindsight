@@ -25,10 +25,11 @@ async function setup(t, scopes = [{ name: 'a', match: {}, bank: 'cc-{project}', 
   const v = validateScopes(scopes);
   assert.deepEqual(v.errors, []);
   store.save(v.scopes);
+  const activity = createActivityLog({ dataDir: r.dataDir, log: () => {} });
   const memory = createMemory({
     scopes: store, cc: createCcClient({ conductorUrl: cc.url }),
     hindsight: createHindsightClient({ connection: () => ({ apiUrl: hs.url, apiKey: FAKE_KEY }) }),
-    cursors: createRetainCursors(r.dataDir), activity: createActivityLog({ dataDir: r.dataDir, log: () => {} }),
+    cursors: createRetainCursors(r.dataDir), activity,
   });
   const handle = createHookRoutes({ memory });
   const server = http.createServer((req, res) => handle(req, res, new URL(req.url, 'http://x')));
@@ -46,7 +47,7 @@ async function setup(t, scopes = [{ name: 'a', match: {}, bank: 'cc-{project}', 
     req.on('error', reject);
     req.end(data);
   });
-  return { cc, hs, memory, send };
+  return { cc, hs, memory, send, activity };
 }
 
 test('a request that carries Origin or Sec-Fetch-Site/-Dest/-User is refused BROWSER_REFUSED on every route; Node fetch\'s own Sec-Fetch-Mode is not a browser', async (t) => {
@@ -79,6 +80,9 @@ test('only POST with application/json, valid JSON, a session id and bounded bodi
   assert.equal((await x.send('/-/hook/recall', { body: { sessionId: 's1' } })).status, 400);
   assert.equal((await x.send('/-/hook/retain', { body: { sessionId: 's1', turns: [{ id: 1 }] } })).status, 400);
   assert.equal((await x.send('/-/hook/nope', { body: {} })).status, 404);
+  for (const id of ['', 'x'.repeat(HOOK_BODY_LIMITS.other)]) {
+    assert.equal((await x.send('/-/hook/retain', { body: { sessionId: 's1', turns: [{ id, role: 'user', content: 'q', timestamp: null }] } })).status, 400, 'an empty or oversized turn id is refused');
+  }
   const big = (n) => ({ sessionId: 's1', prompt: 'x'.repeat(n) });
   assert.equal((await x.send('/-/hook/recall', { body: big(HOOK_BODY_LIMITS.other + 10) })).status, 413);
   const turns = [{ id: 'a', role: 'user', content: 'x'.repeat(HOOK_BODY_LIMITS.retain), timestamp: null }];
@@ -162,4 +166,17 @@ test('/-/api/memory/stages lists cc\'s playbook stages and reports a failed read
   const failed = await (await fetch(`${none.url}/-/api/memory/stages`)).json();
   assert.deepEqual(failed.stages, []);
   assert.ok(failed.error);
+});
+
+test('a retain whose last turn has an empty id is refused and leaves the stored progress alone (no CURSOR_INVALID)', async (t) => {
+  const x = await setup(t);
+  const turn = (n, role) => ({ id: `u${n}`, role, content: `c${n}`, timestamp: `2026-01-01T00:00:0${n}.000Z` });
+  await x.send('/-/hook/retain', { body: { sessionId: 's1', turns: [turn(1, 'user'), turn(2, 'assistant')] } });
+  await x.memory.idle();
+  const bad = await x.send('/-/hook/retain', { body: { sessionId: 's1', turns: [turn(1, 'user'), turn(2, 'assistant'), { id: '', role: 'assistant', content: 'x', timestamp: null }] } });
+  assert.equal(bad.status, 400);
+  await x.send('/-/hook/retain', { body: { sessionId: 's1', turns: [turn(1, 'user'), turn(2, 'assistant'), turn(3, 'user'), turn(4, 'assistant')] } });
+  await x.memory.idle();
+  assert.deepEqual(x.hs.retains().length, 2);
+  assert.equal(x.activity.list().some((e) => e.code === 'CURSOR_INVALID'), false);
 });

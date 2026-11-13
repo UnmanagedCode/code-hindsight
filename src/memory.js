@@ -4,7 +4,7 @@
 // memories already injected per session, and the one-in-flight-per-session retain worker.
 import { AppError } from './errors.js';
 import { matchScopes } from './scopes.js';
-import { windowTurns, lastExchangeBoundary, endsAfter, isValidCursor, tailEnd, operationIdFor } from './retainCursor.js';
+import { windowTurns, lastExchangeBoundary, endsAfter, provablyBehind, isOlderTail, isValidCursor, tailEnd, operationIdFor } from './retainCursor.js';
 
 export const MEMORY_LIMITS = Object.freeze({
   /** Per-bank recall deadline; with the describe_session deadline it must stay under the hook's. */
@@ -116,6 +116,7 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
    */
   function readCursor(sessionId) {
     const c = cursors.get(sessionId);
+    if (cursors.consumeCorruption()) activity.add({ event: 'retain', outcome: 'error', sessionId, code: 'CURSOR_INVALID', message: new AppError('CURSOR_INVALID', { file: true }).message });
     if (c === undefined || isValidCursor(c)) return c;
     cursors.drop(sessionId);
     activity.add({ event: 'retain', outcome: 'error', sessionId, code: 'CURSOR_INVALID', message: new AppError('CURSOR_INVALID').message });
@@ -211,6 +212,13 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
       const win = cursor.pending[0];
       if (!win) return;
       const rest = cursor.pending.slice(1);
+      // Never move the cursor backwards: a window provably at or behind it (a late Stop) is dropped from
+      // the list and the cursor stays. Its turns were already passed (sent, or reported as lost).
+      if (provablyBehind(worker.tail, win, cursor)) {
+        if (win.bank && win.lastId !== cursor.lastId) activity.add({ event: 'retain', outcome: 'skipped', sessionId, ...win.session, banks: [win.bank], code: 'RETAIN_STALE', message: new AppError('RETAIN_STALE').message });
+        update(sessionId, { pending: rest });
+        continue;
+      }
       let delta = [];
       if (win.bank) {
         delta = windowTurns(worker.tail, cursor, win);
@@ -242,7 +250,8 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
    */
   function kick(sessionId, turns) {
     const running = workers.get(sessionId);
-    if (running) { running.tail = turns; running.dirty = true; return; }
+    // The newest tail is the one windows are placed in: a late, older Stop does not replace it.
+    if (running) { if (!isOlderTail(turns, running.tail)) running.tail = turns; running.dirty = true; return; }
     const w = { tail: turns, dirty: false, done: null };
     workers.set(sessionId, w);
     w.done = (async () => {

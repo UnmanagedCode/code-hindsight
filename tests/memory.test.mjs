@@ -508,3 +508,80 @@ test('a cursor entry of the wrong shape is reset and logged; it is never spread 
   assert.deepEqual(bodies(x, 'cc-proj'), ['q', 'a'], 'only the last exchange: no backfill from the corrupt entry');
   assert.deepEqual(x.activity.list().filter((e) => e.code === 'CURSOR_INVALID').length, 1);
 });
+
+test('a crafted tail that repeats an earlier id as its end is refused: the cursor does not move backwards', async (t) => {
+  const x = await setup(t);
+  const t1 = [turn(1, 'user', 'q1'), turn(2, 'assistant', 'a1')];
+  const t2 = [...t1, turn(3, 'user', 'q2'), turn(4, 'assistant', 'a2')];
+  await x.memory.retainForHook(S, t1);
+  await x.memory.retainForHook(S, t2);
+  await x.memory.idle();
+  const before = JSON.stringify(x.cursors.get(S));
+  await x.memory.retainForHook(S, [...t2, turn(2, 'assistant', 'a1')]); // ends at u2, which appears before the recorded end u4
+  await x.memory.idle();
+  assert.equal(JSON.stringify(x.cursors.get(S)), before);
+  await x.memory.retainForHook(S, [...t2, turn(5, 'user', 'q3'), turn(6, 'assistant', 'a3')]);
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'cc-proj'), ['q1', 'a1', 'q2', 'a2', 'q3', 'a3'], 'nothing was sent twice');
+});
+
+test('without timestamps a late, older Stop is recorded but the drain leaves the cursor where it is and says it was ignored', async (t) => {
+  const x = await setup(t);
+  const bare = (n, role, content) => ({ id: `b${n}`, role, content, timestamp: null });
+  const A = [bare(1, 'user', 'q1'), bare(2, 'assistant', 'a1')];
+  const B = [...A, bare(3, 'user', 'q2'), bare(4, 'assistant', 'a2')];
+  const C = [...A, bare(3, 'user', 'q2')]; // an older Stop that arrives last: nothing in it proves that
+  const release = x.hs.hold(); // keep the first retain in flight so all three Stops are recorded first
+  await x.memory.retainForHook(S, A);
+  await x.memory.retainForHook(S, B);
+  await x.memory.retainForHook(S, C);
+  release();
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'cc-proj'), ['q1', 'a1', 'q2', 'a2'], 'nothing was sent twice');
+  assert.equal(x.cursors.get(S).lastId, 'b4', 'the cursor did not move back to b3');
+  assert.deepEqual(x.cursors.get(S).pending, []);
+  assert.deepEqual(x.activity.list().filter((e) => e.code === 'RETAIN_STALE').length, 1);
+  assert.deepEqual(x.activity.list().filter((e) => e.code === 'RETAIN_DROPPED'), []);
+});
+
+test('a Stop in the same millisecond as the previous end is accepted, not ignored: sibling turns share a timestamp', async (t) => {
+  const x = await setup(t);
+  const ms = '2026-01-01T00:00:02.000Z';
+  const t1 = [turn(1, 'user', 'q1'), { ...turn(2, 'assistant', 'a1'), timestamp: ms }];
+  await x.memory.retainForHook(S, t1);
+  await x.memory.idle();
+  await x.memory.retainForHook(S, [...t1, { id: 'u2#0', role: 'action', content: 'Edit a.js', timestamp: ms }]);
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'cc-proj'), ['q1', 'a1', 'Edit a.js']);
+});
+
+test('a Stop that arrives while the worker is busy makes it drain once more, with its state still persisted', async (t) => {
+  const x = await setup(t);
+  x.hs.retainStatus = 500;
+  const release = x.hs.hold();
+  const next = growing();
+  await x.memory.retainForHook(S, next('a')); // the drain blocks inside its first retain
+  await x.memory.retainForHook(S, next('b')); // arrives meanwhile: the worker is marked dirty
+  release();
+  await x.memory.idle();
+  assert.equal(x.hs.retains().length, 2, 'the worker ran a second pass instead of ending');
+  const cursor = x.cursors.get(S);
+  assert.equal(cursor.inflight.count, 2, 'the failed batch is still persisted');
+  assert.equal(cursor.pending.length, 1, 'and so is the window recorded meanwhile');
+});
+
+test('a cursors.json that is unreadable as a whole is moved aside once, logged once, and retain carries on', async (t) => {
+  const x = await setup(t);
+  const dir = path.join(x.r.dataDir, 'memory');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'cursors.json'), '{this is not json');
+  x.restart();
+  const next = growing();
+  await x.memory.retainForHook(S, next('a'));
+  await x.memory.idle();
+  await x.memory.retainForHook(S, next('a'));
+  await x.memory.idle();
+  assert.equal(fs.readFileSync(path.join(dir, 'cursors.json.corrupt'), 'utf8'), '{this is not json');
+  assert.equal(x.activity.list().filter((e) => e.code === 'CURSOR_INVALID').length, 1);
+  assert.deepEqual(bodies(x, 'cc-proj'), ['aq1', 'aa1', 'aq2', 'aa2']);
+});

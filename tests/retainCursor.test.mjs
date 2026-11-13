@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { mkRoot, fakeClock } from './helpers.mjs';
-import { createRetainCursors, CURSOR_MAX_AGE_MS, windowTurns, lastExchangeBoundary, endsAfter, isValidCursor } from '../src/retainCursor.js';
+import { createRetainCursors, CURSOR_MAX_AGE_MS, windowTurns, lastExchangeBoundary, endsAfter, provablyBehind, isOlderTail, isValidCursor } from '../src/retainCursor.js';
 
 test('an entry older than the maximum age is pruned on the next write; the writer\'s own entry survives', (t) => {
   const r = mkRoot(t);
@@ -93,6 +93,38 @@ test('endsAfter: a tail is newer only if it ends after the previous end, by id o
   assert.equal(endsAfter([], B(1)), false);
 });
 
+test('endsAfter refuses only a provably older tail: a repeated id, or an earlier timestamp; equal timestamps and unprovable tails are accepted', () => {
+  const crafted = [T(1), T(2), T(3), T(1)];
+  assert.equal(endsAfter(crafted, B(3)), false, 'ends at an id that occurs before the previous end');
+  const ms = '2026-01-01T00:00:03.000Z';
+  assert.equal(endsAfter([{ ...T(9), timestamp: ms }], { lastId: 'gone', lastTs: ms }), true, 'a legitimate Stop in the same millisecond');
+  const bare = (n) => ({ id: `b${n}`, role: 'user', content: '', timestamp: null });
+  assert.equal(endsAfter([bare(1), bare(2)], { lastId: 'gone', lastTs: null }), true, 'no timestamps, no overlap: nothing to prove');
+  assert.equal(endsAfter([bare(1), bare(2)], { lastId: 'b2', lastTs: null }), false, 'but the id order still proves the same end');
+  assert.equal(endsAfter([{ ...T(1), timestamp: '2026-01-01T00:00:01.000Z' }, bare(2)], B(3)), false, 'the newest parseable timestamp is earlier');
+});
+
+test('provablyBehind: same end, earlier in the tail (a repeated end id counts as its first place), or earlier by time; unprovable is false', () => {
+  const tail = [T(1), T(2), T(3), T(4)];
+  assert.equal(provablyBehind(tail, B(3), B(4)), true);
+  assert.equal(provablyBehind(tail, B(4), B(4)), true);
+  assert.equal(provablyBehind(tail, B(4), B(3)), false);
+  const crafted = [T(1), T(2), T(3), T(1)];
+  assert.equal(provablyBehind(crafted, B(1), B(3)), true, 'the crafted tail ending at a1 after a3');
+  assert.equal(provablyBehind([T(9)], B(2), B(3)), true, 'neither in the tail: by time');
+  const bare = (id) => ({ lastId: id, lastTs: null });
+  assert.equal(provablyBehind([], bare('x'), bare('y')), false);
+  assert.equal(provablyBehind([T(9)], B(3), B(3)), true);
+  assert.equal(provablyBehind([T(9)], { lastId: 'e', lastTs: '2026-01-01T00:00:03.000Z' }, { lastId: 'f', lastTs: '2026-01-01T00:00:03.000Z' }), false, 'equal time with different ids is not behind');
+});
+
+test('isOlderTail: a tail that ends at a turn the known tail has moved past', () => {
+  assert.equal(isOlderTail([T(1), T(2)], [T(1), T(2), T(3)]), true);
+  assert.equal(isOlderTail([T(1), T(2), T(3), T(4)], [T(1), T(2), T(3)]), false);
+  assert.equal(isOlderTail([T(3)], [T(1), T(2), T(3)]), false);
+  assert.equal(isOlderTail([T(7)], [T(1)]), false);
+});
+
 test('isValidCursor accepts what the writer produces and refuses wrong shapes, so they are never spread or sent', () => {
   const win = { bank: 'b', session: { project: 'p', worktree: 'w', kind: 'worker', stage: null }, lastId: 'u1', lastTs: null };
   const ok = { lastId: 'u0', lastTs: null, pending: [win, { ...win, bank: null }] };
@@ -106,7 +138,7 @@ test('isValidCursor accepts what the writer produces and refuses wrong shapes, s
   assert.equal(isValidCursor({ lastId: null, lastTs: null }), false, 'pending is required');
 });
 
-test('drop forgets one entry on disk; a cursors.json that is not an object is refused, not spread', (t) => {
+test('drop forgets one entry on disk', (t) => {
   const r = mkRoot(t);
   const cursors = createRetainCursors(r.dataDir);
   cursors.set('a', { lastId: 'x', lastTs: null, pending: [] });
@@ -114,6 +146,23 @@ test('drop forgets one entry on disk; a cursors.json that is not an object is re
   cursors.drop('a');
   const again = createRetainCursors(r.dataDir);
   assert.deepEqual([again.get('a'), again.get('b')?.lastId], [undefined, 'y']);
-  fs.writeFileSync(path.join(r.dataDir, 'memory', 'cursors.json'), '"abc"');
-  assert.throws(() => createRetainCursors(r.dataDir).get('0'), /not an object/);
+});
+
+test('a cursors.json that is not valid JSON or not an object is moved aside, replacing an older one, and the store starts fresh', (t) => {
+  const r = mkRoot(t);
+  const file = path.join(r.dataDir, 'memory', 'cursors.json');
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(`${file}.corrupt`, 'older');
+  for (const bad of ['{nope', '"abc"', '[1,2]', 'null']) {
+    fs.writeFileSync(file, bad);
+    const cursors = createRetainCursors(r.dataDir);
+    assert.equal(cursors.get('0'), undefined, `${bad}: nothing is spread out of it`);
+    assert.equal(cursors.consumeCorruption(), true);
+    assert.equal(cursors.consumeCorruption(), false, 'reported once');
+    assert.equal(fs.readFileSync(`${file}.corrupt`, 'utf8'), bad);
+    assert.equal(fs.existsSync(file), false);
+    cursors.set('s', { lastId: 'x', lastTs: null, pending: [] });
+    assert.equal(createRetainCursors(r.dataDir).get('s').lastId, 'x', 'it works again');
+    fs.rmSync(file);
+  }
 });

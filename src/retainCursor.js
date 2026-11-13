@@ -3,6 +3,7 @@
 // last; the batch currently being sent (kept verbatim so a retry resends the same batch under the
 // same operation id); and `pending`, the stretches of turns recorded since, each tagged with the bank
 // its own stage chose (or none). Plus the pure placement of those stretches in a transcript tail.
+import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { readJsonFile, writePrivateFileAtomic } from './fsPrivate.js';
@@ -14,15 +15,24 @@ export function createRetainCursors(dataDir, { now = () => Date.now() } = {}) {
   const file = path.join(dataDir, 'memory', 'cursors.json');
   let data = null;
   // No prototype, own-keys only: a session id such as `__proto__` or `constructor` is just a key.
+  let corrupt = false;
   const load = () => {
     if (!data) {
-      const raw = readJsonFile(file, {});
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('memory/cursors.json is not an object');
+      let raw;
+      try { raw = readJsonFile(file, {}); } catch (e) { if (!(e instanceof SyntaxError)) throw e; raw = null; }
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        // Unreadable as a whole: keep it for inspection (replacing an older one) and start fresh.
+        fs.renameSync(file, `${file}.corrupt`);
+        corrupt = true;
+        raw = {};
+      }
       data = Object.assign(Object.create(null), raw);
     }
     return data;
   };
   return {
+    /** True once after the whole file was found unreadable and moved aside to `cursors.json.corrupt`. */
+    consumeCorruption() { const c = corrupt; corrupt = false; return c; },
     get: (sessionId) => (Object.hasOwn(load(), sessionId) ? load()[sessionId] : undefined),
     /** Forget a session's entry (a corrupt one is reset; the next retain starts from the last exchange). */
     drop(sessionId) {
@@ -99,18 +109,51 @@ export function windowTurns(tail, from, to) {
 }
 
 /**
- * Whether a tail's end is strictly after `prev` (`{lastId, lastTs}`: the newest recorded end). A
- * Stop hook is a separate process, so an older Stop can arrive after a newer one; its tail is stale
- * and must not move the persisted state backwards. If `prev` is in the tail it must not be the last
- * turn; otherwise (a rotation) the tail's newest timestamp must be later, when both parse.
+ * Whether a tail may be newer than `prev` (`{lastId, lastTs}`, the newest recorded end). A Stop hook
+ * is a separate process, so an older Stop can arrive after a newer one; only a tail that is
+ * *provably* older is refused, so the persisted state never moves backwards on evidence:
+ * - `prev` is in the tail and the tail's end id appears at or before it (a repeated id counts);
+ * - the tail's newest timestamp, or its end turn's own, is earlier than `prev`'s.
+ * Equal timestamps are accepted (turns of one moment are not older). With no timestamps and no
+ * overlap nothing can be proven and the tail is accepted: best effort, which the drain backs up.
  */
 export function endsAfter(turns, prev) {
   if (!turns.length) return false;
-  const i = prev.lastId == null ? -1 : turns.map((t) => t.id).lastIndexOf(prev.lastId);
-  if (i >= 0) return i < turns.length - 1;
-  const a = ts([...turns].reverse().find((t) => t.timestamp)?.timestamp);
-  const b = ts(prev.lastTs);
-  return Number.isNaN(a) || Number.isNaN(b) ? true : a > b;
+  const ids = turns.map((t) => t.id);
+  const end = turns[turns.length - 1];
+  if (prev.lastId != null) {
+    const p = ids.lastIndexOf(prev.lastId);
+    if (p >= 0 && ids.indexOf(end.id) <= p) return false;
+  }
+  const prevTs = ts(prev.lastTs);
+  if (!Number.isNaN(prevTs)) {
+    const newest = ts([...turns].reverse().find((t) => t.timestamp)?.timestamp);
+    if (newest < prevTs || ts(end.timestamp) < prevTs) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether a window ending at `w` is provably at or behind `cursor` (`{lastId, lastTs}`), judged by
+ * order in the tail it was drained with, else by timestamp. Unprovable is false. The drain uses it
+ * so no advance ever moves the cursor backwards.
+ */
+export function provablyBehind(tail, w, cursor) {
+  if (w.lastId === cursor.lastId) return true;
+  const ids = tail.map((t) => t.id);
+  const wi = ids.indexOf(w.lastId);
+  const ci = cursor.lastId == null ? -1 : ids.lastIndexOf(cursor.lastId);
+  if (wi >= 0 && ci >= 0) return wi <= ci;
+  const a = ts(w.lastTs);
+  const b = ts(cursor.lastTs);
+  return !Number.isNaN(a) && !Number.isNaN(b) && a < b;
+}
+
+/** Whether `turns` is provably an older tail than `known` (it ends at a turn `known` has since moved past). */
+export function isOlderTail(turns, known) {
+  if (!turns.length || !known.length) return false;
+  const i = known.map((t) => t.id).lastIndexOf(turns[turns.length - 1].id);
+  return i >= 0 && i < known.length - 1;
 }
 
 const isStr = (v) => typeof v === 'string' && v.length > 0;

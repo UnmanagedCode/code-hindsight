@@ -10,6 +10,8 @@ export const HOOK_BODY_LIMITS = Object.freeze({ retain: 512 * 1024, other: 16 * 
 export const MCP_QUERY_MAX_CHARS = 2000;
 export const TURN_ROLES = Object.freeze(['user', 'assistant', 'action']);
 const MAX_TURNS = 5000;
+/** A transcript uuid, with the suffixes this plugin adds (`#n`, `final:`), fits well inside. */
+export const TURN_ID_MAX = 256;
 
 /**
  * What keeps a web page out. A browser's non-GET/HEAD request always carries `Origin` (its value
@@ -26,7 +28,7 @@ const bad = (detail) => new AppError('BAD_REQUEST', { detail });
 
 function validTurns(turns) {
   return Array.isArray(turns) && turns.length <= MAX_TURNS && turns.every((t) => t && typeof t === 'object'
-    && typeof t.id === 'string' && TURN_ROLES.includes(t.role) && typeof t.content === 'string'
+    && typeof t.id === 'string' && t.id.length > 0 && t.id.length <= TURN_ID_MAX && TURN_ROLES.includes(t.role) && typeof t.content === 'string'
     && (t.timestamp === null || typeof t.timestamp === 'string'));
 }
 
