@@ -169,6 +169,7 @@ export const CATALOG = Object.freeze({
   HINDSIGHT_NOT_READY: { title: 'Hindsight is not ready', message: () => 'Hindsight is not running, so this turn has no memory. Open Status to start it.', action: ACTIONS.start, status: 503 },
   RECALL_FAILED: { title: 'Recall failed', message: (p) => `Recall from bank ${s(p.bank)} failed: ${s(p.detail)}`, action: null, status: 502 },
   RETAIN_FAILED: { title: 'Retain failed', message: (p) => `Retaining into bank ${s(p.bank)} failed: ${s(p.detail)}; the turns are resent with the next turn.`, action: null, status: 502 },
+  CURSOR_INVALID: { title: 'Retain progress was unreadable and was reset', message: () => 'The stored retain progress of this session had an unexpected shape and was discarded; the next retain starts from the last exchange, without backfilling.', action: null, status: 500 },
   RETAIN_DROPPED: { title: 'Turns were dropped before they were retained', message: (p) => `Some turns of this session were not retained (${s(p.reason)}). They were not sent to any other bank.`, action: null, status: 503 },
   BANK_RENDER_FAILED: { title: 'A bank template did not render to a valid bank id', message: (p) => `Scope ${s(p.scope)}: ${s(p.detail)}.`, action: null, status: 409 },
   BUSY: {

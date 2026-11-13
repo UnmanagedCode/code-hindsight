@@ -20,6 +20,9 @@ const SCOPE_KEYS = ['name', 'match', 'bank', 'actions'];
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
+/** Whether `bank` is a valid Hindsight bank id as this plugin writes them. */
+export const isBankId = (bank) => typeof bank === 'string' && BANK_RE.test(bank);
+
 /** The template's problem, or null. */
 export function templateProblem(template) {
   if (typeof template !== 'string' || !template) return 'must be a non-empty string';

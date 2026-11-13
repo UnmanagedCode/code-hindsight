@@ -4,7 +4,7 @@
 // memories already injected per session, and the one-in-flight-per-session retain worker.
 import { AppError } from './errors.js';
 import { matchScopes } from './scopes.js';
-import { windowTurns, lastExchangeBoundary, tailEnd, operationIdFor } from './retainCursor.js';
+import { windowTurns, lastExchangeBoundary, endsAfter, isValidCursor, tailEnd, operationIdFor } from './retainCursor.js';
 
 export const MEMORY_LIMITS = Object.freeze({
   /** Per-bank recall deadline; with the describe_session deadline it must stay under the hook's. */
@@ -41,7 +41,7 @@ function cleanText(text, max) {
 export function createMemory({ scopes, cc, hindsight, cursors, activity, limits = MEMORY_LIMITS, now = () => Date.now() }) {
   /** sessionId → ids of memories already injected into its current context (insertion-ordered, bounded). */
   const injected = new Map();
-  /** sessionId → {tail, done}: at most one retain in flight per session; `tail` is the newest transcript tail seen. */
+  /** sessionId → {tail, dirty, done}: at most one retain in flight per session; `tail` is the newest transcript tail seen. */
   const workers = new Map();
 
   const ctx = (s) => (s ? { project: s.project, worktree: s.worktree, stage: s.stage, kind: s.kind } : {});
@@ -110,9 +110,21 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
 
   const summary = (s) => ({ project: s.project, worktree: s.worktree, kind: s.kind, stage: s.stage });
 
+  /**
+   * The session's stored cursor entry, or undefined. An entry of the wrong shape is corrupt: it is
+   * dropped and logged, never acted on (the next retain starts from the last exchange).
+   */
+  function readCursor(sessionId) {
+    const c = cursors.get(sessionId);
+    if (c === undefined || isValidCursor(c)) return c;
+    cursors.drop(sessionId);
+    activity.add({ event: 'retain', outcome: 'error', sessionId, code: 'CURSOR_INVALID', message: new AppError('CURSOR_INVALID').message });
+    return undefined;
+  }
+
   /** The persisted cursor entry with `change` applied; always a fresh object. */
   function update(sessionId, change) {
-    const cur = cursors.get(sessionId);
+    const cur = readCursor(sessionId);
     const next = { lastId: cur.lastId, lastTs: cur.lastTs, ...(cur.inflight ? { inflight: cur.inflight } : {}), pending: cur.pending ?? [], ...change };
     if (!next.inflight) delete next.inflight;
     cursors.set(sessionId, next);
@@ -144,19 +156,23 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
    * unacknowledged batch blocks sending and across a backend restart. Bounded by `retainQueueMax`.
    */
   function record(sessionId, turns, session, target) {
-    let cursor = cursors.get(sessionId);
+    let cursor = readCursor(sessionId);
     if (!cursor) {
       if (!target) return false;
       const start = lastExchangeBoundary(turns);
       if (!start) return false;
       cursor = { ...start, pending: [] };
     }
-    const pending = [...(cursor.pending ?? [])];
+    const pending = [...cursor.pending];
     const boundary = cursor.inflight ? { lastId: cursor.inflight.lastId, lastTs: cursor.inflight.lastTs } : { lastId: cursor.lastId, lastTs: cursor.lastTs };
+    // A stale Stop (an older hook process arriving late) must not move the state backwards.
+    if (!endsAfter(turns, pending.length ? pending[pending.length - 1] : boundary)) return false;
     const end = tailEnd(turns, cursor);
-    if (end.lastId === (pending.length ? pending[pending.length - 1] : boundary).lastId) return false;
     const w = { bank: target?.bank ?? null, session: summary(session), lastId: end.lastId, lastTs: end.lastTs };
-    if (pending.length && pending[pending.length - 1].bank === w.bank) pending[pending.length - 1] = w; else pending.push(w);
+    const newest = pending[pending.length - 1];
+    // Replace only a window this tail can still place (its end is in it); one it cannot place stays
+    // its own window, so the drain reports it instead of this one swallowing its loss.
+    if (newest && newest.bank === w.bank && turns.some((t) => t.id === newest.lastId)) pending[pending.length - 1] = w; else pending.push(w);
     while (pending.length > limits.retainQueueMax && pending.some((p) => p.bank)) shed(sessionId, session, turns, boundary, pending);
     cursors.set(sessionId, { lastId: cursor.lastId, lastTs: cursor.lastTs, ...(cursor.inflight ? { inflight: cursor.inflight } : {}), pending });
     return true;
@@ -181,7 +197,7 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
   async function drain(sessionId, worker) {
     let fresh = false;
     for (;;) {
-      const cursor = cursors.get(sessionId);
+      const cursor = readCursor(sessionId);
       if (!cursor) return;
       if (cursor.inflight) {
         const inf = cursor.inflight;
@@ -192,13 +208,13 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
         fresh = false;
         continue;
       }
-      const win = cursor.pending?.[0];
+      const win = cursor.pending[0];
       if (!win) return;
       const rest = cursor.pending.slice(1);
       let delta = [];
       if (win.bank) {
         delta = windowTurns(worker.tail, cursor, win);
-        if (delta === null) {
+        if (!delta) {
           fail('retain', win.session, sessionId, new AppError('RETAIN_DROPPED', { reason: 'they left the transcript window before they could be sent' }), { banks: [win.bank] });
           delta = [];
         }
@@ -219,14 +235,20 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     }
   }
 
-  /** Make sure one worker is draining this session; a running one is given the newest tail. */
+  /**
+   * Make sure a worker drains this session, with the newest tail. A worker that is still running is
+   * marked dirty, so it drains once more before it ends: a window recorded just as a drain finishes
+   * is never left without a worker.
+   */
   function kick(sessionId, turns) {
     const running = workers.get(sessionId);
-    if (running) { running.tail = turns; return; }
-    const w = { tail: turns, done: null };
+    if (running) { running.tail = turns; running.dirty = true; return; }
+    const w = { tail: turns, dirty: false, done: null };
     workers.set(sessionId, w);
     w.done = (async () => {
-      try { await drain(sessionId, w); } catch (e) { fail('retain', null, sessionId, e); } finally { workers.delete(sessionId); }
+      try {
+        do { w.dirty = false; await drain(sessionId, w); } while (w.dirty);
+      } catch (e) { fail('retain', null, sessionId, e); } finally { workers.delete(sessionId); }
     })();
   }
 
@@ -315,7 +337,7 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
       return out?.context ?? 'No matching memories.';
     },
 
-    /** Resolves when every queued retain has finished (tests and shutdown). */
+    /** Resolves when every session's retain worker has finished draining (tests and shutdown). */
     async idle() {
       while (workers.size) await Promise.all([...workers.values()].map((w) => w.done));
     },

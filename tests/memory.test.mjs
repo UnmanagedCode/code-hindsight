@@ -3,6 +3,8 @@
 // turn plus an activity entry; nothing throws at the hook).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
 import { mkRoot } from './helpers.mjs';
 import { startFakeCc, live } from './support/fakeCc.mjs';
 import { startFakeHindsight, FAKE_KEY } from './support/fakeHindsight.mjs';
@@ -455,4 +457,54 @@ test('turns whose boundaries left the transcript tail are reported as dropped, n
   assert.ok(dropped.length >= 1);
   assert.equal(x.hs.retains().some((r) => /a2/.test(r.body.items[0].content)), false);
   assert.equal(x.cursors.get(S).inflight, undefined);
+});
+
+test('a pending window lost to a rotation is reported, not skipped, and no old-transcript turn is sent (timestamped turns)', async (t) => {
+  const x = await setup(t);
+  x.hs.retainStatus = 500;
+  await x.memory.retainForHook(S, [turn(1, 'user', 'q1'), turn(2, 'assistant', 'a1')]); // inflight; send fails
+  await x.memory.retainForHook(S, [turn(1, 'user', 'q1'), turn(2, 'assistant', 'a1'), turn(3, 'user', 'q2'), turn(4, 'assistant', 'a2')]); // window; resend fails
+  x.hs.retainStatus = null;
+  // /clear or a trim: the next tail holds only newer turns, with new ids
+  await x.memory.retainForHook(S, [turn(5, 'user', 'r1'), turn(6, 'assistant', 'r2')]);
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'cc-proj'), ['q1', 'a1', 'r1', 'r2'], 'q2/a2 are gone and were not re-sent');
+  const dropped = x.activity.list().filter((e) => e.code === 'RETAIN_DROPPED');
+  assert.equal(dropped.length, 1);
+  assert.deepEqual(dropped[0].banks, ['cc-proj']);
+});
+
+test('a stale Stop (an older hook process arriving late) changes nothing and is not a loss', async (t) => {
+  const x = await setup(t, { scopes: stageScopes });
+  x.cc.session(S, live({ stage: 'plan' }), live({ stage: 'implement' }), live({ stage: 'plan' }), live({ stage: 'implement' }));
+  const next = growing();
+  const t1 = next('p');
+  const t2 = next('i');
+  await x.memory.retainForHook(S, t1);
+  await x.memory.retainForHook(S, t2);
+  await x.memory.idle();
+  const before = JSON.stringify(x.cursors.get(S));
+  await x.memory.retainForHook(S, t1); // arrives late: older than what is recorded
+  await x.memory.idle();
+  assert.equal(JSON.stringify(x.cursors.get(S)), before, 'the cursor did not move backwards');
+  await x.memory.retainForHook(S, t2); // a duplicate of the newest
+  await x.memory.idle();
+  const t3 = next('i');
+  await x.memory.retainForHook(S, t3);
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'plan-proj'), ['pq1', 'pa1']);
+  assert.deepEqual(bodies(x, 'impl-proj'), ['iq2', 'ia2', 'iq3', 'ia3'], 'nothing was sent twice and nothing went to the wrong bank');
+  assert.deepEqual(errors(x.activity), []);
+});
+
+test('a cursor entry of the wrong shape is reset and logged; it is never spread into a backfill', async (t) => {
+  const x = await setup(t);
+  fs.mkdirSync(path.join(x.r.dataDir, 'memory'), { recursive: true });
+  fs.writeFileSync(path.join(x.r.dataDir, 'memory', 'cursors.json'), JSON.stringify({ [S]: { lastId: 'u0', lastTs: null, pending: 'abc' } }));
+  x.restart();
+  const tail = [turn(1, 'user', 'old q'), turn(2, 'assistant', 'old a'), turn(3, 'user', 'q'), turn(4, 'assistant', 'a')];
+  await x.memory.retainForHook(S, tail);
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'cc-proj'), ['q', 'a'], 'only the last exchange: no backfill from the corrupt entry');
+  assert.deepEqual(x.activity.list().filter((e) => e.code === 'CURSOR_INVALID').length, 1);
 });

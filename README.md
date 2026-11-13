@@ -43,6 +43,7 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 - The recall tool is text-only (no JSON format).
 - Bank names are sanitized, so different projects can map to the same bank.
 - If `memory/cursors.json` is lost, turns already retained can be retained again.
+- `memory/cursors.json` is one file, rewritten synchronously on each Stop and each drain step, and it holds each session's unacknowledged batch. Hundreds of sessions blocked at once on large batches make it large, and writing it can slow concurrent recalls.
 - With LLM mode `none`, retain stores raw chunks without fact extraction.
 - If Hindsight stays unavailable long enough that a session's backlog of unsent turns overflows, or the turns leave the transcript tail the hook sends, they are dropped (logged as `RETAIN_DROPPED`), never sent to another bank.
 - Inside the control plane, attachment links and images, the logo in the memory constellation and the favicon 404 (upstream builds those URLs without the base path).
