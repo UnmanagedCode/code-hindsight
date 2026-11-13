@@ -6,24 +6,11 @@ import http from 'node:http';
 import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { mkRoot, REPO } from './helpers.mjs';
+import { mkRoot } from './helpers.mjs';
+import { runHook } from './support/runHook.mjs';
 
-const HOOK = path.join(REPO, 'claude', 'hooks', 'hook.mjs');
 const TIMEOUT_MS = 400;
-
-function run(event, input, env, { stdin = JSON.stringify(input) } = {}) {
-  return new Promise((resolve) => {
-    const t0 = Date.now();
-    const child = spawn('node', [HOOK, event], { env: { PATH: process.env.PATH, ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (d) => { stdout += d; });
-    child.stderr.on('data', (d) => { stderr += d; });
-    child.on('close', (code) => resolve({ code, stdout, stderr, ms: Date.now() - t0 }));
-    child.stdin.end(stdin);
-  });
-}
+const run = runHook;
 
 /** A backend answering every hook request with `reply(req, body)`; `requests` logs them. */
 async function backend(t, reply) {

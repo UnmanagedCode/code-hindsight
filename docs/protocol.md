@@ -11,6 +11,7 @@ cc strips `/plugins/code-hindsight` before a request reaches the backend.
 | `/`, `/index.html`, `/theme-init.js`, `/assets/*` | the shell UI from `frontend/dist` (allowlist in `src/http.js`); unbuilt: HTML entries answer `503` text, others fall through |
 | `/pluginBridge.js`, `/pluginTheme.css` | `404` (cc serves them at its own root) |
 | `/-/api/*` | the plugin's JSON API (below) |
+| `/-/hook/{recall,retain,reset}`, `/-/mcp` | the non-browser routes (below) |
 | `/-/*` (anything else) | `404` |
 | every other path | the Hindsight control plane, proxied ([CP proxy](#cp-proxy)) |
 
@@ -26,6 +27,11 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 | GET | `/-/api/status[?refresh=1]` | `{state, error, docker: {mode, serverVersion}, variant, bindAddress, bindAuto, ports: {api, cp}, images: {api: {ref, present, id, version, ok}, cp: {ref, present, id, basePath, upstream, built, trusted, ok}} \| null, containers: {api, cp} \| null, startedAt, pendingRestart, volume, lastShutdownFailure: {at, error} \| null, llmMode, autoStart?, job, bundles: [{name, size}], bundleNames: {full, slim}}`. `refresh=1` re-inspects images and containers first. `autoStart` is cc's flag for this plugin, omitted when cc cannot be asked |
 | GET | `/-/api/settings` | `{settings, secrets: {llmApiKey: bool, embeddingsApiKey: bool}, defaults, detectedBindAddress, choices, images}` |
 | PUT | `/-/api/settings` | `{settings, secrets?: {llmApiKey?, embeddingsApiKey?}}` — the whole settings object; a secret string sets, `null`/`""` clears, absent keeps — except that an absent key whose endpoint changed is cleared (`keyEndpoints` in `src/settings.js`: LLM mode/provider/base URL; embeddings provider/base URL). `400 SETTINGS_INVALID` with `params.fields: [{field, code?, message}]` changes nothing. Answers the settings view plus `cleared: [key names]` and `status` |
+| GET | `/-/api/scopes` | `{scopes, choices: {actions, kinds, placeholders, limits}}` |
+| PUT | `/-/api/scopes` | `{scopes}` — the whole list, validated by `validateScopes` (`src/scopes.js`) and stored in `scopes.json`; `400 SCOPES_INVALID` with `params.fields: [{field: "scopes[i].…", message}]` changes nothing. Answers `{scopes}` |
+| POST | `/-/api/memory/preview-bank` | `{template, sample?: {project, worktree, kind}}` → `{bank}` or `{error}` (the same renderer as recall and retain) |
+| GET | `/-/api/memory/activity` | `{entries}` newest first; entry `{at, event: recall\|retain\|mcp-recall, outcome: ok\|error\|skipped, sessionId?, project?, worktree?, stage?, kind?, banks?, count?, code?, message?}` |
+| GET | `/-/api/memory/stages` | `{stages: [{name, playbooks: [id]}], error}` — stage names across cc's playbooks; `error` is a string when cc could not be read |
 | GET | `/-/api/cc-backends` | `{backends: [{id, label, host, usable, refusal, models: [{model, label}]}]}` — never a token |
 | POST | `/-/api/start` | start / reconcile to the saved settings; answers status at once |
 | POST | `/-/api/restart` | stop, then start; answers status at once |
@@ -70,6 +76,34 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 
 An export is the `docker save` archive with one extra root file, `code-hindsight-bundle.json` (`BUNDLE_MANIFEST`): `{format: 1, hindsight, variant, images: [{ref, id}], createdAt}`. `docker load` ignores it; the import job reads it back. It is informational: what runs is decided by the loaded images' own IDs.
 
+## Hook and tool routes (`src/hookRoutes.js`)
+
+Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP forwarding; never by the shell UI.
+
+- **Request policy:** `POST` with `Content-Type: application/json` only. Refused `403 BROWSER_REFUSED` when the request carries `Origin`, `Sec-Fetch-Site`, `Sec-Fetch-Dest` or `Sec-Fetch-User` (browsers always add them; Node's `fetch` adds only `Sec-Fetch-Mode`, which is not a refusal reason). `/-/mcp` is also refused when it carries `X-Forwarded-Prefix` (cc's public proxy adds it; its MCP forward dials the backend directly). Body limits: `HOOK_BODY_LIMITS` (`413` over). `sessionId` must be a cc session id.
+- **Identity:** the claimed `sessionId` must be a **live** cc session; scopes are matched against what cc's `describe_session` says about it at call time. It is advisory, not authenticated: see [README → Trust model](../README.md#trust-model).
+
+| Path | Body → answer |
+|---|---|
+| `/-/hook/recall` | `{sessionId, prompt}` → `200 {context}` (`context` is the `<hindsight_memory>` block or `null`; never an error) |
+| `/-/hook/retain` | `{sessionId, turns: [{id, role: user\|assistant\|action, content, timestamp\|null}]}` → `202 {status: accepted\|off\|empty\|unresolved\|error}`; sending to Hindsight happens after the answer |
+| `/-/hook/reset` | `{sessionId}` → `200 {ok: true}` |
+| `/-/mcp` | cc's forward: `{tool: "recall", arguments: {query}, caller: {sessionId, project}, format}` → always `200 {text}` or `{error, code}` (`NO_SESSION`, `SESSION_NOT_LIVE`, `SESSION_UNRESOLVED`, `NO_RECALL_SCOPE`, `HINDSIGHT_NOT_READY`, `RECALL_FAILED`, `BAD_REQUEST`; an unknown tool has no code). The banks searched are exactly what the scopes yield for `caller.sessionId` now; arguments cannot add one |
+
+### Hook process (`claude/hooks/hook.mjs`)
+
+`hook.mjs recall|retain|reset` reads the hook input from stdin and posts to `<base>/-/hook/<event>`, where `<base>` is `$CODE_HINDSIGHT_HOOK_URL` if set, else `$CONDUCTOR_URL/plugins/code-hindsight`. It identifies the session by `$CC_SESSION_ID` (the public id, not the hook input's rotating backing `session_id`). With no `CC_SESSION_ID`, or no base, it makes no request. It **always exits 0**, writes nothing to stderr, and writes stdout only for `recall` (one `hookSpecificOutput` JSON). Deadlines: `HOOK_TIMEOUTS` in `claude/hooks/limits.mjs`; `CODE_HINDSIGHT_HOOK_TIMEOUT_MS` overrides them (tests only). `retain` parses `transcript_path` with `claude/hooks/transcript.mjs`, waits briefly for the transcript to hold `last_assistant_message` and otherwise adds it as a synthetic turn `final:<last uuid>`, and sends the newest turns within `RETAIN_TAIL_BYTES`.
+
+`claude/hooks/hooks.json`: `UserPromptSubmit` → `recall`; `Stop` → `retain` with `async: true`; `SessionStart` matcher `clear|compact` → `reset`. `Stop` must exit 0 and print nothing: exit 2, `decision: "block"` or `additionalContext` on a Stop hook keeps the session running.
+
+### Hindsight calls (`src/hindsightClient.js`)
+
+| Call | Detail |
+|---|---|
+| recall | `POST /v1/default/banks/<bank>/memories/recall` `{query, budget, max_tokens}` (`RECALL_BUDGET`, `RECALL_MAX_TOKENS`); **no `types` filter** (LLM none stores `world` chunks); `404` (bank never created) is an empty result |
+| retain | `POST /v1/default/banks/<bank>/memories` `{items: [{content, document_id: "cc-session:<id>", update_mode: "append", timestamp, context, metadata}], async: true, operation_id}`; creates a missing bank, and an append onto a missing document stores the content as a new document. `content` is JSONL, one `{role, content, timestamp}` per turn. `metadata`: `source`, `ccSessionId`, `project`, `worktree`, `kind`, `stage` (omitted without one) |
+| `operation_id` | `operationIdFor` (`src/retainCursor.js`): a v4-shaped UUID from the SHA-256 of `bank`, document id, first and last turn id, so a resend of a batch repeats it and Hindsight returns the original operation |
+
 ## Hindsight states
 
 `stopped → checking → starting → ready`, plus `stopping` and `error` (with `error` set). `ready` means the API answered `/health` with 200, the CP answered `<base path>/api/health`, and the backend signed in to the CP.
@@ -82,6 +116,9 @@ An export is the `docker save` archive with one extra root file, `code-hindsight
 | `secrets.json` (0600) | `apiKey`, `cpAccessKey` (generated once), `llmApiKey`, `embeddingsApiKey` |
 | `stopping.json` (0600) | `{pid, at}` of the detached `docker stop` a SIGTERM left running; the next backend waits for that pid |
 | `shutdown-failed.json` (0600) | `{at, error}` when a SIGTERM could not start that stop; shown as `status.lastShutdownFailure` and removed when Hindsight is next ready |
+| `scopes.json` (0600) | `{scopes}`: the memory scopes; absent = memory off |
+| `memory/cursors.json` (0600) | per `CC_SESSION_ID`: `{lastId, lastTs, inflight?, at}` — the last retained turn, and the batch being sent (kept so a retry resends it unchanged); entries older than `CURSOR_MAX_AGE_MS` are pruned on write. Losing it can duplicate turns |
+| `logs/memory.jsonl` (+ `.1`) | the activity log (rotated at `ACTIVITY_LIMITS.rotateBytes`) |
 | `trusted-cp.json` (0600) | `{id, source: build\|confirmed, at}`: the CP image ID allowed to run |
 | `run/` | short-lived `--env-file`s for `docker run`, removed after each run |
 | `logs/jobs/<id>.log` | each job's output |
@@ -133,6 +170,8 @@ Both published ports need a key except: API `/health*`, `/version`, `/metrics`, 
 |---|---|---|
 | `GET $CONDUCTOR_URL/api/settings/models` (`backends[].{id,label,env:[{key,value}]}`, `backendModels`) | the cc-backend link and its picker; a row whose `ANTHROPIC_BASE_URL` host is loopback (`isLoopbackHost` in `src/llmEnv.js`, over the WHATWG-normalized host; best-effort, literal addresses and `localhost`) is refused `CC_BACKEND_LOOPBACK` | `CC_UNREACHABLE` / `CC_ROUTE_CHANGED` |
 | `GET $CONDUCTOR_URL/api/plugins/code-hindsight/status` (`autoStart`) | the Auto-start hint | hint omitted |
+| `POST $CONDUCTOR_URL/mcp/tools/describe_session` `{sessionId}` (`live.{project, worktree.worktreeName, playbook, stage}`) | placing a session for scope matching, on every hook or tool call (`DESCRIBE_TIMEOUT_MS`); kind is `conductor` iff `live.project` is `.conduct` | `SESSION_UNRESOLVED`; no `live` arm or `SESSION_UNKNOWN` → `SESSION_NOT_LIVE` |
+| `GET $CONDUCTOR_URL/api/playbooks`, `GET …/api/playbooks/<id>` (`stages` keys) | the stage suggestions in the Memory tab (cached `STAGES_TTL_MS`) | `error` string in `/-/api/memory/stages` |
 
 ## For clients of the Hindsight API
 
