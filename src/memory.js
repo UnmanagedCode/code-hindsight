@@ -3,19 +3,21 @@
 // routes never see an exception. Owns the recall budget, the injected-context format, the set of
 // memories already injected per session, and the one-in-flight-per-session retain worker.
 import { AppError } from './errors.js';
-import { matchScopes, SCOPE_LIMITS } from './scopes.js';
+import { matchScopes } from './scopes.js';
 import { newTurns, tailEnd, operationIdFor } from './retainCursor.js';
 
 export const MEMORY_LIMITS = Object.freeze({
   /** Per-bank recall deadline; with the describe_session deadline it must stay under the hook's. */
   recallTimeoutMs: 2000,
-  recallMaxBanks: SCOPE_LIMITS.recallMaxBanks,
   /** Below the 10,000 characters after which Claude Code persists hook context to a file. */
   contextMaxChars: 8000,
   memoryTextMaxChars: 1500,
   injectedSessionsMax: 500,
+  /** Per session: the oldest injected ids are forgotten beyond this. */
+  injectedIdsMax: 2000,
 });
 
+const NONE = Object.freeze({ context: null, commit: () => {} });
 const OPEN_TAG = '<hindsight_memory>';
 const CLOSE_TAG = '</hindsight_memory>';
 const RETAIN_CONTEXT = "Conversation between a cc user (or a cc conductor) and a coding agent in a cc session. Record the agent's statements as claims it made, not as verified facts.";
@@ -37,7 +39,7 @@ function cleanText(text, max) {
 export function createMemory({ scopes, cc, hindsight, cursors, activity, limits = MEMORY_LIMITS, now = () => Date.now() }) {
   /** sessionId → ids of memories already injected into its current context (insertion-ordered, bounded). */
   const injected = new Map();
-  /** sessionId → {pending, done}: at most one retain in flight per session. */
+  /** sessionId → {queue, done}: at most one retain in flight per session. */
   const workers = new Map();
 
   const ctx = (s) => (s ? { sessionId: s.sessionId, project: s.project, worktree: s.worktree, stage: s.stage, kind: s.kind } : {});
@@ -98,7 +100,8 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
   function markInjected(sessionId, ids) {
     const set = injected.get(sessionId) ?? new Set();
     injected.delete(sessionId);
-    for (const id of ids) set.add(id);
+    for (const id of ids) { set.delete(id); set.add(id); }
+    while (set.size > limits.injectedIdsMax) set.delete(set.values().next().value);
     injected.set(sessionId, set);
     while (injected.size > limits.injectedSessionsMax) injected.delete(injected.keys().next().value);
   }
@@ -117,7 +120,6 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
       if (cursor && turns.length) cursors.set(sessionId, tailEnd(turns, cursor));
       return undefined;
     }
-    if (!hindsight.isReady()) return fail('retain', session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks: [target.bank] });
     const fresh = newTurns(turns, cursor);
     if (!fresh.length) return undefined;
 
@@ -134,22 +136,34 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     };
     const inflight = { bank: target.bank, operationId: operationIdFor(target.bank, documentId, first.id, last.id), item, lastId: last.id, lastTs: tailEnd(fresh, cursor).lastTs, count: fresh.length };
     cursors.set(sessionId, { lastId: cursor?.lastId ?? null, lastTs: cursor?.lastTs ?? null, inflight });
+    // The batch is persisted before Hindsight is asked, so a Hindsight that is not ready costs
+    // nothing: the next Stop resends this batch, even when the tail has moved past it.
+    if (!hindsight.isReady()) return fail('retain', session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks: [inflight.bank] });
     try { await hindsight.retain(inflight.bank, item, { operationId: inflight.operationId }); } catch (e) { return fail('retain', session, sessionId, e, { banks: [inflight.bank] }); }
     cursors.set(sessionId, { lastId: inflight.lastId, lastTs: inflight.lastTs });
     activity.add({ event: 'retain', outcome: 'ok', sessionId, ...ctx(session), banks: [inflight.bank], count: fresh.length });
     return undefined;
   }
 
+  /**
+   * Queue a job behind the one in flight. A newer tail supersedes a pending one (it holds the same
+   * turns and more), except that a job with no retain target never discards a pending job that has
+   * one: the targeted turns are sent first, then the cursor advances past the untargeted ones.
+   */
   function enqueue(sessionId, job) {
     const running = workers.get(sessionId);
-    if (running) { running.pending = job; return; }
-    const w = { pending: job, done: null };
+    if (running) {
+      const last = running.queue[running.queue.length - 1];
+      if (last && (job.target || !last.target)) running.queue[running.queue.length - 1] = job;
+      else running.queue.push(job);
+      return;
+    }
+    const w = { queue: [job], done: null };
     workers.set(sessionId, w);
     w.done = (async () => {
       try {
-        while (w.pending) {
-          const j = w.pending;
-          w.pending = null;
+        while (w.queue.length) {
+          const j = w.queue.shift();
           try { await sendJob(sessionId, j); } catch (e) { fail('retain', j.session, sessionId, e); }
         }
       } finally { workers.delete(sessionId); }
@@ -157,30 +171,33 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
   }
 
   return {
-    /** The context to inject before a prompt, or null. Never throws. */
+    /**
+     * The context to inject before a prompt (or null) and `commit`, which records the memories as
+     * injected: call it once the response has reached the hook, so an aborted answer suppresses nothing.
+     * Never throws.
+     */
     async recallForHook(sessionId, prompt) {
       try {
         const list = loadScopes('recall', sessionId);
-        if (!list.length) return { context: null };
+        if (!list.length) return NONE;
         const session = await resolve('recall', sessionId);
-        if (!session) return { context: null };
+        if (!session) return NONE;
         const m = matchScopes(list, session);
         logSkipped('recall', session, m);
-        if (!m.recall.length) return { context: null };
+        if (!m.recall.length) return NONE;
         const banks = m.recall.map((r) => r.bank);
         if (!hindsight.isReady()) {
           fail('recall', session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks });
-          return { context: null };
+          return NONE;
         }
         const perBank = await recallBanks(m.recall, prompt);
         for (const b of perBank) if (b.error) fail('recall', session, sessionId, b.error, { banks: [b.bank] });
         const out = formatContext(perBank, injected.get(sessionId));
-        if (out) markInjected(sessionId, out.ids);
         activity.add({ event: 'recall', outcome: 'ok', sessionId, ...ctx(session), banks: perBank.filter((b) => b.results).map((b) => b.bank), count: out?.count ?? 0 });
-        return { context: out?.context ?? null };
+        return { context: out?.context ?? null, commit: () => { if (out) markInjected(sessionId, out.ids); } };
       } catch (e) {
         fail('recall', null, sessionId, e);
-        return { context: null };
+        return NONE;
       }
     },
 

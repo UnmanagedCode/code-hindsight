@@ -88,7 +88,7 @@ A scope is `{name, match: {projects?, sessions?, stages?}, bank, actions}`. Scop
 
 - **Header:** says "Memory is off" when no scopes are saved; warns when Hindsight is not ready (sessions are memoryless) and when its LLM mode is `none`.
 - **Scope editor:** ordered cards (move up/down, delete, **Add scope**) with name, projects (one glob per line), sessions, stages (suggestions from cc's playbooks), bank template with a live preview, and actions. **Save** sends the whole list; a refusal (`SCOPES_INVALID`) shows against the field it names.
-- **Activity:** recent recalls, retains and refusals (time, event, session, project · stage, banks, count, result), newest first, refreshed every few seconds. Entries hold ids, names, counts and error text, never prompt or memory text.
+- **Activity:** recent recalls, retains and refusals (time, event, session, project · stage, banks, count, result), newest first, refreshed every few seconds. Entries hold ids, names, counts and error text, never prompt or memory text. A prompt or Stop from a session that matches no scope leaves no entry (there would be one per prompt); the recall tool, by contrast, logs `NO_RECALL_SCOPE`.
 
 ### Degrading
 

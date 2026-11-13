@@ -32,6 +32,7 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 - **Session identity for memory is advisory, and scopes are not an isolation boundary.** The backend trusts the session id a hook or the recall tool claims (it must be a live cc session) and an agent can claim another live session's id. Every session also runs as the same OS user as the backend, so an agent with a shell can read `secrets.json` and query Hindsight directly. Scopes keep cooperating agents' memory in its lane; they do not contain an adversarial one.
 - **Retained content is not redacted.** Prompts, replies and tool-call targets (a command line, a path) that contain secrets reach Hindsight and, with an LLM configured, its provider.
 - **Recalled memory is other sessions' text.** It is wrapped and labelled as data, but a memory that tries to instruct the agent remains a risk.
+- **Every prompt is also sent to Hindsight (and, with an LLM configured, its provider) as a recall query** whenever a recall scope matches the session, whether or not the turn is retained.
 - **The hook and tool routes** (`/-/hook/*`, `/-/mcp`) refuse requests that look like a browser's, so a web page cannot read memories or inject retains through them.
 - Keys live in `secrets.json` (0600) in the plugin data dir and are never returned by any route. A key is cleared when its provider or URL changes without it being entered again.
 

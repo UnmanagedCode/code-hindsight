@@ -53,7 +53,7 @@ async function turnsWithFinalMessage(input, waitMs) {
 async function run(event) {
   const sessionId = env.CC_SESSION_ID;
   const base = env.CODE_HINDSIGHT_HOOK_URL || (env.CONDUCTOR_URL ? `${env.CONDUCTOR_URL.replace(/\/+$/, '')}/plugins/code-hindsight` : '');
-  if (!sessionId || !base || !(event in HOOK_TIMEOUTS)) return null;
+  if (!sessionId || !base || !Object.hasOwn(HOOK_TIMEOUTS, event)) return null;
   const input = await readStdin();
   if (event === 'recall') {
     const prompt = stripInjectedMemory(String(input.prompt ?? '')).trim().slice(0, RECALL_QUERY_MAX_CHARS);

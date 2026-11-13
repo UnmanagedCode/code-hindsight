@@ -61,7 +61,7 @@ test('never blocks or fails: a hanging backend, a 500, a refused port and garbag
     for (const event of ['recall', 'retain', 'reset']) {
       const r = await run(event, { prompt: 'hi', transcript_path: transcriptFile(t, [msg('user', 'u1', 'q', '2026-01-01T00:00:00Z')]), last_assistant_message: '' }, envFor(url));
       assert.deepEqual([name, event, r.code, r.stdout, r.stderr], [name, event, 0, '', '']);
-      assert.ok(r.ms < 5000, `${name}/${event} exited in ${r.ms} ms`);
+      assert.ok(r.ms < TIMEOUT_MS + 700, `${name}/${event} exited in ${r.ms} ms: the per-request deadline (${TIMEOUT_MS} ms) did not fire, only the backstop did`);
     }
   }
 });
@@ -114,4 +114,21 @@ test('retain does not duplicate the final message when the transcript already ha
   const file = transcriptFile(t, [msg('user', 'u1', 'q', '2026-01-01T00:00:00Z'), msg('assistant', 'a1', 'the final words', '2026-01-01T00:00:01Z')]);
   await run('retain', { transcript_path: file, last_assistant_message: 'the final words' }, envFor(b.url));
   assert.deepEqual(b.requests[0].body.turns.map((x) => x.id), ['u1', 'a1']);
+});
+
+test('a stdin that is never closed, against a hanging backend, still ends in a silent exit 0 inside the backstop', async (t) => {
+  const hang = await backend(t, () => {});
+  for (const event of ['recall', 'retain', 'reset']) {
+    const r = await run(event, { prompt: 'hi', transcript_path: '/nonexistent' }, envFor(hang.url), { keepStdinOpen: true });
+    assert.deepEqual([event, r.code, r.stdout, r.stderr], [event, 0, '', '']);
+    assert.ok(r.ms < 3000, `${event} exited in ${r.ms} ms`);
+  }
+  const noStdinData = await run('recall', null, envFor(hang.url), { stdin: '', keepStdinOpen: true });
+  assert.deepEqual([noStdinData.code, noStdinData.stdout, noStdinData.stderr], [0, '', '']);
+});
+
+test('an event name that only exists on Object.prototype is not an event', async (t) => {
+  const b = await backend(t, ok({}));
+  const r = await run('constructor', {}, envFor(b.url));
+  assert.deepEqual([r.code, r.stdout, r.stderr, b.requests.length], [0, '', '', 0]);
 });

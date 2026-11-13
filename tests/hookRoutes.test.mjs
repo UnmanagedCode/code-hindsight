@@ -91,10 +91,16 @@ test('the hook routes answer: recall → {context}, retain → 202 and sends, re
   x.hs.bank('cc-proj', [{ id: 'm', text: 'a remembered thing' }]);
   const rec = await x.send('/-/hook/recall', { body: { sessionId: 's1', prompt: 'p' } });
   assert.match(rec.body.context, /a remembered thing/);
+  assert.equal((await x.send('/-/hook/recall', { body: { sessionId: 's1', prompt: 'p' } })).body.context, null, 'flushed, so the memory now counts as injected');
   const turns = [{ id: 'u1', role: 'user', content: 'q', timestamp: '2026-01-01T00:00:00.000Z' }, { id: 'u2', role: 'assistant', content: 'a', timestamp: '2026-01-01T00:00:01.000Z' }];
+  x.hs.retainLatency = 400;
+  const t0 = Date.now();
   const ret = await x.send('/-/hook/retain', { body: { sessionId: 's1', turns } });
   assert.equal(ret.status, 202);
+  assert.ok(Date.now() - t0 < 250, 'the 202 does not wait for Hindsight');
   await x.memory.idle();
+  assert.ok(Date.now() - t0 >= 400, 'the send really was slow');
+  x.hs.retainLatency = 0;
   assert.equal(x.hs.retains().length, 1);
   assert.equal((await x.send('/-/hook/reset', { body: { sessionId: 's1' } })).status, 200);
   assert.match((await x.send('/-/hook/recall', { body: { sessionId: 's1', prompt: 'p' } })).body.context, /a remembered thing/, 'reset makes the memory injectable again');

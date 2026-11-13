@@ -39,7 +39,7 @@ function toForm(s: Scope): ScopeForm {
   };
 }
 
-/** Both kinds ticked (or neither) means "any": the key is omitted, never sent as an empty list. */
+/** Both kinds ticked means "any": the key is omitted, never sent as an empty list. */
 function toScope(f: ScopeForm): Scope {
   const match: Scope['match'] = {};
   const projects = f.projects.split('\n').map((l) => l.trim()).filter(Boolean);
@@ -228,9 +228,11 @@ export function Memory({ status }: { status: Status }) {
                   <legend className="text-sm font-medium">Sessions</legend>
                   {KINDS.map((k) => (
                     <label key={k} className="mr-4 inline-flex items-center gap-2 text-sm">
-                      <input type="checkbox" checked={f.sessions[k]} onChange={(e) => patch(i, { sessions: { ...f.sessions, [k]: e.target.checked } })} /> {k}
+                      {/* The last ticked kind cannot be cleared: "none" would silently mean "any". */}
+                      <input type="checkbox" checked={f.sessions[k]} disabled={f.sessions[k] && KINDS.filter((o) => f.sessions[o]).length === 1} onChange={(e) => patch(i, { sessions: { ...f.sessions, [k]: e.target.checked } })} /> {k}
                     </label>
                   ))}
+                  <p className="text-xs text-muted-foreground">{KINDS.every((k) => f.sessions[k]) ? 'Both ticked: any session.' : 'Only these sessions.'} At least one stays ticked.</p>
                   <FieldMsg errors={errors} field={`${p}.match.sessions`} />
                 </fieldset>
                 <div className="space-y-1">

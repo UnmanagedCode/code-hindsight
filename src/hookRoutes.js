@@ -11,7 +11,15 @@ export const MCP_QUERY_MAX_CHARS = 2000;
 export const TURN_ROLES = Object.freeze(['user', 'assistant', 'action']);
 const MAX_TURNS = 5000;
 
-/** Headers only a browser adds. Node's fetch sends `Sec-Fetch-Mode` alone, which is not one of them. */
+/**
+ * What keeps a web page out. A browser's non-GET/HEAD request always carries `Origin` (its value
+ * may be `null`), and an `application/json` body cannot be sent as a simple or form request, so a
+ * cross-origin page cannot send one without a preflight these routes never answer. `Sec-Fetch-*`
+ * adds to that where the browser sends it (some omit it on non-trustworthy HTTP origins). The check
+ * fails open only for a client that sends none of these: a non-browser local process, which the
+ * trust model already treats as able to call. Node's `fetch` sends `Sec-Fetch-Mode` alone, which
+ * is not a refusal reason.
+ */
 const BROWSER_HEADERS = ['origin', 'sec-fetch-site', 'sec-fetch-dest', 'sec-fetch-user'];
 
 const bad = (detail) => new AppError('BAD_REQUEST', { detail });
@@ -29,7 +37,10 @@ export function createHookRoutes({ memory }) {
     if (!isSessionId(body.sessionId)) throw bad('sessionId must be a cc session id');
     if (event === 'recall') {
       if (typeof body.prompt !== 'string' || !body.prompt.trim()) throw bad('prompt must be a non-empty string');
-      return sendJson(res, 200, await memory.recallForHook(body.sessionId, body.prompt));
+      const out = await memory.recallForHook(body.sessionId, body.prompt);
+      // Injected only once the answer was flushed: a client that went away never saw the block.
+      res.once('finish', out.commit);
+      return sendJson(res, 200, { context: out.context });
     }
     if (event === 'retain') {
       if (!validTurns(body.turns)) throw bad('turns must be a list of {id, role, content, timestamp}');

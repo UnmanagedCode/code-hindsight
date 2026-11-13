@@ -38,12 +38,13 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
           body: JSON.stringify({ sessionId }),
           signal: AbortSignal.timeout(describeTimeoutMs),
         });
+        if (!res.ok) throw new Error(`describe_session answered HTTP ${res.status}`);
         body = await res.json();
       } catch (e) {
         throw new AppError('SESSION_UNRESOLVED', { detail: e?.name === 'TimeoutError' ? 'cc did not answer in time' : (e?.message ?? String(e)) }, { cause: e });
       }
       if (body?.ok === false) {
-        if (body.code === 'SESSION_UNKNOWN') throw new AppError('SESSION_NOT_LIVE', { sessionId });
+        if (body.code === 'SESSION_UNKNOWN' || body.code === 'SESSION_NOT_LIVE') throw new AppError('SESSION_NOT_LIVE', { sessionId });
         throw new AppError('SESSION_UNRESOLVED', { detail: `${body.code ?? 'error'}: ${body.reason ?? ''}` });
       }
       const live = body?.live;

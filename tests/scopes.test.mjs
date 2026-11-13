@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { validateScopes, matchScopes, renderBank, createScopesStore, SCOPE_LIMITS } from '../src/scopes.js';
+import { validateScopes, matchScopes, renderBank, createScopesStore, globMatches, SCOPE_LIMITS } from '../src/scopes.js';
 import { mkRoot } from './helpers.mjs';
 
 const scope = (over = {}) => ({ name: 's', match: {}, bank: 'cc-{project}', actions: ['recall', 'retain'], ...over });
@@ -120,4 +120,24 @@ test('the store round-trips scopes.json and refuses a corrupt file', (t) => {
   assert.equal(fs.statSync(path.join(r.dataDir, 'scopes.json')).mode & 0o777, 0o600);
   fs.writeFileSync(path.join(r.dataDir, 'scopes.json'), '{"scopes":[{"name":""}]}');
   assert.throws(() => createScopesStore(r.dataDir).get(), /scopes\.json is not valid/);
+});
+
+test('a list entry that is undefined (or any non-string) is refused, not skipped', () => {
+  assert.deepEqual(fieldsOf([scope({ match: { projects: [undefined] } })]), ['scopes[0].match.projects']);
+  assert.deepEqual(fieldsOf([scope({ match: { stages: ['plan', null] } })]), ['scopes[0].match.stages']);
+  assert.deepEqual(fieldsOf([scope({ match: { sessions: [0] } })]), ['scopes[0].match.sessions']);
+});
+
+test('glob matching is linear: a many-star glob against a non-matching name finishes at once', () => {
+  const glob = '*a'.repeat(10) + '*b';
+  const name = 'a'.repeat(41);
+  const t0 = process.hrtime.bigint();
+  assert.equal(globMatches(glob, name), false);
+  assert.equal(matchScopes(ok([scope({ match: { projects: [glob] } })]), session({ project: name })).recall.length, 0);
+  assert.ok(Number(process.hrtime.bigint() - t0) / 1e6 < 100, 'took far longer than a linear scan would');
+});
+
+test('glob semantics: * spans any run (including none), ? exactly one, everything else literal', () => {
+  const cases = [['*', ''], ['a*', 'a'], ['*b', 'ab'], ['a*c*e', 'abcde'], ['a?c', 'abc'], ['a?c', 'ac'], ['a.c', 'abc'], ['**', 'x'], ['a*b', 'acbc']];
+  assert.deepEqual(cases.map(([g, n]) => globMatches(g, n)), [true, true, true, true, true, false, false, true, false]);
 });

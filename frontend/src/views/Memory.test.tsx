@@ -107,4 +107,20 @@ describe('Memory', () => {
     expect(row.textContent).toContain(hostile);
     expect(row.textContent).toContain('RETAIN_FAILED');
   });
+
+  it('never lets both session kinds be cleared, and says what the ticks mean', async () => {
+    const calls = stub({ scopes: [scope('a')] });
+    render(<Memory status={status()} />);
+    const conductor = (await screen.findByLabelText('conductor')) as HTMLInputElement;
+    const worker = screen.getByLabelText('worker') as HTMLInputElement;
+    expect(screen.getByText(/Both ticked: any session/)).toBeTruthy();
+    await userEvent.click(conductor);
+    expect(worker.disabled).toBe(true);
+    expect(screen.getByText(/Only these sessions/)).toBeTruthy();
+    await userEvent.click(worker);
+    expect(worker.checked).toBe(true);
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    expect(putBody(calls).scopes[0].match.sessions).toEqual(['worker']);
+  });
 });

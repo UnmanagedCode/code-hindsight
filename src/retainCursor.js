@@ -11,9 +11,10 @@ export const CURSOR_MAX_AGE_MS = 30 * 24 * 3600 * 1000;
 export function createRetainCursors(dataDir, { now = () => Date.now() } = {}) {
   const file = path.join(dataDir, 'memory', 'cursors.json');
   let data = null;
-  const load = () => (data ??= readJsonFile(file, {}));
+  // No prototype, own-keys only: a session id such as `__proto__` or `constructor` is just a key.
+  const load = () => (data ??= Object.assign(Object.create(null), readJsonFile(file, {})));
   return {
-    get: (sessionId) => load()[sessionId],
+    get: (sessionId) => (Object.hasOwn(load(), sessionId) ? load()[sessionId] : undefined),
     set(sessionId, entry) {
       const all = load();
       all[sessionId] = { ...entry, at: now() };

@@ -57,8 +57,8 @@ export function validateScopes(input) {
         const v = match[key];
         if (!Array.isArray(v) || v.length === 0) return err(f(`match.${key}`), 'must be a non-empty list (omit the key to match any)');
         if (v.length > SCOPE_LIMITS.listMax) return err(f(`match.${key}`), `at most ${SCOPE_LIMITS.listMax} entries`);
-        const bad = v.find((x) => typeof x !== 'string' || !ok(x));
-        if (bad !== undefined) return err(f(`match.${key}`), `${JSON.stringify(bad)} is not ${what}`);
+        const badAt = v.findIndex((x) => typeof x !== 'string' || !ok(x));
+        if (badAt >= 0) return err(f(`match.${key}`), `${JSON.stringify(v[badAt]) ?? 'undefined'} is not ${what}`);
         if (new Set(v).size !== v.length) return err(f(`match.${key}`), 'duplicate entries');
         scope.match[key] = [...v];
       };
@@ -88,12 +88,27 @@ export function renderBank(template, session) {
   return BANK_RE.test(bank) ? { bank } : { error: `renders to "${bank}", which is not a valid bank id` };
 }
 
-const globToRegExp = (g) => new RegExp(`^${g.replace(/[.]/g, '\\.').replace(/\*/g, '.*').replace(/\?/g, '.')}$`);
+/**
+ * Whether `text` matches a glob (`*` any run of characters, `?` one character, the rest literal).
+ * Linear scan with a single backtrack point, so no glob can take exponential time (a regular
+ * expression built from many `*` can).
+ */
+export function globMatches(glob, text) {
+  let g = 0;
+  let t = 0;
+  let star = -1;
+  let resume = 0;
+  while (t < text.length) {
+    if (g < glob.length && (glob[g] === '?' || glob[g] === text[t])) { g++; t++; } else if (g < glob.length && glob[g] === '*') { star = g++; resume = t; } else if (star >= 0) { g = star + 1; t = ++resume; } else return false;
+  }
+  while (g < glob.length && glob[g] === '*') g++;
+  return g === glob.length;
+}
 
 /** Whether a scope's matcher accepts a session. An absent key matches anything. */
 export function scopeMatches(scope, session) {
   const { projects, sessions, stages } = scope.match;
-  if (projects && !projects.some((g) => globToRegExp(g).test(session.project ?? ''))) return false;
+  if (projects && !projects.some((g) => globMatches(g, session.project ?? ''))) return false;
   if (sessions && !sessions.includes(session.kind)) return false;
   if (stages && !(session.stage && stages.includes(session.stage))) return false;
   return true;
