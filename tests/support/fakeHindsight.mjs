@@ -16,9 +16,12 @@ export async function startFakeHindsight(t) {
     latency: {},
     failStatus: null,
     retainLatency: 0,
+    gate: null,
     inflightRetains: 0,
     maxInflightRetains: 0,
     retainStatus: null,
+    /** Hold every retain until the returned function is called. */
+    hold() { let release; h.gate = new Promise((r) => { release = r; }); return () => { h.gate = null; release(); }; },
     /** Create a bank with the results its recall returns. */
     bank(name, results = []) { banks.set(name, { docs: new Map(), results }); },
     doc: (bank, docId) => banks.get(bank)?.docs.get(docId),
@@ -43,6 +46,7 @@ export async function startFakeHindsight(t) {
       if (!b) return send(404, { detail: `bank ${bank} not found` });
       return send(200, { results: b.results.map((r) => ({ type: 'world', ...r })) });
     }
+    if (h.gate) await h.gate;
     h.inflightRetains++;
     h.maxInflightRetains = Math.max(h.maxInflightRetains, h.inflightRetains);
     if (h.retainLatency) await new Promise((r) => setTimeout(r, h.retainLatency));

@@ -4,7 +4,7 @@
 // memories already injected per session, and the one-in-flight-per-session retain worker.
 import { AppError } from './errors.js';
 import { matchScopes } from './scopes.js';
-import { newTurns, tailEnd, operationIdFor } from './retainCursor.js';
+import { windowTurns, lastExchangeBoundary, tailEnd, operationIdFor } from './retainCursor.js';
 
 export const MEMORY_LIMITS = Object.freeze({
   /** Per-bank recall deadline; with the describe_session deadline it must stay under the hook's. */
@@ -15,7 +15,7 @@ export const MEMORY_LIMITS = Object.freeze({
   injectedSessionsMax: 500,
   /** Per session: the oldest injected ids are forgotten beyond this. */
   injectedIdsMax: 2000,
-  /** Per session: queued retains behind the one in flight (each holds up to a transcript tail). */
+  /** Per session: windows of unsent turns waiting in the cursor behind the batch in flight. */
   retainQueueMax: 8,
 });
 
@@ -41,10 +41,10 @@ function cleanText(text, max) {
 export function createMemory({ scopes, cc, hindsight, cursors, activity, limits = MEMORY_LIMITS, now = () => Date.now() }) {
   /** sessionId → ids of memories already injected into its current context (insertion-ordered, bounded). */
   const injected = new Map();
-  /** sessionId → {queue, done}: at most one retain in flight per session. */
+  /** sessionId → {tail, done}: at most one retain in flight per session; `tail` is the newest transcript tail seen. */
   const workers = new Map();
 
-  const ctx = (s) => (s ? { sessionId: s.sessionId, project: s.project, worktree: s.worktree, stage: s.stage, kind: s.kind } : {});
+  const ctx = (s) => (s ? { project: s.project, worktree: s.worktree, stage: s.stage, kind: s.kind } : {});
   const fail = (event, session, sessionId, e, extra = {}) => activity.add({
     event, outcome: 'error', sessionId, ...ctx(session), code: e?.code ?? 'INTERNAL', message: e?.message ?? String(e), ...extra,
   });
@@ -108,87 +108,125 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     while (injected.size > limits.injectedSessionsMax) injected.delete(injected.keys().next().value);
   }
 
-  async function sendJob(sessionId, { turns, session, target }) {
-    let cursor = cursors.get(sessionId);
-    if (cursor?.inflight) {
-      const inf = cursor.inflight;
-      if (!hindsight.isReady()) return fail('retain', session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks: [inf.bank] });
-      try { await hindsight.retain(inf.bank, inf.item, { operationId: inf.operationId }); } catch (e) { return fail('retain', session, sessionId, e, { banks: [inf.bank] }); }
-      cursor = { lastId: inf.lastId, lastTs: inf.lastTs };
-      cursors.set(sessionId, cursor);
-      activity.add({ event: 'retain', outcome: 'ok', sessionId, ...ctx(session), banks: [inf.bank], count: inf.count, message: 'resent an unacknowledged batch' });
-    }
-    if (!target) {
-      if (cursor && turns.length) cursors.set(sessionId, tailEnd(turns, cursor));
-      return undefined;
-    }
-    const fresh = newTurns(turns, cursor);
-    if (!fresh.length) return undefined;
+  const summary = (s) => ({ project: s.project, worktree: s.worktree, kind: s.kind, stage: s.stage });
 
-    const documentId = `cc-session:${sessionId}`;
-    const first = fresh[0];
-    const last = fresh[fresh.length - 1];
-    const item = {
-      content: fresh.map((t) => JSON.stringify({ role: t.role, content: t.content, timestamp: t.timestamp ?? undefined })).join('\n'),
-      document_id: documentId,
-      update_mode: 'append',
-      timestamp: first.timestamp ?? new Date(now()).toISOString(),
-      context: `${RETAIN_CONTEXT} Project ${session.project}, worktree ${session.worktree}, ${session.kind} session${session.stage ? `, stage ${session.stage}` : ''}.`,
-      metadata: { source: 'code-hindsight', ccSessionId: sessionId, project: session.project, worktree: session.worktree, kind: session.kind, ...(session.stage ? { stage: session.stage } : {}) },
-    };
-    const inflight = { bank: target.bank, operationId: operationIdFor(target.bank, documentId, first.id, last.id), item, lastId: last.id, lastTs: tailEnd(fresh, cursor).lastTs, count: fresh.length };
-    cursors.set(sessionId, { lastId: cursor?.lastId ?? null, lastTs: cursor?.lastTs ?? null, inflight });
-    // The batch is persisted before Hindsight is asked, so a Hindsight that is not ready costs
-    // nothing: the next Stop resends this batch, even when the tail has moved past it.
-    if (!hindsight.isReady()) return fail('retain', session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks: [inflight.bank] });
-    try { await hindsight.retain(inflight.bank, item, { operationId: inflight.operationId }); } catch (e) { return fail('retain', session, sessionId, e, { banks: [inflight.bank] }); }
-    cursors.set(sessionId, { lastId: inflight.lastId, lastTs: inflight.lastTs });
-    activity.add({ event: 'retain', outcome: 'ok', sessionId, ...ctx(session), banks: [inflight.bank], count: fresh.length });
-    return undefined;
+  /** The persisted cursor entry with `change` applied; always a fresh object. */
+  function update(sessionId, change) {
+    const cur = cursors.get(sessionId);
+    const next = { lastId: cur.lastId, lastTs: cur.lastTs, ...(cur.inflight ? { inflight: cur.inflight } : {}), pending: cur.pending ?? [], ...change };
+    if (!next.inflight) delete next.inflight;
+    cursors.set(sessionId, next);
   }
 
-  const targetOf = (job) => job.target?.bank ?? null;
-
   /**
-   * Make room in a session's queue without ever misrouting. The oldest job that still has a retain
-   * target is turned into a job with none: it sends nothing, only advances the cursor, so the next
-   * job (maybe of another bank) cannot sweep its turns in. Adjacent jobs with no target then merge
-   * into the later one. Turns are lost; they are never sent to the wrong bank.
+   * Make room among a session's pending windows without ever misrouting. The oldest window that
+   * still has a bank becomes one with none: it sends nothing, only advances the cursor, so a later
+   * window (maybe of another bank) cannot sweep its turns in. Adjacent windows with no bank then
+   * merge into the later one. Turns are lost, logged as RETAIN_DROPPED; never sent to another bank.
    */
-  function shed(sessionId, queue) {
-    const i = queue.findIndex((j) => j.target);
+  function shed(sessionId, session, turns, boundary, pending) {
+    const i = pending.findIndex((w) => w.bank);
     if (i < 0) return;
-    const dropped = queue[i];
-    fail('retain', dropped.session, sessionId, new AppError('RETAIN_DROPPED', { count: dropped.turns.length }), { banks: [dropped.target.bank] });
-    queue[i] = { ...dropped, target: null };
-    for (let k = 0; k < queue.length - 1;) {
-      if (!queue[k].target && !queue[k + 1].target) queue.splice(k, 1); else k++;
+    const w = pending[i];
+    const delta = windowTurns(turns, i === 0 ? boundary : pending[i - 1], w);
+    fail('retain', session, sessionId, new AppError('RETAIN_DROPPED', { reason: 'the backlog of unsent turns was full' }), { banks: [w.bank], count: delta?.length });
+    pending[i] = { ...w, bank: null };
+    for (let k = 0; k < pending.length - 1;) {
+      if (!pending[k].bank && !pending[k + 1].bank) pending.splice(k, 1); else k++;
     }
   }
 
   /**
-   * Queue a job behind the one in flight. A newer tail supersedes the last queued job only when both
-   * aim at the same bank (or both at none): it holds the same turns and more. A job aimed elsewhere
-   * is queued behind, so each stretch of turns goes to the bank its own stage chose, and turns from a
-   * stage with no retain scope are never sent later. The queue is bounded by `retainQueueMax`.
+   * Record the turns this Stop adds as one window of the session's persisted cursor, tagged with the
+   * bank its own stage's first retain scope chose (or none). The newest window is replaced by this one
+   * only when both aim at the same bank (or both at none): it covers the same turns and more. Windows
+   * of other targets stay separate, so every stretch goes to its own bank or nowhere, even while an
+   * unacknowledged batch blocks sending and across a backend restart. Bounded by `retainQueueMax`.
    */
-  function enqueue(sessionId, job) {
-    const running = workers.get(sessionId);
-    if (running) {
-      const q = running.queue;
-      if (q.length && targetOf(q[q.length - 1]) === targetOf(job)) q[q.length - 1] = job; else q.push(job);
-      while (q.length > limits.retainQueueMax && q.some((j) => j.target)) shed(sessionId, q);
-      return;
+  function record(sessionId, turns, session, target) {
+    let cursor = cursors.get(sessionId);
+    if (!cursor) {
+      if (!target) return false;
+      const start = lastExchangeBoundary(turns);
+      if (!start) return false;
+      cursor = { ...start, pending: [] };
     }
-    const w = { queue: [job], done: null };
+    const pending = [...(cursor.pending ?? [])];
+    const boundary = cursor.inflight ? { lastId: cursor.inflight.lastId, lastTs: cursor.inflight.lastTs } : { lastId: cursor.lastId, lastTs: cursor.lastTs };
+    const end = tailEnd(turns, cursor);
+    if (end.lastId === (pending.length ? pending[pending.length - 1] : boundary).lastId) return false;
+    const w = { bank: target?.bank ?? null, session: summary(session), lastId: end.lastId, lastTs: end.lastTs };
+    if (pending.length && pending[pending.length - 1].bank === w.bank) pending[pending.length - 1] = w; else pending.push(w);
+    while (pending.length > limits.retainQueueMax && pending.some((p) => p.bank)) shed(sessionId, session, turns, boundary, pending);
+    cursors.set(sessionId, { lastId: cursor.lastId, lastTs: cursor.lastTs, ...(cursor.inflight ? { inflight: cursor.inflight } : {}), pending });
+    return true;
+  }
+
+  function buildItem(sessionId, delta, ses) {
+    return {
+      content: delta.map((t) => JSON.stringify({ role: t.role, content: t.content, timestamp: t.timestamp ?? undefined })).join('\n'),
+      document_id: `cc-session:${sessionId}`,
+      update_mode: 'append',
+      timestamp: delta[0].timestamp ?? new Date(now()).toISOString(),
+      context: `${RETAIN_CONTEXT} Project ${ses.project}, worktree ${ses.worktree}, ${ses.kind} session${ses.stage ? `, stage ${ses.stage}` : ''}.`,
+      metadata: { source: 'code-hindsight', ccSessionId: sessionId, project: ses.project, worktree: ses.worktree, kind: ses.kind, ...(ses.stage ? { stage: ses.stage } : {}) },
+    };
+  }
+
+  /**
+   * Work through a session's persisted state in order: the unacknowledged batch first (resent
+   * unchanged), then each pending window: no bank → just advance past it; a bank → send its own turns
+   * to that bank. Stops at the first failure or when Hindsight is not ready; everything stays persisted.
+   */
+  async function drain(sessionId, worker) {
+    let fresh = false;
+    for (;;) {
+      const cursor = cursors.get(sessionId);
+      if (!cursor) return;
+      if (cursor.inflight) {
+        const inf = cursor.inflight;
+                if (!hindsight.isReady()) return fail('retain', inf.session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks: [inf.bank] });
+        try { await hindsight.retain(inf.bank, inf.item, { operationId: inf.operationId }); } catch (e) { return fail('retain', inf.session, sessionId, e, { banks: [inf.bank] }); }
+        update(sessionId, { lastId: inf.lastId, lastTs: inf.lastTs, inflight: undefined });
+        activity.add({ event: 'retain', outcome: 'ok', sessionId, ...inf.session, banks: [inf.bank], count: inf.count, ...(fresh ? {} : { message: 'resent an unacknowledged batch' }) });
+        fresh = false;
+        continue;
+      }
+      const win = cursor.pending?.[0];
+      if (!win) return;
+      const rest = cursor.pending.slice(1);
+      let delta = [];
+      if (win.bank) {
+        delta = windowTurns(worker.tail, cursor, win);
+        if (delta === null) {
+          fail('retain', win.session, sessionId, new AppError('RETAIN_DROPPED', { reason: 'they left the transcript window before they could be sent' }), { banks: [win.bank] });
+          delta = [];
+        }
+      }
+      if (!delta.length) {
+        update(sessionId, { lastId: win.lastId, lastTs: win.lastTs, pending: rest });
+        continue;
+      }
+      const documentId = `cc-session:${sessionId}`;
+      const inflight = {
+        bank: win.bank,
+        operationId: operationIdFor(win.bank, documentId, delta[0].id, delta[delta.length - 1].id),
+        item: buildItem(sessionId, delta, win.session),
+        lastId: win.lastId, lastTs: win.lastTs, count: delta.length, session: win.session,
+      };
+      update(sessionId, { inflight, pending: rest });
+      fresh = true;
+    }
+  }
+
+  /** Make sure one worker is draining this session; a running one is given the newest tail. */
+  function kick(sessionId, turns) {
+    const running = workers.get(sessionId);
+    if (running) { running.tail = turns; return; }
+    const w = { tail: turns, done: null };
     workers.set(sessionId, w);
     w.done = (async () => {
-      try {
-        while (w.queue.length) {
-          const j = w.queue.shift();
-          try { await sendJob(sessionId, j); } catch (e) { fail('retain', j.session, sessionId, e); }
-        }
-      } finally { workers.delete(sessionId); }
+      try { await drain(sessionId, w); } catch (e) { fail('retain', null, sessionId, e); } finally { workers.delete(sessionId); }
     })();
   }
 
@@ -233,7 +271,7 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
         if (!session) return { status: 'unresolved' };
         const m = matchScopes(list, session);
         logSkipped('retain', session, m);
-        enqueue(sessionId, { turns, session, target: m.retain });
+        if (record(sessionId, turns, session, m.retain)) kick(sessionId, turns);
         return { status: 'accepted' };
       } catch (e) {
         fail('retain', null, sessionId, e);

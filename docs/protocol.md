@@ -86,7 +86,7 @@ Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP f
 | Path | Body → answer |
 |---|---|
 | `/-/hook/recall` | `{sessionId, prompt}` → `200 {context}` (`context` is the `<hindsight_memory>` block or `null`; never an error). The memories count as injected only after the answer is flushed. A session that matches no recall scope produces no activity entry (every prompt would add one); the `/-/mcp` tool does log `NO_RECALL_SCOPE` |
-| `/-/hook/retain` | `{sessionId, turns: [{id, role: user\|assistant\|action, content, timestamp\|null}]}` → `202 {status: accepted\|off\|empty\|unresolved\|error}`; sending to Hindsight happens after the answer, one retain in flight per session with a bounded backlog behind it (overflow drops the oldest queued turns and logs `RETAIN_DROPPED` in the activity log; see [architecture](architecture.md#memory)) |
+| `/-/hook/retain` | `{sessionId, turns: [{id, role: user\|assistant\|action, content, timestamp\|null}]}` → `202 {status: accepted\|off\|empty\|unresolved\|error}`; sending to Hindsight happens after the answer, one retain in flight per session with a bounded, persisted backlog of windows behind it (a loss is logged `RETAIN_DROPPED` in the activity log and never sent to another bank; see [architecture](architecture.md#memory)) |
 | `/-/hook/reset` | `{sessionId}` → `200 {ok: true}` |
 | `/-/mcp` | cc's forward: `{tool: "recall", arguments: {query}, caller: {sessionId, project}, format}` → always `200 {text}` or `{error, code}` (`NO_SESSION`, `SESSION_NOT_LIVE`, `SESSION_UNRESOLVED`, `NO_RECALL_SCOPE`, `HINDSIGHT_NOT_READY`, `RECALL_FAILED`, `BAD_REQUEST`; an unknown tool has no code). The banks searched are exactly what the scopes yield for `caller.sessionId` now; arguments cannot add one |
 
@@ -117,7 +117,7 @@ Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP f
 | `stopping.json` (0600) | `{pid, at}` of the detached `docker stop` a SIGTERM left running; the next backend waits for that pid |
 | `shutdown-failed.json` (0600) | `{at, error}` when a SIGTERM could not start that stop; shown as `status.lastShutdownFailure` and removed when Hindsight is next ready |
 | `scopes.json` (0600) | `{scopes}`: the memory scopes; absent = memory off |
-| `memory/cursors.json` (0600) | per `CC_SESSION_ID`: `{lastId, lastTs, inflight?, at}` — the last retained turn, and the batch being sent (kept so a retry resends it unchanged); entries older than `CURSOR_MAX_AGE_MS` are pruned on write. Losing it can duplicate turns |
+| `memory/cursors.json` (0600) | per `CC_SESSION_ID`: `{lastId, lastTs, inflight?, pending, at}` — the last retained turn; the batch being sent (kept so a retry resends it unchanged); and `pending`, the windows of unsent turns `{bank \| null, session, lastId, lastTs}` in order, each with the bank its own stage chose; entries older than `CURSOR_MAX_AGE_MS` are pruned on write. Losing it can duplicate turns |
 | `logs/memory.jsonl` (+ `.1`) | the activity log (rotated at `ACTIVITY_LIMITS.rotateBytes`) |
 | `trusted-cp.json` (0600) | `{id, source: build\|confirmed, at}`: the CP image ID allowed to run |
 | `run/` | short-lived `--env-file`s for `docker run`, removed after each run |

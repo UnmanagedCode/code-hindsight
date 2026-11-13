@@ -27,15 +27,17 @@ async function setup(t, { scopes = [scope()], limits = MEMORY_LIMITS, describeTi
   save(scopes);
   const state = { ready: true };
   const activity = createActivityLog({ dataDir: r.dataDir, log: () => {} });
-  const cursors = createRetainCursors(r.dataDir);
-  const memory = createMemory({
-    scopes: store,
-    cc: createCcClient({ conductorUrl: cc.url, describeTimeoutMs }),
-    hindsight: createHindsightClient({ connection: () => (state.ready ? { apiUrl: hs.url, apiKey: FAKE_KEY } : null) }),
-    cursors, activity, limits,
-  });
+  const hindsight = createHindsightClient({ connection: () => (state.ready ? { apiUrl: hs.url, apiKey: FAKE_KEY } : null) });
+  const ccClient = createCcClient({ conductorUrl: cc.url, describeTimeoutMs });
+  const build = () => {
+    const cursors = createRetainCursors(r.dataDir);
+    return { cursors, memory: createMemory({ scopes: store, cc: ccClient, hindsight, cursors, activity, limits }) };
+  };
+  const x = { r, cc, hs, activity, state, save, ...build() };
+  /** A backend restart: a new memory and cursor store over the same data dir, nothing in memory carried over. */
+  x.restart = () => Object.assign(x, build());
   cc.session(S, live());
-  return { r, cc, hs, memory, activity, cursors, state, save };
+  return x;
 }
 /** recallForHook as the route uses it: the memories count as injected once the answer is flushed. */
 async function recall(memory, sessionId, prompt) {
@@ -360,21 +362,97 @@ test('turns from a stage with no retain scope between two matched stretches are 
   assert.equal(x.hs.retains().some((r) => /iq3|ia3/.test(r.body.items[0].content)), false);
 });
 
-test('a full retain queue drops turns, says so, and never misroutes the ones that remain', async (t) => {
+test('turns blocked behind an unacknowledged batch keep their own bank: not-ready Hindsight, then recovery', async (t) => {
+  const x = await setup(t, { scopes: stageScopes });
+  x.cc.session(S, live({ stage: 'plan' }), live({ stage: 'implement' }), live({ stage: 'plan' }));
+  const next = growing();
+  x.state.ready = false;
+  await x.memory.retainForHook(S, next('p')); // blocked
+  await x.memory.retainForHook(S, next('i')); // blocked behind it
+  x.state.ready = true;
+  await x.memory.retainForHook(S, next('p')); // recovery
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'plan-proj'), ['pq1', 'pa1', 'pq3', 'pa3']);
+  assert.deepEqual(bodies(x, 'impl-proj'), ['iq2', 'ia2'], 'the implement turns went to the implement bank, not the plan bank');
+  assert.deepEqual(x.activity.list().filter((e) => e.code === 'RETAIN_DROPPED'), []);
+});
+
+test('a failed retain followed by a failed resend, with a stage change in between, still keeps each stretch in its own bank', async (t) => {
+  const x = await setup(t, { scopes: stageScopes });
+  x.cc.session(S, live({ stage: 'plan' }), live({ stage: 'implement' }), live({ stage: 'plan' }), live({ stage: 'plan' }));
+  const next = growing();
+  x.hs.retainStatus = 500;
+  await x.memory.retainForHook(S, next('p')); // send fails: inflight
+  await x.memory.retainForHook(S, next('i')); // resend fails: blocked
+  await x.memory.retainForHook(S, next('p')); // resend fails again
+  x.hs.retainStatus = null;
+  await x.memory.retainForHook(S, next('p'));
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'plan-proj'), ['pq1', 'pa1', 'pq3', 'pa3', 'pq4', 'pa4']);
+  assert.deepEqual(bodies(x, 'impl-proj'), ['iq2', 'ia2']);
+});
+
+test('turns of a stage with no retain scope, blocked behind an unacknowledged batch, are never sent when it clears', async (t) => {
+  const x = await setup(t, { scopes: [stageScopes[0]] });
+  x.cc.session(S, live({ stage: 'plan' }), live({ stage: 'implement' }), live({ stage: 'plan' }));
+  const next = growing();
+  x.hs.retainStatus = 500;
+  await x.memory.retainForHook(S, next('p'));
+  await x.memory.retainForHook(S, next('i')); // no retain scope
+  x.hs.retainStatus = null;
+  await x.memory.retainForHook(S, next('p'));
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'plan-proj'), ['pq1', 'pa1', 'pq3', 'pa3']);
+  assert.equal(x.hs.retains().some((r) => /iq2|ia2/.test(r.body.items[0].content)), false);
+});
+
+test('the blocked windows survive a backend restart: the first Stop afterwards sends each to its own bank', async (t) => {
+  const x = await setup(t, { scopes: stageScopes });
+  x.cc.session(S, live({ stage: 'plan' }), live({ stage: 'implement' }), live({ stage: 'plan' }));
+  const next = growing();
+  x.state.ready = false;
+  await x.memory.retainForHook(S, next('p'));
+  await x.memory.retainForHook(S, next('i'));
+  await x.memory.idle();
+  assert.equal(x.hs.requests.length, 0);
+  x.restart();
+  x.state.ready = true;
+  await x.memory.retainForHook(S, next('p'));
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'plan-proj'), ['pq1', 'pa1', 'pq3', 'pa3']);
+  assert.deepEqual(bodies(x, 'impl-proj'), ['iq2', 'ia2']);
+});
+
+test('a full backlog drops turns deterministically, logs each drop, and never misroutes what remains', async (t) => {
   const x = await setup(t, { scopes: stageScopes, limits: { ...MEMORY_LIMITS, retainQueueMax: 3 } });
   const stages = ['plan', 'implement', 'plan', 'implement', 'plan', 'implement', 'plan', 'implement'];
   x.cc.session(S, ...stages.map((stage) => live({ stage })));
-  x.hs.retainLatency = 80;
+  const release = x.hs.hold(); // the first retain stays in flight until every Stop is recorded
   const next = growing();
   for (const stage of stages) await x.memory.retainForHook(S, next(stage === 'plan' ? 'p' : 'i'));
+  release();
   await x.memory.idle();
-  const plan = bodies(x, 'plan-proj');
-  const impl = bodies(x, 'impl-proj');
-  assert.ok(plan.every((c) => c.startsWith('p')), `plan bank holds only plan turns: ${plan}`);
-  assert.ok(impl.every((c) => c.startsWith('i')), `implement bank holds only implement turns: ${impl}`);
-  assert.ok(impl.includes('ia8'), 'the newest stretch is delivered');
-  assert.ok(plan.length + impl.length < 16, 'some turns were dropped');
+  assert.deepEqual(bodies(x, 'plan-proj'), ['pq1', 'pa1', 'pq7', 'pa7']);
+  assert.deepEqual(bodies(x, 'impl-proj'), ['iq8', 'ia8']);
+  const dropped = x.activity.list().filter((e) => e.code === 'RETAIN_DROPPED').reverse();
+  assert.deepEqual(dropped.map((e) => [e.banks[0], e.count]), [['impl-proj', 2], ['plan-proj', 2], ['impl-proj', 2], ['plan-proj', 2], ['impl-proj', 2]]);
+  assert.doesNotMatch(dropped[0].message, /\d/, 'the message claims no number');
+  assert.equal(x.cursors.get(S).inflight, undefined);
+  assert.deepEqual(x.cursors.get(S).pending, []);
+});
+
+test('turns whose boundaries left the transcript tail are reported as dropped, not sent and not silently skipped', async (t) => {
+  const x = await setup(t);
+  const bare = (n, role, content) => ({ id: `u${n}`, role, content, timestamp: null });
+  x.hs.retainStatus = 500;
+  await x.memory.retainForHook(S, [bare(1, 'user', 'q1'), bare(2, 'assistant', 'a1')]); // inflight, fails
+  await x.memory.retainForHook(S, [bare(1, 'user', 'q1'), bare(2, 'assistant', 'a1'), bare(3, 'user', 'q2'), bare(4, 'assistant', 'a2')]); // window recorded
+  x.hs.retainStatus = null;
+  // a rotated transcript: new ids, no timestamps: the recorded window cannot be placed
+  await x.memory.retainForHook(S, [bare(5, 'user', 'q3'), bare(6, 'assistant', 'a3')]);
+  await x.memory.idle();
   const dropped = x.activity.list().filter((e) => e.code === 'RETAIN_DROPPED');
-  assert.ok(dropped.length > 0);
+  assert.ok(dropped.length >= 1);
+  assert.equal(x.hs.retains().some((r) => /a2/.test(r.body.items[0].content)), false);
   assert.equal(x.cursors.get(S).inflight, undefined);
 });

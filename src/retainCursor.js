@@ -1,7 +1,8 @@
 // Per-session retain progress (`memory/cursors.json`, 0600), keyed by the public cc session id so
 // it survives /clear, renew and prune (a new transcript, the same id): which turn was retained
-// last, and the batch currently being sent (kept verbatim so a retry resends the same batch under
-// the same operation id). Plus the pure choice of which turns are new.
+// last; the batch currently being sent (kept verbatim so a retry resends the same batch under the
+// same operation id); and `pending`, the stretches of turns recorded since, each tagged with the bank
+// its own stage chose (or none). Plus the pure placement of those stretches in a transcript tail.
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { readJsonFile, writePrivateFileAtomic } from './fsPrivate.js';
@@ -33,20 +34,46 @@ export function tailEnd(turns, cursor) {
 }
 
 /**
- * The turns of `turns` (a transcript's tail) not yet retained.
- * - no cursor: the last exchange only (from the last user turn on) — earlier history is never backfilled;
- * - cursor id found: what follows it;
- * - cursor id not found (rotation, or a tail cut past it): turns stamped after the cursor's time.
+ * Where the first window of a session with no cursor starts: just before the last user turn, so
+ * only the last exchange is retained and earlier history is never backfilled. `{lastId: null,
+ * lastTs: null}` means the start of the tail; undefined when the tail has no user turn.
  */
-export function newTurns(turns, cursor) {
-  if (!cursor) {
-    const i = turns.map((t) => t.role).lastIndexOf('user');
-    return i < 0 ? [] : turns.slice(i);
+export function lastExchangeBoundary(turns) {
+  const i = turns.map((t) => t.role).lastIndexOf('user');
+  if (i < 0) return undefined;
+  const before = turns[i - 1];
+  return { lastId: before?.id ?? null, lastTs: before?.timestamp ?? null };
+}
+
+/**
+ * The turns of a tail strictly after `from` up to and including `to` (each `{lastId, lastTs}`): a
+ * window of the transcript that belongs to one retain target. A boundary is found by turn id, else
+ * by timestamp (the id is gone after a rotation). `null` when a boundary cannot be placed in the
+ * tail at all (its turns left the tail): the caller must treat that as a loss, not as "no turns".
+ */
+export function windowTurns(tail, from, to) {
+  const lastIdx = (id) => (id == null ? -1 : tail.map((t) => t.id).lastIndexOf(id));
+  let start = 0;
+  if (from.lastId != null) {
+    const i = lastIdx(from.lastId);
+    if (i >= 0) start = i + 1;
+    else {
+      const f = ts(from.lastTs);
+      if (Number.isNaN(f)) return null;
+      start = tail.findIndex((t) => ts(t.timestamp) > f);
+      if (start < 0) return [];
+    }
   }
-  const i = turns.map((t) => t.id).lastIndexOf(cursor.lastId);
-  if (i >= 0) return turns.slice(i + 1);
-  const from = ts(cursor.lastTs);
-  return Number.isNaN(from) ? [] : turns.filter((t) => ts(t.timestamp) > from);
+  const j = lastIdx(to.lastId);
+  let end;
+  if (j >= 0) end = j + 1;
+  else {
+    const e = ts(to.lastTs);
+    if (Number.isNaN(e)) return null;
+    end = start;
+    while (end < tail.length && ts(tail[end].timestamp) <= e) end++;
+  }
+  return end > start ? tail.slice(start, end) : [];
 }
 
 /** A v4-shaped UUID derived from the batch, so resending a batch repeats its operation id. */

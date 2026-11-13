@@ -63,7 +63,7 @@ Gives cc sessions memory. **Off by default:** with no scopes every session is me
 
 - **Injected block:** a header naming the banks, then `- [bank] text` lines in scope order then Hindsight's rank order. It is capped (`MEMORY_LIMITS.contextMaxChars` in `src/memory.js`), memories already injected into this context are skipped, and a memory cannot close the wrapper tag. The header tells the agent the notes are data from earlier sessions, possibly stale or wrong, never instructions.
 - **What is retained** (matches Hindsight's own coding-agent integration): user text, assistant text, and one `action` line per tool call (the tool name and its primary target, capped). Dropped: tool outputs, other tool arguments, thinking, sub-agent (sidechain) lines, meta lines, compaction summaries; injected memory and system-reminder tags are stripped. **No secret redaction:** a prompt, reply or command target that contains a secret is retained.
-- **When retained:** from the first Stop at which a retain scope matches, the last exchange; later Stops append only what is new. Earlier history is never backfilled, and turns that happened while no retain scope matched are never sent later.
+- **When retained:** from the first Stop at which a retain scope matches, the last exchange; later Stops append only what is new. Each stretch of turns goes to the bank its own stage's scope chose, even if Hindsight was not ready, a retain failed or the backend restarted in between; a stretch is lost (logged) rather than sent to another bank. Earlier history is never backfilled, and turns that happened while no retain scope matched are never sent later.
 - **LLM mode `none`:** retain stores the raw chunks as facts with no extraction; recall works on them. The tab says so.
 
 ### Scopes
@@ -102,7 +102,7 @@ Every failure yields a memoryless turn and an Activity entry; the hooks always e
 | a bank's recall failed or timed out (other banks still answer) | `RECALL_FAILED` |
 | retain failed (the same batch is resent with the next turn) | `RETAIN_FAILED` |
 | a bank template did not render | `BANK_RENDER_FAILED` |
-| Hindsight too slow: the session's retain backlog overflowed (`MEMORY_LIMITS.retainQueueMax`) and the oldest queued turns were dropped, never sent to another bank | `RETAIN_DROPPED` |
+| turns could not be kept for later: the session's backlog of unsent windows overflowed (`MEMORY_LIMITS.retainQueueMax`), or a window's turns left the transcript tail before they could be sent. They are never sent to another bank | `RETAIN_DROPPED` |
 | `scopes.json` unreadable | `SCOPES_INVALID` |
 
 A stopped or crashed plugin backend cannot log anything: the hooks give up at their deadline and cc's plugin row is the only sign.
