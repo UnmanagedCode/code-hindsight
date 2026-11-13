@@ -102,6 +102,7 @@ Every failure yields a memoryless turn and an Activity entry; the hooks always e
 | a bank's recall failed or timed out (other banks still answer) | `RECALL_FAILED` |
 | retain failed (the same batch is resent with the next turn) | `RETAIN_FAILED` |
 | a bank template did not render | `BANK_RENDER_FAILED` |
+| Hindsight too slow: the session's retain backlog overflowed (`MEMORY_LIMITS.retainQueueMax`) and the oldest queued turns were dropped, never sent to another bank | `RETAIN_DROPPED` |
 | `scopes.json` unreadable | `SCOPES_INVALID` |
 
 A stopped or crashed plugin backend cannot log anything: the hooks give up at their deadline and cc's plugin row is the only sign.
@@ -140,4 +141,4 @@ Every error is a code from `CATALOG` (`src/errors.js`); the Status card shows it
 | `UNHEALTHY`, `CRASHED`, `CP_LOGIN_FAILED` | Restart Hindsight |
 | `CONTAINERS_RUNNING` | Stop Hindsight |
 | `HINDSIGHT_NOT_READY` | Start Hindsight |
-| `SCOPES_INVALID`, `BROWSER_REFUSED`, `NO_SESSION`, `SESSION_UNRESOLVED`, `SESSION_NOT_LIVE`, `NO_RECALL_SCOPE`, `RECALL_FAILED`, `RETAIN_FAILED`, `BANK_RENDER_FAILED` | — (Memory-tab and hook/tool errors: shown against a field, in Activity, or to the tool caller) |
+| `SCOPES_INVALID`, `BROWSER_REFUSED`, `NO_SESSION`, `SESSION_UNRESOLVED`, `SESSION_NOT_LIVE`, `NO_RECALL_SCOPE`, `RECALL_FAILED`, `RETAIN_FAILED`, `RETAIN_DROPPED`, `BANK_RENDER_FAILED` | — (Memory-tab and hook/tool errors: shown against a field, in Activity, or to the tool caller) |

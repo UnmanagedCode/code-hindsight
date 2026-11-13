@@ -90,8 +90,8 @@ export function renderBank(template, session) {
 
 /**
  * Whether `text` matches a glob (`*` any run of characters, `?` one character, the rest literal).
- * Linear scan with a single backtrack point, so no glob can take exponential time (a regular
- * expression built from many `*` can).
+ * One scan with a single backtrack point: O(glob × text) at worst, never exponential (a regular
+ * expression built from many `*` can be).
  */
 export function globMatches(glob, text) {
   let g = 0;

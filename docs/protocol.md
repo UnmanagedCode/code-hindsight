@@ -86,7 +86,7 @@ Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP f
 | Path | Body → answer |
 |---|---|
 | `/-/hook/recall` | `{sessionId, prompt}` → `200 {context}` (`context` is the `<hindsight_memory>` block or `null`; never an error). The memories count as injected only after the answer is flushed. A session that matches no recall scope produces no activity entry (every prompt would add one); the `/-/mcp` tool does log `NO_RECALL_SCOPE` |
-| `/-/hook/retain` | `{sessionId, turns: [{id, role: user\|assistant\|action, content, timestamp\|null}]}` → `202 {status: accepted\|off\|empty\|unresolved\|error}`; sending to Hindsight happens after the answer |
+| `/-/hook/retain` | `{sessionId, turns: [{id, role: user\|assistant\|action, content, timestamp\|null}]}` → `202 {status: accepted\|off\|empty\|unresolved\|error}`; sending to Hindsight happens after the answer, one retain in flight per session with a bounded backlog behind it (overflow drops the oldest queued turns and logs `RETAIN_DROPPED` in the activity log; see [architecture](architecture.md#memory)) |
 | `/-/hook/reset` | `{sessionId}` → `200 {ok: true}` |
 | `/-/mcp` | cc's forward: `{tool: "recall", arguments: {query}, caller: {sessionId, project}, format}` → always `200 {text}` or `{error, code}` (`NO_SESSION`, `SESSION_NOT_LIVE`, `SESSION_UNRESOLVED`, `NO_RECALL_SCOPE`, `HINDSIGHT_NOT_READY`, `RECALL_FAILED`, `BAD_REQUEST`; an unknown tool has no code). The banks searched are exactly what the scopes yield for `caller.sessionId` now; arguments cannot add one |
 

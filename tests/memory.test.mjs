@@ -324,3 +324,57 @@ test('the recall tool searches exactly the banks the scopes allow now, and fails
   x.cc.session('gone', 'retired');
   await assert.rejects(x.memory.recallForMcp('gone', 'q'), { code: 'SESSION_NOT_LIVE' });
 });
+
+const bodies = (x, bank) => lines(x.hs.doc(bank, `cc-session:${S}`) ?? []).map((l) => l.content);
+/** A transcript tail that grows by one exchange per call: tag + n. */
+const growing = () => { const all = []; return (tag) => { const n = all.length / 2 + 1; all.push(turn(2 * n - 1, 'user', `${tag}q${n}`), turn(2 * n, 'assistant', `${tag}a${n}`)); return [...all]; }; };
+const stageScopes = [
+  scope({ name: 'p', match: { stages: ['plan'] }, bank: 'plan-{project}', actions: ['retain'] }),
+  scope({ name: 'i', match: { stages: ['implement'] }, bank: 'impl-{project}', actions: ['retain'] }),
+];
+
+test('a pending job is not superseded by a job aimed at another bank: each stretch of turns goes to its own stage\'s bank', async (t) => {
+  const x = await setup(t, { scopes: stageScopes });
+  x.cc.session(S, live({ stage: 'plan' }), live({ stage: 'plan' }), live({ stage: 'implement' }));
+  x.hs.retainLatency = 60;
+  const next = growing();
+  await x.memory.retainForHook(S, next('p')); // in flight
+  await x.memory.retainForHook(S, next('p')); // pending, plan
+  await x.memory.retainForHook(S, next('i')); // implement: another bank
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'plan-proj'), ['pq1', 'pa1', 'pq2', 'pa2']);
+  assert.deepEqual(bodies(x, 'impl-proj'), ['iq3', 'ia3'], 'the plan turns did not travel to the implement bank');
+});
+
+test('turns from a stage with no retain scope between two matched stretches are never appended to the later bank', async (t) => {
+  const x = await setup(t, { scopes: [stageScopes[0]] });
+  x.cc.session(S, live({ stage: 'plan' }), live({ stage: 'plan' }), live({ stage: 'implement' }), live({ stage: 'plan' }));
+  x.hs.retainLatency = 60;
+  const next = growing();
+  await x.memory.retainForHook(S, next('p')); // in flight
+  await x.memory.retainForHook(S, next('p')); // pending
+  await x.memory.retainForHook(S, next('i')); // no retain scope
+  await x.memory.retainForHook(S, next('p')); // plan again: must not replace the unmatched job
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'plan-proj'), ['pq1', 'pa1', 'pq2', 'pa2', 'pq4', 'pa4']);
+  assert.equal(x.hs.retains().some((r) => /iq3|ia3/.test(r.body.items[0].content)), false);
+});
+
+test('a full retain queue drops turns, says so, and never misroutes the ones that remain', async (t) => {
+  const x = await setup(t, { scopes: stageScopes, limits: { ...MEMORY_LIMITS, retainQueueMax: 3 } });
+  const stages = ['plan', 'implement', 'plan', 'implement', 'plan', 'implement', 'plan', 'implement'];
+  x.cc.session(S, ...stages.map((stage) => live({ stage })));
+  x.hs.retainLatency = 80;
+  const next = growing();
+  for (const stage of stages) await x.memory.retainForHook(S, next(stage === 'plan' ? 'p' : 'i'));
+  await x.memory.idle();
+  const plan = bodies(x, 'plan-proj');
+  const impl = bodies(x, 'impl-proj');
+  assert.ok(plan.every((c) => c.startsWith('p')), `plan bank holds only plan turns: ${plan}`);
+  assert.ok(impl.every((c) => c.startsWith('i')), `implement bank holds only implement turns: ${impl}`);
+  assert.ok(impl.includes('ia8'), 'the newest stretch is delivered');
+  assert.ok(plan.length + impl.length < 16, 'some turns were dropped');
+  const dropped = x.activity.list().filter((e) => e.code === 'RETAIN_DROPPED');
+  assert.ok(dropped.length > 0);
+  assert.equal(x.cursors.get(S).inflight, undefined);
+});

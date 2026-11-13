@@ -128,13 +128,13 @@ test('a list entry that is undefined (or any non-string) is refused, not skipped
   assert.deepEqual(fieldsOf([scope({ match: { sessions: [0] } })]), ['scopes[0].match.sessions']);
 });
 
-test('glob matching is linear: a many-star glob against a non-matching name finishes at once', () => {
+test('glob matching never blows up: a many-star glob against a non-matching name finishes at once', () => {
   const glob = '*a'.repeat(10) + '*b';
   const name = 'a'.repeat(41);
   const t0 = process.hrtime.bigint();
   assert.equal(globMatches(glob, name), false);
   assert.equal(matchScopes(ok([scope({ match: { projects: [glob] } })]), session({ project: name })).recall.length, 0);
-  assert.ok(Number(process.hrtime.bigint() - t0) / 1e6 < 100, 'took far longer than a linear scan would');
+  assert.ok(Number(process.hrtime.bigint() - t0) / 1e6 < 100, 'took far longer than a bounded scan would');
 });
 
 test('glob semantics: * spans any run (including none), ? exactly one, everything else literal', () => {

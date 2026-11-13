@@ -44,6 +44,7 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 - Bank names are sanitized, so different projects can map to the same bank.
 - If `memory/cursors.json` is lost, turns already retained can be retained again.
 - With LLM mode `none`, retain stores raw chunks without fact extraction.
+- If Hindsight is slow enough that a session's retain backlog overflows, the oldest queued turns are dropped (logged as `RETAIN_DROPPED`), never sent to another bank.
 - Inside the control plane, attachment links and images, the logo in the memory constellation and the favicon 404 (upstream builds those URLs without the base path).
 - The control plane is only usable through cc's mount (`/plugins/code-hindsight/`); its port alone has no UI session.
 - Hindsight runs only while the plugin backend runs (see Auto-start). A backend killed with SIGKILL alone leaves the containers running until the next start adopts them.

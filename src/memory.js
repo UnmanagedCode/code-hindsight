@@ -15,6 +15,8 @@ export const MEMORY_LIMITS = Object.freeze({
   injectedSessionsMax: 500,
   /** Per session: the oldest injected ids are forgotten beyond this. */
   injectedIdsMax: 2000,
+  /** Per session: queued retains behind the one in flight (each holds up to a transcript tail). */
+  retainQueueMax: 8,
 });
 
 const NONE = Object.freeze({ context: null, commit: () => {} });
@@ -145,17 +147,37 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     return undefined;
   }
 
+  const targetOf = (job) => job.target?.bank ?? null;
+
   /**
-   * Queue a job behind the one in flight. A newer tail supersedes a pending one (it holds the same
-   * turns and more), except that a job with no retain target never discards a pending job that has
-   * one: the targeted turns are sent first, then the cursor advances past the untargeted ones.
+   * Make room in a session's queue without ever misrouting. The oldest job that still has a retain
+   * target is turned into a job with none: it sends nothing, only advances the cursor, so the next
+   * job (maybe of another bank) cannot sweep its turns in. Adjacent jobs with no target then merge
+   * into the later one. Turns are lost; they are never sent to the wrong bank.
+   */
+  function shed(sessionId, queue) {
+    const i = queue.findIndex((j) => j.target);
+    if (i < 0) return;
+    const dropped = queue[i];
+    fail('retain', dropped.session, sessionId, new AppError('RETAIN_DROPPED', { count: dropped.turns.length }), { banks: [dropped.target.bank] });
+    queue[i] = { ...dropped, target: null };
+    for (let k = 0; k < queue.length - 1;) {
+      if (!queue[k].target && !queue[k + 1].target) queue.splice(k, 1); else k++;
+    }
+  }
+
+  /**
+   * Queue a job behind the one in flight. A newer tail supersedes the last queued job only when both
+   * aim at the same bank (or both at none): it holds the same turns and more. A job aimed elsewhere
+   * is queued behind, so each stretch of turns goes to the bank its own stage chose, and turns from a
+   * stage with no retain scope are never sent later. The queue is bounded by `retainQueueMax`.
    */
   function enqueue(sessionId, job) {
     const running = workers.get(sessionId);
     if (running) {
-      const last = running.queue[running.queue.length - 1];
-      if (last && (job.target || !last.target)) running.queue[running.queue.length - 1] = job;
-      else running.queue.push(job);
+      const q = running.queue;
+      if (q.length && targetOf(q[q.length - 1]) === targetOf(job)) q[q.length - 1] = job; else q.push(job);
+      while (q.length > limits.retainQueueMax && q.some((j) => j.target)) shed(sessionId, q);
       return;
     }
     const w = { queue: [job], done: null };
