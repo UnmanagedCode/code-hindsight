@@ -194,6 +194,11 @@ export const CATALOG = Object.freeze({
     message: () => 'Scopes changed since the scan, or a newer scan replaced it; scan again.',
     action: null, status: 409,
   },
+  BACKFILL_UNCHECKED: {
+    title: 'The scan could not check Hindsight',
+    message: () => 'Hindsight was not ready during the scan, so it did not show live overlap or parts already stored; scan again once Hindsight is ready.',
+    action: null, status: 409,
+  },
   BACKFILL_UNPLACEABLE: { title: 'cc could not place this transcript', message: (p) => `cc has no project for it (${s(p.detail)}); it is not imported anywhere.`, action: null, status: 409 },
   SESSION_LIVE: { title: 'The session is still running', message: () => 'A running session is imported after it ends: scan again then.', action: null, status: 409 },
   NO_RETAIN_SCOPE: { title: 'No scope retains this session', message: () => "No memory scope grants retain to this session's project, kind and stage, so it is not imported anywhere.", action: null, status: 409 },

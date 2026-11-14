@@ -786,7 +786,7 @@ test('a session that fails part-way still counts the parts it sent', async (t) =
   assert.deepEqual(result.failed.map((f) => f.code), ['RETAIN_FAILED']);
   assert.equal(result.documents.sent, 1);
   assert.equal(result.sessions, 0);
-  assert.match(x.activity.list()[0].message, /^0 sessions \(1 documents\) sent/);
+  assert.match(x.activity.list()[0].message, /^0 sessions finished, 1 documents sent/);
 });
 
 // A6 / invariant: an import never reports success for parts the file no longer yields.
@@ -821,4 +821,18 @@ test('a version-1 placement cache is moved aside and the cache rebuilt', async (
   assert.equal(end.result.totals.resolved, 1);
   assert.equal(JSON.parse(fs.readFileSync(x.placements.file, 'utf8')).version, 2);
   assert.equal(x.row(KEY(1)).status, 'ready');
+});
+
+// A4 / invariant: only a dry run that checked Hindsight (overlap, stored and outdated parts) can be confirmed, whatever the caller.
+test('an import of a scan made while Hindsight was not ready is refused BACKFILL_UNCHECKED', async (t) => {
+  const x = await setup(t);
+  x.place(1);
+  x.state.ready = false;
+  ok(await x.scan());
+  assert.equal(x.backfill.latestScan().hindsightChecked, false);
+  x.state.ready = true;
+  assert.throws(() => x.jobs.start('backfill-import', { scanId: x.backfill.latestScan().scanId, sessions: [KEY(1)], confirm: true }), (e) => e.code === 'BACKFILL_UNCHECKED' && /scan again once Hindsight is ready/.test(e.message));
+  assert.deepEqual(x.hs.requests, []);
+  ok(await x.scan());
+  ok(await x.import([KEY(1)]));
 });

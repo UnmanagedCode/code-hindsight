@@ -530,7 +530,7 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
     } finally {
       result.banks = [...banks];
       const d = result.documents;
-      const summary = `${signal.aborted ? 'Cancelled: ' : ''}${result.sessions} sessions (${d.sent + d.replaced + d.retried} documents) sent, ${d.replaced} of them replacing outdated parts, ${d.alreadyImported} already imported, ${d.queued} already queued, ${d.retried} retried, ${d.deleted} orphaned parts deleted, ${result.failed.length} failed, ${result.skipped.length} skipped`;
+      const summary = `${signal.aborted ? 'Cancelled: ' : ''}${result.sessions} sessions finished, ${d.sent + d.replaced + d.retried} documents sent (${d.replaced} of them replacing outdated parts), ${d.alreadyImported} already imported, ${d.queued} already queued, ${d.retried} retried, ${d.deleted} orphaned parts deleted, ${result.failed.length} failed, ${result.skipped.length} skipped`;
       line(summary);
       // A cancelled run is not a success; a stopped one is an error.
       const outcome = signal.aborted ? 'skipped' : fatal ? 'error' : 'ok';
@@ -557,6 +557,8 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
         validate(p) {
           if (p.confirm !== true) throw new AppError('CONFIRMATION_REQUIRED', { expected: 'confirm: true' });
           if (!latest || p.scanId !== latest.view.scanId || hashOf(savedScopes()) !== latest.view.scopesHash) throw new AppError('BACKFILL_STALE');
+          // A dry run that could not read Hindsight disclosed neither live overlap nor outdated parts: it cannot be confirmed.
+          if (!latest.view.hindsightChecked) throw new AppError('BACKFILL_UNCHECKED');
           if (!Array.isArray(p.sessions) || !p.sessions.length) throw new AppError('BAD_REQUEST', { detail: 'sessions must be a non-empty list of scan keys' });
           const keys = [...new Set(p.sessions)];
           const bad = keys.find((k) => typeof k !== 'string' || latest.rows.get(k)?.status !== 'ready');
