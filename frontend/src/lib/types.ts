@@ -36,11 +36,14 @@ export interface ContainerInfo {
 export interface Job {
   id: string;
   kind: string;
-  state: 'running' | 'done' | 'failed';
+  state: 'running' | 'done' | 'failed' | 'cancelled';
   startedAt: string;
   endedAt: string | null;
   result: Record<string, unknown> | null;
   error: CatalogError | null;
+  /** Registered (non-Docker) jobs report it; null otherwise. */
+  progress: { done: number; total: number; unit: string } | null;
+  cancellable: boolean;
   tail?: string;
 }
 
@@ -122,9 +125,77 @@ export interface CcProjectsView {
   error: string | null;
 }
 
+export interface BackfillEstimate { chunks: number; inputTokens: number; outputTokens: number }
+
+/** One transcript segment a backfill scan found importable (docs/protocol.md → backfill-scan). */
+export interface BackfillSession {
+  key: string;
+  handle: string;
+  backingId: string;
+  project: string;
+  worktree: string;
+  kind: 'conductor' | 'worker';
+  stage: string | null;
+  title: string | null;
+  firstAt: string | null;
+  lastAt: string | null;
+  turns: number;
+  documents: number;
+  chars: number;
+  bank: string;
+  scope: string;
+  status: 'ready' | 'imported';
+  /** Only turns before this (live memory's first turn) are imported. */
+  cutoffAt: string | null;
+  untimed: number;
+  malformed: number;
+  oversized: number;
+  /** Parts the bank already holds with exactly this content. */
+  stored: number;
+  /** Parts the bank holds with other content (an import replaces them). */
+  outdated: number;
+  /** Stored parts numbered past this plan (an import deletes them). */
+  orphans: number;
+  estimate: BackfillEstimate;
+}
+
+/** A transcript a scan did not offer, with the catalog code and message saying why. */
+export interface BackfillSkip {
+  key: string;
+  handle: string | null;
+  backingId: string;
+  project?: string;
+  worktree?: string;
+  stage?: string | null;
+  code: string;
+  message: string;
+}
+
+export interface BackfillScan {
+  scanId: string;
+  scannedAt: string;
+  scopesHash: string;
+  /** False when Hindsight was not ready: already-imported sessions and live overlap were not checked. */
+  hindsightChecked: boolean;
+  llm: { mode: string; model: string | null };
+  basis: { chunkChars: number; charsPerToken: number; promptTokensPerChunk: number; outputTokensPerChunk: number };
+  totals: { files: number; ready: number; imported: number; skipped: number; cached: number; resolved: number; estimate: BackfillEstimate };
+  sessions: BackfillSession[];
+  skipped: BackfillSkip[];
+}
+
+export interface BackfillImportResult {
+  sessions: number;
+  documents: { sent: number; replaced: number; alreadyImported: number; queued: number; retried: number; deleted: number };
+  failed: { key: string; code: string; message: string }[];
+  skipped: { key: string; code: string; message: string }[];
+  banks: string[];
+}
+
 /** One memory activity entry; never holds prompt or memory text. */
 export interface ActivityEntry {
   at: string;
+  /** recall, retain, mcp-recall, backfill-scan or backfill-import. */
   event: string;
   outcome: 'ok' | 'error' | 'skipped';
   sessionId?: string;

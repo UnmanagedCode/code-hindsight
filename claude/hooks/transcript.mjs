@@ -3,7 +3,8 @@
 // core/transcript-util.ts): user and assistant prose, plus one compact `action` turn per tool
 // call (tool name and primary target). Tool results, other tool arguments, thinking, sidechain
 // lines, `isMeta` lines and compaction summaries are dropped; injected-memory tags are stripped.
-// Pure apart from `readTranscriptTail`; imported by the hook and the tests.
+// Pure apart from `readTranscriptTail` (the hook's bounded tail) and `readTranscriptFile` (the
+// backend's whole-file read for the backfill importer); imported by the hook, the backend and the tests.
 import fs from 'node:fs';
 
 /** Injected context removed from retained text, so a retain never re-ingests its own recall. */
@@ -56,6 +57,29 @@ function render(content, type) {
 }
 
 /**
+ * Turns of one transcript line (`index` is its 0-based line number in the file): `[]` for a line
+ * that is not a real message, `null` for one that is not a JSON object.
+ */
+export function parseLine(raw, index) {
+  const text = raw.trim();
+  if (!text) return [];
+  let line;
+  try { line = JSON.parse(text); } catch { return null; }
+  if (!line || typeof line !== 'object' || Array.isArray(line)) return null;
+  if (line.type !== 'user' && line.type !== 'assistant') return [];
+  if (line.isMeta === true || line.isSidechain === true || line.isCompactSummary === true) return [];
+  if (!line.message || typeof line.message !== 'object') return [];
+  const base = typeof line.uuid === 'string' && line.uuid ? line.uuid : `line-${index}`;
+  let actionN = 0;
+  return render(line.message.content, line.type).map((r) => ({
+    id: r.role === 'action' ? `${base}#${actionN++}` : base,
+    role: r.role,
+    content: r.content,
+    timestamp: typeof line.timestamp === 'string' ? line.timestamp : null,
+  }));
+}
+
+/**
  * Turns of a transcript's text: `{id, role: 'user'|'assistant'|'action', content, timestamp}`.
  * `id` is the entry's uuid (an action's is `<uuid>#<n>`). Unparsable lines (a partial last line
  * is normal while the file is being written) and lines that are not real messages are skipped.
@@ -63,27 +87,72 @@ function render(content, type) {
 export function parseTranscript(text) {
   const turns = [];
   const lines = text.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i].trim();
-    if (!raw) continue;
-    let line;
-    try { line = JSON.parse(raw); } catch { continue; }
-    if (!line || typeof line !== 'object') continue;
-    if (line.type !== 'user' && line.type !== 'assistant') continue;
-    if (line.isMeta === true || line.isSidechain === true || line.isCompactSummary === true) continue;
-    if (!line.message || typeof line.message !== 'object') continue;
-    const base = typeof line.uuid === 'string' && line.uuid ? line.uuid : `line-${i}`;
-    let actionN = 0;
-    for (const r of render(line.message.content, line.type)) {
-      turns.push({
-        id: r.role === 'action' ? `${base}#${actionN++}` : base,
-        role: r.role,
-        content: r.content,
-        timestamp: typeof line.timestamp === 'string' ? line.timestamp : null,
-      });
-    }
-  }
+  for (let i = 0; i < lines.length; i++) turns.push(...(parseLine(lines[i], i) ?? []));
   return turns;
+}
+
+/**
+ * Every turn of a transcript file, streamed (never a tail window: a whole session is wanted) and
+ * yielded one at a time, so a caller that only summarises keeps no turn text. Lines are split on
+ * the newline byte and decoded only when complete, so a character split across read chunks
+ * survives. A line growing past `lineMaxBytes` is skipped while it streams, never buffered whole
+ * (`stats.oversized`); a line that is not a JSON object is counted `stats.malformed`. Line numbers
+ * are absolute, so ids match `parseTranscript` over the same text. The file is opened without
+ * following a symlink. Open and read errors (and an aborted `signal`) throw.
+ * @param {string} file
+ * @param {{lineMaxBytes?: number, signal?: AbortSignal, stats?: {lines: number, malformed: number, oversized: number}}} [o]
+ */
+export async function* transcriptTurns(file, { lineMaxBytes, signal, stats = { lines: 0, malformed: 0, oversized: 0 } } = {}) {
+  let parts = [];
+  let size = 0;
+  let skipping = false;
+  /** The turns of the line just completed. */
+  const finish = () => {
+    let out = [];
+    if (!skipping) {
+      const parsed = parseLine(Buffer.concat(parts, size).toString('utf8'), stats.lines);
+      if (parsed === null) stats.malformed++; else out = parsed;
+    }
+    stats.lines++;
+    parts = [];
+    size = 0;
+    skipping = false;
+    return out;
+  };
+  const take = (chunk) => {
+    if (skipping) return;
+    if (lineMaxBytes !== undefined && size + chunk.length > lineMaxBytes) {
+      skipping = true;
+      stats.oversized++;
+      parts = [];
+      size = 0;
+      return;
+    }
+    parts.push(chunk);
+    size += chunk.length;
+  };
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  for await (const chunk of fs.createReadStream(file, { flags, highWaterMark: 64 * 1024, signal })) {
+    let from = 0;
+    for (let nl = chunk.indexOf(0x0a, from); nl >= 0; nl = chunk.indexOf(0x0a, from)) {
+      take(chunk.subarray(from, nl));
+      yield* finish();
+      from = nl + 1;
+    }
+    if (from < chunk.length) take(chunk.subarray(from));
+  }
+  if (size > 0 || skipping) yield* finish();
+}
+
+/**
+ * Every turn of a transcript file at once (`transcriptTurns`, collected).
+ * @returns {Promise<{turns: object[], lines: number, malformed: number, oversized: number}>}
+ */
+export async function readTranscriptFile(file, { lineMaxBytes, signal } = {}) {
+  const stats = { lines: 0, malformed: 0, oversized: 0 };
+  const turns = [];
+  for await (const t of transcriptTurns(file, { lineMaxBytes, signal, stats })) turns.push(t);
+  return { turns, ...stats };
 }
 
 /** Turns of the transcript file's end; [] when it cannot be read. */

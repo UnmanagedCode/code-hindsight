@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
-import { boot, goodApiImage, goodCpImage, dockerCalls, fakeBundle } from './helpers.mjs';
+import { boot, goodApiImage, goodCpImage, dockerCalls, fakeBundle, waitFor } from './helpers.mjs';
 import { API_IMAGES, CP_IMAGE } from '../src/pins.js';
 import { bundleName } from '../src/jobs.js';
 
@@ -215,4 +215,39 @@ test('static UI: 503 while unbuilt, host URLs 404, allowlisted files only, CSP a
   const cpPath = await fetch(`${built.url}/dashboard`, { headers: { 'sec-fetch-site': 'none' } });
   assert.equal(cpPath.status, 503);
   assert.match(await cpPath.text(), /not running/);
+});
+
+// A6 / invariant: the backfill routes answer their shapes and share every POST guard.
+test('POST /-/api/jobs/:id/cancel and GET /-/api/memory/backfill answer their shapes; cross-site and non-JSON posts are refused', async (t) => {
+  const { url } = await boot(t, { seed: { images: {} } });
+  assert.deepEqual(await (await fetch(`${url}/-/api/memory/backfill`)).json(), { scan: null });
+  const missing = await post(`${url}/-/api/jobs/nope/cancel`);
+  assert.equal(missing.status, 404);
+  assert.equal((await missing.json()).code, 'NOT_FOUND');
+  const started = await (await post(`${url}/-/api/jobs/pull`, { variant: 'full' })).json();
+  assert.deepEqual([started.cancellable, started.progress], [false, null]);
+  const refused = await post(`${url}/-/api/jobs/${started.id}/cancel`);
+  assert.equal(refused.status, 409);
+  assert.equal((await refused.json()).code, 'JOB_NOT_CANCELLABLE');
+  assert.equal((await post(`${url}/-/api/jobs/${started.id}/cancel`, {}, { 'content-type': 'application/json', 'sec-fetch-site': 'cross-site' })).status, 403);
+  assert.equal((await fetch(`${url}/-/api/jobs/${started.id}/cancel`, { method: 'POST', headers: { 'content-type': 'text/plain', 'sec-fetch-site': 'same-origin' }, body: '{}' })).status, 415);
+  await waitFor(async () => (await (await fetch(`${url}/-/api/jobs/${started.id}`)).json()).state !== 'running');
+  const scan = await post(`${url}/-/api/jobs/backfill-scan`, {});
+  assert.equal(scan.status, 409);
+  assert.equal((await scan.json()).code, 'BACKFILL_NO_SCOPES');
+});
+
+// A4 / invariant: an import request may name every session of a large scan (BACKFILL_LIMITS.selectionMaxBytes), and no more.
+test('a backfill-import body larger than the default limit is read up to selectionMaxBytes; beyond it is refused 413', async (t) => {
+  const { BACKFILL_LIMITS } = await import('../src/backfill.js');
+  const { url } = await boot(t, { seed: { images: {} } });
+  // Each key and its JSON quoting take 76 bytes: at least `bytes` in all.
+  const keys = (bytes) => Array.from({ length: Math.ceil(bytes / 70) }, (_, i) => `${'h'.repeat(36)}:${String(i).padStart(36, '0')}`);
+  const big = await post(`${url}/-/api/jobs/backfill-import`, { scanId: 'x', sessions: keys(512 * 1024), confirm: true });
+  assert.equal(big.status, 409, 'read and validated (no scan yet), not refused for size');
+  assert.equal((await big.json()).code, 'BACKFILL_STALE');
+  const pull = await post(`${url}/-/api/jobs/pull`, { variant: 'full', pad: 'x'.repeat(512 * 1024) });
+  assert.equal(pull.status, 413, 'other kinds keep the default limit');
+  const huge = await post(`${url}/-/api/jobs/backfill-import`, { scanId: 'x', sessions: keys(BACKFILL_LIMITS.selectionMaxBytes + 1024), confirm: true });
+  assert.equal(huge.status, 413);
 });

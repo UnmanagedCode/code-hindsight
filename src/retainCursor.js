@@ -34,6 +34,27 @@ export function createRetainCursors(dataDir, { now = () => Date.now() } = {}) {
     /** True once after the whole file was found unreadable and moved aside to `cursors.json.corrupt`. */
     consumeCorruption() { const c = corrupt; corrupt = false; return c; },
     get: (sessionId) => (Object.hasOwn(load(), sessionId) ? load()[sessionId] : undefined),
+    /**
+     * A read-only view for a reader that must never disturb live retain (the backfill importer; one
+     * per job run): answers from the live store's memory when it is loaded, else from the file parsed
+     * at most once for this view, never cached into the store, renamed or written. Undefined when
+     * absent or unreadable.
+     * @returns {(sessionId: string) => object|undefined}
+     */
+    peeker() {
+      let parsed;
+      const fromFile = () => {
+        if (parsed === undefined) {
+          try { parsed = readJsonFile(file, {}); } catch { parsed = null; }
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) parsed = null;
+        }
+        return parsed;
+      };
+      return (sessionId) => {
+        const all = data ?? fromFile();
+        return all && Object.hasOwn(all, sessionId) ? all[sessionId] : undefined;
+      };
+    },
     /** Forget a session's entry (a corrupt one is reset; the next retain starts from the last exchange). */
     drop(sessionId) {
       const all = load();
@@ -171,9 +192,12 @@ export function isValidCursor(c) {
     && (c.inflight === undefined || validInflight(c.inflight));
 }
 
-/** A v4-shaped UUID derived from the batch, so resending a batch repeats its operation id. */
-export function operationIdFor(bank, documentId, firstId, lastId) {
-  const h = crypto.createHash('sha256').update(`${bank}\n${documentId}\n${firstId}\n${lastId}`).digest();
+/**
+ * A v4-shaped UUID derived from the batch, so resending a batch repeats its operation id.
+ * `contentHash` (backfill) also ties it to the exact content, so a replacement gets a new one.
+ */
+export function operationIdFor(bank, documentId, firstId, lastId, contentHash) {
+  const h = crypto.createHash('sha256').update(`${bank}\n${documentId}\n${firstId}\n${lastId}${contentHash === undefined ? '' : `\n${contentHash}`}`).digest();
   h[6] = (h[6] & 0x0f) | 0x40;
   h[8] = (h[8] & 0x3f) | 0x80;
   const x = h.subarray(0, 16).toString('hex');

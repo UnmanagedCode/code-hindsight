@@ -166,3 +166,27 @@ test('a cursors.json that is not valid JSON or not an object is moved aside, rep
     fs.rmSync(file);
   }
 });
+
+// A3 / invariant: the backfill importer reads live retain progress without ever disturbing it,
+// parsing the file at most once per job run.
+test('a peeker reads entries without writing, caching or moving the file, parses it once, and answers undefined for an unreadable file', (t) => {
+  const r = mkRoot(t);
+  const file = path.join(r.dataDir, 'memory', 'cursors.json');
+  const writer = createRetainCursors(r.dataDir);
+  writer.set('s1', { lastId: 'a', lastTs: null, pending: [] });
+  const reader = createRetainCursors(r.dataDir);
+  const peek = reader.peeker();
+  assert.equal(peek('s1').lastId, 'a');
+  assert.equal(peek('nope'), undefined);
+  assert.equal(peek('constructor'), undefined);
+  writer.set('s1', { lastId: 'b', lastTs: null, pending: [] });
+  assert.equal(peek('s1').lastId, 'a', 'memoised for this view: the file is not parsed again');
+  assert.equal(reader.peeker()('s1').lastId, 'b', 'a new view (the next job run) reads it again');
+  assert.equal(writer.peeker()('s1').lastId, 'b', 'a loaded store answers from memory');
+  const bytes = fs.readFileSync(file);
+  fs.writeFileSync(file, '{not json');
+  assert.equal(createRetainCursors(r.dataDir).peeker()('s1'), undefined);
+  assert.equal(fs.readFileSync(file, 'utf8'), '{not json', 'never moved aside or rewritten');
+  assert.equal(fs.existsSync(`${file}.corrupt`), false);
+  assert.ok(bytes.length > 0);
+});

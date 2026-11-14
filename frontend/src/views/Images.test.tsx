@@ -43,7 +43,7 @@ describe('Images & data', () => {
       ],
       manifest: { format: 1, images: [{ ref: 'code-hindsight-cp:1.2.1', id: CP_ID }, { ref: evil, id: 'sha256:bbb' }] },
     } } } : undefined));
-    render(<Images status={status({ job: { id: 'j9', kind: 'import', state: 'running', startedAt: '', endedAt: null, result: null, error: null } })} onChanged={vi.fn()} />);
+    render(<Images status={status({ job: { id: 'j9', kind: 'import', state: 'running', startedAt: '', endedAt: null, result: null, error: null, progress: null, cancellable: false } })} onChanged={vi.fn()} />);
     const list = await screen.findByLabelText('Loaded images');
     expect(list.querySelector('[data-standing="needs-confirmation"]')?.textContent).toContain(CP_ID);
     expect(list.querySelector('[data-standing="pinned"]')).not.toBeNull();
@@ -57,7 +57,7 @@ describe('Images & data', () => {
     stubFetch((url) => (url === '-/api/jobs/e1' ? { body: { id: 'e1', kind: 'export', state: 'done', error: null, tail: 'wrote', result: {
       name: 'code-hindsight-1.2.1-full.tar', size: 1, sha256: 'x', images: [{ ref: 'ghcr.io/vectorize-io/hindsight:1.2.1', id: 'sha256:aaa' }, { ref: 'code-hindsight-cp:1.2.1', id: CP_ID }],
     } } } : undefined));
-    render(<Images status={status({ job: { id: 'e1', kind: 'export', state: 'running', startedAt: '', endedAt: null, result: null, error: null } })} onChanged={vi.fn()} />);
+    render(<Images status={status({ job: { id: 'e1', kind: 'export', state: 'running', startedAt: '', endedAt: null, result: null, error: null, progress: null, cancellable: false } })} onChanged={vi.fn()} />);
     const ids = await screen.findByLabelText('Image IDs in this bundle (compare them after importing it)');
     expect(ids.textContent).toContain(CP_ID);
     expect(ids.textContent).toContain('sha256:aaa');
