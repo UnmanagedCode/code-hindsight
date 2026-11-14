@@ -34,6 +34,19 @@ export function createRetainCursors(dataDir, { now = () => Date.now() } = {}) {
     /** True once after the whole file was found unreadable and moved aside to `cursors.json.corrupt`. */
     consumeCorruption() { const c = corrupt; corrupt = false; return c; },
     get: (sessionId) => (Object.hasOwn(load(), sessionId) ? load()[sessionId] : undefined),
+    /**
+     * A session's entry for a reader that must never disturb live retain (the backfill importer):
+     * from memory when loaded, else parsed from the file without caching, renaming or writing.
+     * Undefined when absent or unreadable.
+     */
+    peek(sessionId) {
+      let all = data;
+      if (!all) {
+        try { all = readJsonFile(file, {}); } catch { return undefined; }
+        if (!all || typeof all !== 'object' || Array.isArray(all)) return undefined;
+      }
+      return Object.hasOwn(all, sessionId) ? all[sessionId] : undefined;
+    },
     /** Forget a session's entry (a corrupt one is reset; the next retain starts from the last exchange). */
     drop(sessionId) {
       const all = load();

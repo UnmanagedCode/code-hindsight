@@ -3,7 +3,8 @@
 // routes never see an exception. Owns the recall budget, the injected-context format, the set of
 // memories already injected per session, and the one-in-flight-per-session retain worker.
 import { AppError } from './errors.js';
-import { matchScopes, needsWorkspace } from './scopes.js';
+import { matchScopes, withWorkspace } from './scopes.js';
+import { buildRetainItem } from './retainItem.js';
 import { windowTurns, lastExchangeBoundary, endsAfter, provablyBehind, isOlderTail, isValidCursor, tailEnd, operationIdFor } from './retainCursor.js';
 
 export const MEMORY_LIMITS = Object.freeze({
@@ -24,7 +25,6 @@ export const MEMORY_LIMITS = Object.freeze({
 const NONE = Object.freeze({ context: null, commit: () => {} });
 const OPEN_TAG = '<hindsight_memory>';
 const CLOSE_TAG = '</hindsight_memory>';
-const RETAIN_CONTEXT = "Conversation between a cc user (or a cc conductor) and a coding agent in a cc session. Record the agent's statements as claims it made, not as verified facts.";
 
 /** One line of a recalled memory: whitespace collapsed, the wrapper tag neutralized, length capped. */
 function cleanText(text, max) {
@@ -66,16 +66,7 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     }
   }
 
-  /**
-   * The session with its cc workspace placed (`workspace`, or `workspaceError` when it could not
-   * be looked up); unchanged when no scope's outcome depends on it, so cc is asked only then.
-   */
-  async function placeWorkspace(list, session) {
-    if (!needsWorkspace(list, session)) return session;
-    try { return { ...session, workspace: await cc.workspaceOf(session.project) }; } catch (e) {
-      return { ...session, workspaceError: e?.params?.detail ?? e?.message ?? String(e) };
-    }
-  }
+  const placeWorkspace = (list, session) => withWorkspace(list, session, cc.workspaceOf);
 
   function logSkipped(event, session, m) {
     for (const k of m.skipped) fail(event, session, session.sessionId, new AppError(k.code, { scope: k.scope, detail: k.detail }));
@@ -199,16 +190,9 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     return true;
   }
 
-  function buildItem(sessionId, delta, ses) {
-    return {
-      content: delta.map((t) => JSON.stringify({ role: t.role, content: t.content, timestamp: t.timestamp ?? undefined })).join('\n'),
-      document_id: `cc-session:${sessionId}`,
-      update_mode: 'append',
-      timestamp: delta[0].timestamp ?? new Date(now()).toISOString(),
-      context: `${RETAIN_CONTEXT} Project ${ses.project}, worktree ${ses.worktree}, ${ses.kind} session${ses.stage ? `, stage ${ses.stage}` : ''}.`,
-      metadata: { source: 'code-hindsight', ccSessionId: sessionId, project: ses.project, worktree: ses.worktree, kind: ses.kind, ...(ses.stage ? { stage: ses.stage } : {}) },
-    };
-  }
+  const buildItem = (sessionId, delta, ses) => buildRetainItem({
+    sessionId, documentId: `cc-session:${sessionId}`, updateMode: 'append', turns: delta, session: ses, fallbackTimestamp: new Date(now()).toISOString(),
+  });
 
   /**
    * Work through a session's persisted state in order: the unacknowledged batch first (resent

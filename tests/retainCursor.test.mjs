@@ -166,3 +166,25 @@ test('a cursors.json that is not valid JSON or not an object is moved aside, rep
     fs.rmSync(file);
   }
 });
+
+// A3 / invariant: the backfill importer reads live retain progress without ever disturbing it.
+test('peek reads an entry without writing, caching or moving the file; an unreadable file answers undefined', (t) => {
+  const r = mkRoot(t);
+  const file = path.join(r.dataDir, 'memory', 'cursors.json');
+  const writer = createRetainCursors(r.dataDir);
+  writer.set('s1', { lastId: 'a', lastTs: null, pending: [] });
+  const before = fs.readFileSync(file);
+  const reader = createRetainCursors(r.dataDir);
+  assert.equal(reader.peek('s1').lastId, 'a');
+  assert.equal(reader.peek('nope'), undefined);
+  assert.equal(reader.peek('constructor'), undefined);
+  writer.set('s1', { lastId: 'b', lastTs: null, pending: [] });
+  assert.equal(reader.peek('s1').lastId, 'b', 'not cached: a later write is seen');
+  assert.equal(writer.peek('s1').lastId, 'b', 'a loaded store answers from memory');
+  fs.writeFileSync(file, '{not json');
+  const fresh = createRetainCursors(r.dataDir);
+  assert.equal(fresh.peek('s1'), undefined);
+  assert.equal(fs.readFileSync(file, 'utf8'), '{not json', 'never moved aside or rewritten');
+  assert.equal(fs.existsSync(`${file}.corrupt`), false);
+  assert.notDeepEqual(before, fs.readFileSync(file));
+});

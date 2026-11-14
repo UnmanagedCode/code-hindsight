@@ -135,6 +135,18 @@ export function needsWorkspace(scopes, session) {
 }
 
 /**
+ * The session with its cc workspace placed (`workspace`, or `workspaceError` when it could not be
+ * looked up); unchanged when no scope's outcome depends on it, so cc is asked only then.
+ * @param {(project: string) => Promise<string|null>} workspaceOf
+ */
+export async function withWorkspace(scopes, session, workspaceOf) {
+  if (!needsWorkspace(scopes, session)) return session;
+  try { return { ...session, workspace: await workspaceOf(session.project) }; } catch (e) {
+    return { ...session, workspaceError: e?.params?.detail ?? e?.message ?? String(e) };
+  }
+}
+
+/**
  * Recall: every matching scope that grants it, in order, banks de-duplicated and capped.
  * Retain: the first matching scope that grants it; a bank that fails to render, or a scope whose
  * match could not be decided (`retainUnresolved`), leaves the session without retain rather than
