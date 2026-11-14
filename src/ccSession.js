@@ -1,27 +1,61 @@
-// What this plugin reads from cc: the live facts about a session (project, worktree, stage), and
-// the stage names of cc's playbooks. Read-only; both go through documented cc routes.
+// What this plugin reads from cc: the live facts about a session (project, worktree, stage), the
+// stage names of cc's playbooks, and which cc workspace each project is in (plus the workspace
+// list, for the scope editor). Read-only; all go through documented cc routes.
 import { AppError } from './errors.js';
 
 export const DESCRIBE_TIMEOUT_MS = 1000;
 export const STAGES_TTL_MS = 60_000;
 const STAGES_TIMEOUT_MS = 5000;
+/** How long the project → workspace index serves before it is read again (the membership lag). */
+export const WORKSPACES_TTL_MS = 30_000;
+/** Deadline of the `list_projects` read on the hook path; with the other deadlines it must fit the hook's. */
+export const WORKSPACES_TIMEOUT_MS = 900;
 /** The project a cc conductor session reports; `describe_session` has no separate kind field. */
 export const CONDUCTOR_PROJECT = '.conduct';
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
 export const isSessionId = (v) => typeof v === 'string' && SESSION_ID_RE.test(v);
 
+const isStr = (v) => typeof v === 'string';
+
 /**
- * @param {{conductorUrl: string|null, fetchImpl?: typeof fetch, now?: () => number, describeTimeoutMs?: number}} o
+ * @param {{conductorUrl: string|null, fetchImpl?: typeof fetch, now?: () => number, describeTimeoutMs?: number, workspacesTimeoutMs?: number}} o
  */
-export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Date.now(), describeTimeoutMs = DESCRIBE_TIMEOUT_MS }) {
+export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Date.now(), describeTimeoutMs = DESCRIBE_TIMEOUT_MS, workspacesTimeoutMs = WORKSPACES_TIMEOUT_MS }) {
   let stagesCache = { at: -Infinity, value: null };
+  /** name → {workspace, degraded}, as `list_projects` last answered. Never served past WORKSPACES_TTL_MS. */
+  let projectsCache = { at: -Infinity, index: null };
+  /** The match path's refresh in flight, shared by concurrent lookups. */
+  let refreshing = null;
 
   async function getJson(pathname, timeoutMs) {
     const res = await fetchImpl(new URL(pathname, conductorUrl), { signal: AbortSignal.timeout(timeoutMs) });
     if (!res.ok) throw new Error(`${pathname} answered HTTP ${res.status}`);
     return res.json();
   }
+
+  /** An MCP tool through cc's REST alias (`POST /mcp/tools/<name>` → the structured content). */
+  async function callTool(name, timeoutMs) {
+    const res = await fetchImpl(new URL(`/mcp/tools/${name}`, conductorUrl), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) throw new Error(`${name} answered HTTP ${res.status}`);
+    return res.json();
+  }
+
+  /** Read `list_projects` into the cache; returns the new index. Throws on any failure. */
+  async function refreshProjects(timeoutMs) {
+    const body = await callTool('list_projects', timeoutMs);
+    const rows = body?.ok === false ? null : body?.projects;
+    if (!Array.isArray(rows) || rows.some((p) => !isStr(p?.name) || !(isStr(p.workspace) || p.workspace === null))) {
+      throw new Error('list_projects answered an unexpected shape');
+    }
+    const index = new Map(rows.map((p) => [p.name, { workspace: p.workspace, degraded: p.degraded != null && p.degraded !== false }]));
+    projectsCache = { at: now(), index };
+    return index;
+  }
+
+  const freshIndex = () => (now() - projectsCache.at < WORKSPACES_TTL_MS ? projectsCache.index : null);
 
   return {
     /**
@@ -77,6 +111,47 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
       const value = [...byStage].map(([name, playbooks]) => ({ name, playbooks: playbooks.sort() })).sort((a, b) => a.name.localeCompare(b.name));
       stagesCache = { at: now(), value };
       return value;
+    },
+
+    /**
+     * The cc workspace a project is in (null: none; the conductor project is in none). Served from
+     * an index at most WORKSPACES_TTL_MS old; a project missing from a cached index is read again
+     * once. Never answers from an older index.
+     * @throws {AppError} WORKSPACE_UNRESOLVED (cc unset, unreachable, slow or confused; the project unknown or unreadable to cc)
+     */
+    async workspaceOf(project) {
+      if (project === CONDUCTOR_PROJECT) return null;
+      const unresolved = (reason, cause) => new AppError('WORKSPACE_UNRESOLVED', { project, detail: `project ${project}: ${reason}` }, cause ? { cause } : undefined);
+      if (!conductorUrl) throw unresolved('this backend has no cc to ask (CONDUCTOR_URL is unset)');
+      let index = freshIndex();
+      if (!index?.has(project)) {
+        if (!refreshing) refreshing = refreshProjects(workspacesTimeoutMs).finally(() => { refreshing = null; });
+        try { index = await refreshing; } catch (e) {
+          throw unresolved(e?.name === 'TimeoutError' ? 'cc did not answer in time' : (e?.message ?? String(e)), e);
+        }
+      }
+      const row = index.get(project);
+      if (!row) throw unresolved("cc's project list does not include it");
+      if (row.degraded) throw unresolved('cc could not read its project record');
+      return row.workspace;
+    },
+
+    /** cc's projects for the scope editor: `[{name, workspace}]` by name. Throws when cc cannot be read. */
+    async listProjects() {
+      if (!conductorUrl) throw new Error('CONDUCTOR_URL is unset');
+      const index = freshIndex() ?? await refreshProjects(STAGES_TIMEOUT_MS);
+      return [...index].map(([name, { workspace }]) => ({ name, workspace })).sort((a, b) => a.name.localeCompare(b.name));
+    },
+
+    /** cc's workspaces for the scope editor: `[{name, projectCount}]` by name. Throws when cc cannot be read. */
+    async listWorkspaces() {
+      if (!conductorUrl) throw new Error('CONDUCTOR_URL is unset');
+      const body = await callTool('list_workspaces', STAGES_TIMEOUT_MS);
+      const rows = body?.ok === false ? null : body?.workspaces;
+      if (!Array.isArray(rows) || rows.some((w) => !isStr(w?.name) || !Number.isInteger(w.projectCount))) {
+        throw new Error('list_workspaces answered an unexpected shape');
+      }
+      return rows.map((w) => ({ name: w.name, projectCount: w.projectCount })).sort((a, b) => a.name.localeCompare(b.name));
     },
   };
 }

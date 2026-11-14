@@ -32,6 +32,7 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 | POST | `/-/api/memory/preview-bank` | `{template, sample?: {project, worktree, kind}}` → `{bank}` or `{error}` (the same renderer as recall and retain) |
 | GET | `/-/api/memory/activity` | `{entries}` newest first; entry `{at, event: recall\|retain\|mcp-recall, outcome: ok\|error\|skipped, sessionId?, project?, worktree?, stage?, kind?, banks?, count?, code?, message?}` |
 | GET | `/-/api/memory/stages` | `{stages: [{name, playbooks: [id]}], error}` — stage names across cc's playbooks; `error` is a string when cc could not be read |
+| GET | `/-/api/memory/cc-projects` | `{projects: [{name, workspace: string\|null}], workspaces: [{name, projectCount}], error}` — cc's projects (with the workspace each is in) and workspaces, both by name, for the scope pickers. Always 200: a list that could not be read is `[]` and `error` is the first failure's message (else `null`) |
 | GET | `/-/api/cc-backends` | `{backends: [{id, label, host, usable, refusal, models: [{model, label}]}]}` — never a token |
 | POST | `/-/api/start` | start / reconcile to the saved settings; answers status at once |
 | POST | `/-/api/restart` | stop, then start; answers status at once |
@@ -81,14 +82,14 @@ An export is the `docker save` archive with one extra root file, `code-hindsight
 Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP forwarding; never by the shell UI.
 
 - **Request policy:** `POST` with `Content-Type: application/json` only. Refused `403 BROWSER_REFUSED` when the request carries `Origin`, `Sec-Fetch-Site`, `Sec-Fetch-Dest` or `Sec-Fetch-User` (the invariant relied on: a browser's non-GET/HEAD request always carries `Origin`, whose value may be `null`, and an `application/json` body cannot be sent as a simple or form request; `Sec-Fetch-*` adds to that where the browser sends it, and some omit it on non-trustworthy HTTP origins. The check fails open only for a client that sends none of these, i.e. a non-browser local process, as the trust model already says. Node's `fetch` adds only `Sec-Fetch-Mode`, which is not a refusal reason). `/-/mcp` is also refused when it carries `X-Forwarded-Prefix` (cc's public proxy adds it; its MCP forward dials the backend directly). Body limits: `HOOK_BODY_LIMITS` (`413` over). `sessionId` must be a cc session id.
-- **Identity:** the claimed `sessionId` must be a **live** cc session; scopes are matched against what cc's `describe_session` says about it at call time. It is advisory, not authenticated: see [README → Trust model](../README.md#trust-model).
+- **Identity:** the claimed `sessionId` must be a **live** cc session; scopes are matched against what cc's `describe_session` says about it at call time (and, when a scope needs it, the workspace cc's `list_projects` places its project in). It is advisory, not authenticated: see [README → Trust model](../README.md#trust-model).
 
 | Path | Body → answer |
 |---|---|
 | `/-/hook/recall` | `{sessionId, prompt}` → `200 {context}` (`context` is the `<hindsight_memory>` block or `null`; never an error). The memories count as injected only after the answer is flushed. A session that matches no recall scope produces no activity entry (every prompt would add one); the `/-/mcp` tool does log `NO_RECALL_SCOPE` |
 | `/-/hook/retain` | `{sessionId, turns: [{id, role: user\|assistant\|action, content, timestamp\|null}]}` → `202 {status: accepted\|off\|empty\|unresolved\|error}`; sending to Hindsight happens after the answer, one retain in flight per session with a bounded, persisted backlog of windows behind it (a loss is logged `RETAIN_DROPPED` in the activity log and never sent to another bank; see [architecture](architecture.md#memory)) |
 | `/-/hook/reset` | `{sessionId}` → `200 {ok: true}` |
-| `/-/mcp` | cc's forward: `{tool: "recall", arguments: {query}, caller: {sessionId, project}, format}` → always `200 {text}` or `{error, code}` (`NO_SESSION`, `SESSION_NOT_LIVE`, `SESSION_UNRESOLVED`, `NO_RECALL_SCOPE`, `HINDSIGHT_NOT_READY`, `RECALL_FAILED`, `BAD_REQUEST`; an unknown tool has no code). The banks searched are exactly what the scopes yield for `caller.sessionId` now; arguments cannot add one |
+| `/-/mcp` | cc's forward: `{tool: "recall", arguments: {query}, caller: {sessionId, project}, format}` → always `200 {text}` or `{error, code}` (`NO_SESSION`, `SESSION_NOT_LIVE`, `SESSION_UNRESOLVED`, `WORKSPACE_UNRESOLVED`, `NO_RECALL_SCOPE`, `HINDSIGHT_NOT_READY`, `RECALL_FAILED`, `BAD_REQUEST`; an unknown tool has no code). The banks searched are exactly what the scopes yield for `caller.sessionId` now; arguments cannot add one |
 
 ### Hook process (`claude/hooks/hook.mjs`)
 
@@ -172,6 +173,8 @@ Both published ports need a key except: API `/health*`, `/version`, `/metrics`, 
 | `GET $CONDUCTOR_URL/api/plugins/code-hindsight/status` (`autoStart`) | the Auto-start hint | hint omitted |
 | `POST $CONDUCTOR_URL/mcp/tools/describe_session` `{sessionId}` (`live.{project, worktree.worktreeName, playbook, stage}`) | placing a session for scope matching, on every hook or tool call (`DESCRIBE_TIMEOUT_MS`); kind is `conductor` iff `live.project` is `.conduct` | `SESSION_UNRESOLVED`; no `live` arm or `SESSION_UNKNOWN` → `SESSION_NOT_LIVE` |
 | `GET $CONDUCTOR_URL/api/playbooks`, `GET …/api/playbooks/<id>` (`stages` keys) | the stage suggestions in the Memory tab (cached `STAGES_TTL_MS`) | `error` string in `/-/api/memory/stages` |
+| `POST $CONDUCTOR_URL/mcp/tools/list_projects` `{}` (`projects[].{name, workspace: string\|null, degraded?}`) | workspace matching, only when a scope's outcome depends on it (one project → workspace index cached `WORKSPACES_TTL_MS`, never served older; a project missing from it is read again once; deadline `WORKSPACES_TIMEOUT_MS`; concurrent refreshes share one read); the project picker (deadline 5 s). `.conduct` is not listed and is in no workspace without asking. A `degraded` row's `workspace: null` means unknown | `WORKSPACE_UNRESOLVED` (also for a project missing from a fresh read or a `degraded` row); `error` string in `/-/api/memory/cc-projects` |
+| `POST $CONDUCTOR_URL/mcp/tools/list_workspaces` `{}` (`workspaces[].{name, projectCount}`) | the workspace picker (not cached) | `error` string in `/-/api/memory/cc-projects` |
 
 ## For clients of the Hindsight API
 

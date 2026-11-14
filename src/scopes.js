@@ -15,7 +15,7 @@ const GLOB_RE = /^[A-Za-z0-9._*?-]+$/;
 const STAGE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,59}$/;
 const LITERAL_RE = /^[a-z0-9._:-]*$/;
 const BANK_RE = /^[a-z0-9][a-z0-9._:-]{0,127}$/;
-const MATCH_KEYS = ['projects', 'sessions', 'stages'];
+const MATCH_KEYS = ['projects', 'workspaces', 'sessions', 'stages'];
 const SCOPE_KEYS = ['name', 'match', 'bank', 'actions'];
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -65,7 +65,9 @@ export function validateScopes(input) {
         if (new Set(v).size !== v.length) return err(f(`match.${key}`), 'duplicate entries');
         scope.match[key] = [...v];
       };
-      list('projects', (x) => x.length <= SCOPE_LIMITS.globMax && GLOB_RE.test(x), 'a glob of letters, digits . _ - * ?');
+      const glob = (x) => x.length <= SCOPE_LIMITS.globMax && GLOB_RE.test(x);
+      list('projects', glob, 'a glob of letters, digits . _ - * ?');
+      list('workspaces', glob, 'a glob of letters, digits . _ - * ?');
       list('sessions', (x) => SESSION_KINDS.includes(x), `one of ${SESSION_KINDS.join(', ')}`);
       list('stages', (x) => STAGE_RE.test(x), 'a stage name');
     }
@@ -108,28 +110,51 @@ export function globMatches(glob, text) {
   return g === glob.length;
 }
 
-/** Whether a scope's matcher accepts a session. An absent key matches anything. */
+/**
+ * Whether a scope's matcher accepts a session: `sessions` AND `stages` AND (`projects` OR
+ * `workspaces`); an absent key matches anything. `'unresolved'` when the answer depends on the
+ * session's cc workspace and that could not be looked up (`session.workspaceError`).
+ * `session.workspace` is the project's workspace (null: none); both are set only when looked up.
+ * @returns {'match'|'no'|'unresolved'}
+ */
 export function scopeMatches(scope, session) {
-  const { projects, sessions, stages } = scope.match;
-  if (projects && !projects.some((g) => globMatches(g, session.project ?? ''))) return false;
-  if (sessions && !sessions.includes(session.kind)) return false;
-  if (stages && !(session.stage && stages.includes(session.stage))) return false;
-  return true;
+  const { projects, workspaces, sessions, stages } = scope.match;
+  if (sessions && !sessions.includes(session.kind)) return 'no';
+  if (stages && !(session.stage && stages.includes(session.stage))) return 'no';
+  if (!projects && !workspaces) return 'match';
+  if (projects && projects.some((g) => globMatches(g, session.project ?? ''))) return 'match';
+  if (!workspaces) return 'no';
+  if (session.workspaceError) return 'unresolved';
+  return typeof session.workspace === 'string' && workspaces.some((g) => globMatches(g, session.workspace)) ? 'match' : 'no';
+}
+
+/** Whether some scope's outcome for this session depends on the session's cc workspace. */
+export function needsWorkspace(scopes, session) {
+  const unknown = { ...session, workspace: undefined, workspaceError: 'not looked up' };
+  return scopes.some((scope) => scopeMatches(scope, unknown) === 'unresolved');
 }
 
 /**
  * Recall: every matching scope that grants it, in order, banks de-duplicated and capped.
- * Retain: the first matching scope that grants it; a bank that fails to render leaves the
- * session without retain rather than falling through to a later scope.
- * @returns {{recall: {scope: string, bank: string}[], retain: {scope: string, bank: string}|null, skipped: {scope: string, code: string, detail: string}[]}}
+ * Retain: the first matching scope that grants it; a bank that fails to render, or a scope whose
+ * match could not be decided (`retainUnresolved`), leaves the session without retain rather than
+ * falling through to a later scope.
+ * @returns {{recall: {scope: string, bank: string}[], retain: {scope: string, bank: string}|null, retainUnresolved: boolean, skipped: {scope: string, code: string, detail: string}[]}}
  */
 export function matchScopes(scopes, session) {
   const recall = [];
   const skipped = [];
   let retain = null;
   let retainDecided = false;
+  let retainUnresolved = false;
   for (const scope of scopes) {
-    if (!scopeMatches(scope, session)) continue;
+    const outcome = scopeMatches(scope, session);
+    if (outcome === 'no') continue;
+    if (outcome === 'unresolved') {
+      skipped.push({ scope: scope.name, code: 'WORKSPACE_UNRESOLVED', detail: session.workspaceError });
+      if (scope.actions.includes('retain') && !retainDecided) { retainDecided = true; retainUnresolved = true; }
+      continue;
+    }
     const rendered = renderBank(scope.bank, session);
     if (rendered.error) skipped.push({ scope: scope.name, code: 'BANK_RENDER_FAILED', detail: rendered.error });
     if (scope.actions.includes('recall') && rendered.bank && !recall.some((r) => r.bank === rendered.bank) && recall.length < SCOPE_LIMITS.recallMaxBanks) {
@@ -140,7 +165,7 @@ export function matchScopes(scopes, session) {
       if (rendered.bank) retain = { scope: scope.name, bank: rendered.bank };
     }
   }
-  return { recall, retain, skipped };
+  return { recall, retain, retainUnresolved, skipped };
 }
 
 /** scopes.json (0600) in the data dir; read once, written whole. */

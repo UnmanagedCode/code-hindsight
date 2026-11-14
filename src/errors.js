@@ -165,6 +165,11 @@ export const CATALOG = Object.freeze({
     message: (p) => `cc has no live session ${s(p.sessionId)}; memory is only served to live sessions.`,
     action: null, status: 403,
   },
+  WORKSPACE_UNRESOLVED: {
+    title: 'A workspace could not be looked up',
+    message: (p) => `${p.scope ? `Scope ${s(p.scope)}: ` : ''}cc could not say which workspace this session's project is in (${s(p.detail)}); ${p.scope ? 'the scope was' : 'scopes that depend on it were'} not applied to this call.`,
+    action: null, status: 502,
+  },
   NO_RECALL_SCOPE: { title: 'No scope allows recall', message: () => 'No memory scope grants recall to this session (project, kind and stage are matched against Memory → scopes).', action: null, status: 403 },
   HINDSIGHT_NOT_READY: { title: 'Hindsight is not ready', message: () => 'Hindsight is not running, so this turn has no memory. Open Status to start it.', action: ACTIONS.start, status: 503 },
   RECALL_FAILED: { title: 'Recall failed', message: (p) => `Recall from bank ${s(p.bank)} failed: ${s(p.detail)}`, action: null, status: 502 },

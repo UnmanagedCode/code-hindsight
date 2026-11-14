@@ -110,6 +110,15 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
     ['GET', '/-/api/memory/stages', async () => {
       try { return { stages: await cc.fetchStages(), error: null }; } catch (e) { return { stages: [], error: e?.message ?? String(e) }; }
     }],
+    ['GET', '/-/api/memory/cc-projects', async () => {
+      const [projects, workspaces] = await Promise.allSettled([cc.listProjects(), cc.listWorkspaces()]);
+      const failed = [projects, workspaces].find((r) => r.status === 'rejected');
+      return {
+        projects: projects.status === 'fulfilled' ? projects.value : [],
+        workspaces: workspaces.status === 'fulfilled' ? workspaces.value : [],
+        error: failed ? (failed.reason?.message ?? String(failed.reason)) : null,
+      };
+    }],
     ['GET', '/-/api/cc-backends', async () => ({ backends: summarizeCcBackends(await fetchCcModels()) })],
     ['POST', '/-/api/start', async () => { supervisor.ensureRunning(); return status(false); }],
     ['POST', '/-/api/restart', async () => { supervisor.restart(); return status(false); }],

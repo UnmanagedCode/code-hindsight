@@ -3,16 +3,23 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Memory } from './Memory';
 import { stubFetch, status } from '@/test/fixtures';
-import type { ActivityEntry, Scope } from '@/lib/types';
+import type { ActivityEntry, CcProjectsView, Scope } from '@/lib/types';
 
 const choices = { actions: ['recall', 'retain'], kinds: ['conductor', 'worker'], placeholders: ['project', 'worktree', 'kind'], limits: { maxScopes: 50, nameMax: 60, templateMax: 100 } };
 const scope = (name: string, over: Partial<Scope> = {}): Scope => ({ name, match: {}, bank: 'cc-{project}', actions: ['recall', 'retain'], ...over });
 
-function stub({ scopes = [] as Scope[], stages = { stages: [{ name: 'plan', playbooks: ['solo'] }, { name: 'implement', playbooks: ['relay'] }], error: null as string | null }, activity = [] as ActivityEntry[], put }: { scopes?: Scope[]; stages?: { stages: { name: string; playbooks: string[] }[]; error: string | null }; activity?: ActivityEntry[]; put?: (body: { scopes: Scope[] }) => { status?: number; body: unknown } } = {}) {
+const ccLists: CcProjectsView = {
+  projects: [{ name: 'code-hindsight', workspace: 'CC-Dev' }, { name: 'code-wiki', workspace: 'CC-Dev' }, { name: 'notes', workspace: null }],
+  workspaces: [{ name: 'CC-Dev', projectCount: 2 }, { name: 'HOME', projectCount: 0 }],
+  error: null,
+};
+
+function stub({ scopes = [] as Scope[], stages = { stages: [{ name: 'plan', playbooks: ['solo'] }, { name: 'implement', playbooks: ['relay'] }], error: null as string | null }, ccProjects = ccLists as CcProjectsView | null, activity = [] as ActivityEntry[], put }: { scopes?: Scope[]; stages?: { stages: { name: string; playbooks: string[] }[]; error: string | null }; ccProjects?: CcProjectsView | null; activity?: ActivityEntry[]; put?: (body: { scopes: Scope[] }) => { status?: number; body: unknown } } = {}) {
   return stubFetch((url, init) => {
     if (url === '-/api/scopes' && !init) return { body: { scopes, choices } };
     if (url === '-/api/scopes' && init?.method === 'PUT') return put ? put(JSON.parse(String(init.body))) : { body: { scopes: JSON.parse(String(init.body)).scopes } };
     if (url === '-/api/memory/stages') return { body: stages };
+    if (url === '-/api/memory/cc-projects') return ccProjects ? { body: ccProjects } : { status: 502, body: { code: 'INTERNAL', message: 'down' } };
     if (url === '-/api/memory/activity') return { body: { entries: activity } };
     if (url === '-/api/memory/preview-bank') return { body: { bank: 'cc-example' } };
     return undefined;
@@ -122,5 +129,74 @@ describe('Memory', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
     expect(putBody(calls).scopes[0].match.sessions).toEqual(['worker']);
+  });
+
+  it('adds a picked cc project as its exact name on a new line, keeps typed globs, and never adds it twice', async () => {
+    const calls = stub({ scopes: [scope('a')] });
+    render(<Memory status={status()} />);
+    await userEvent.type(await screen.findByLabelText(/Projects/), 'code-*');
+    await userEvent.click(screen.getByRole('button', { name: 'Pick projects from cc' }));
+    await userEvent.type(screen.getByLabelText('Search cc projects'), 'hind');
+    expect(screen.queryByRole('button', { name: 'Add project code-wiki' })).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'Add project code-hindsight' }));
+    expect((screen.getByRole('button', { name: 'Add project code-hindsight' }) as HTMLButtonElement).disabled).toBe(true);
+    await userEvent.clear(screen.getByLabelText('Search cc projects'));
+    await userEvent.type(screen.getByLabelText('Search cc projects'), 'no workspace');
+    expect(screen.getByRole('button', { name: 'Add project notes' })).toBeTruthy();
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    expect(putBody(calls).scopes[0].match.projects).toEqual(['code-*', 'code-hindsight']);
+  });
+
+  it('saves a workspace picked from cc and a typed workspace glob; a scope with none sends no workspaces key', async () => {
+    const calls = stub({ scopes: [scope('a'), scope('b')] });
+    render(<Memory status={status()} />);
+    const first = within(await waitFor(() => { const el = document.querySelector('[data-scope="0"]'); if (!el) throw new Error('no scope'); return el as HTMLElement; }));
+    await userEvent.click(first.getByRole('button', { name: 'Pick workspaces from cc' }));
+    expect(first.getByRole('button', { name: 'Add workspace HOME' })).toBeTruthy();
+    await userEvent.click(first.getByRole('button', { name: 'Add workspace CC-Dev' }));
+    await userEvent.type(first.getByLabelText(/Workspaces/), 'TT*{Enter}');
+    expect(document.querySelector('[data-workspace="TT*"]')!.textContent).not.toMatch(/unknown to cc/);
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    const [a, b] = putBody(calls).scopes;
+    expect(a.match.workspaces).toEqual(['CC-Dev', 'TT*']);
+    expect(b.match).not.toHaveProperty('workspaces');
+  });
+
+  it('flags a literal workspace cc does not list, and shows a workspaces refusal against its field', async () => {
+    stub({
+      scopes: [scope('a', { match: { workspaces: ['Gone'] } })],
+      put: () => ({ status: 400, body: { code: 'SCOPES_INVALID', message: 'x', params: { fields: [{ field: 'scopes[0].match.workspaces', message: '"a/b" is not a glob' }] } } }),
+    });
+    render(<Memory status={status()} />);
+    await waitFor(() => expect(document.querySelector('[data-workspace="Gone"]')?.textContent).toMatch(/unknown to cc/));
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    const alert = await waitFor(() => { const el = document.querySelector('[data-field-error="scopes[0].match.workspaces"]'); if (!el) throw new Error('no alert'); return el; });
+    expect(alert.getAttribute('role')).toBe('alert');
+  });
+
+  it('without cc\'s lists there are no pickers, typed projects and workspaces still save', async () => {
+    const calls = stub({ scopes: [scope('a')], ccProjects: null });
+    render(<Memory status={status()} />);
+    expect(await screen.findByText(/project and workspace lists could not be read/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /from cc/ })).toBeNull();
+    await userEvent.type(screen.getByLabelText(/Projects/), 'proj');
+    await userEvent.type(screen.getByLabelText(/Workspaces/), 'CC-Dev{Enter}');
+    expect(document.querySelector('[data-workspace="CC-Dev"]')!.textContent).not.toMatch(/unknown to cc/);
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    expect(putBody(calls).scopes[0].match).toEqual({ projects: ['proj'], workspaces: ['CC-Dev'] });
+  });
+
+  it('renders hostile cc project and workspace names as text, creating no element', async () => {
+    const hostile = '<img src=x onerror=alert(1)>';
+    stub({ scopes: [scope('a')], ccProjects: { projects: [{ name: hostile, workspace: hostile }], workspaces: [{ name: hostile, projectCount: 1 }], error: null } });
+    render(<Memory status={status()} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Pick projects from cc' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Pick workspaces from cc' }));
+    expect(screen.getByRole('button', { name: `Add project ${hostile}` }).textContent).toContain(hostile);
+    expect(screen.getByRole('button', { name: `Add workspace ${hostile}` }).textContent).toContain(hostile);
+    expect(document.querySelector('img')).toBeNull();
   });
 });

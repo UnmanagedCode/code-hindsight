@@ -1,13 +1,20 @@
-// A fake cc for the memory tests: `describe_session` answers programmable per call, and
-// `/api/playbooks[/:id]` serves the given playbooks. Every request is logged.
+// A fake cc for the memory tests: `describe_session` answers programmable per call,
+// `/api/playbooks[/:id]` serves the given playbooks, and `list_projects` / `list_workspaces`
+// serve programmable rows (or fail on demand). Every request is logged.
 import http from 'node:http';
 
 /**
  * @param {import('node:test').TestContext} t
- * @param {{playbooks?: Record<string, string[]>}} [o] playbook id → stage names
+ * @param {{playbooks?: Record<string, string[]>, projects?: {name: string, workspace: string|null, degraded?: string}[]}} [o] playbook id → stage names; list_projects rows
  */
-export async function startFakeCc(t, { playbooks = { solo: ['plan', 'review'], relay: ['plan', 'implement', 'review', 'refine'] } } = {}) {
+export async function startFakeCc(t, { playbooks = { solo: ['plan', 'review'], relay: ['plan', 'implement', 'review', 'refine'] }, projects = [{ name: 'proj', workspace: 'WS' }] } = {}) {
   const calls = [];
+  let projectRows = projects;
+  let workspaceRows = [{ name: 'WS', projectCount: 1 }];
+  /** null, an HTTP status, 'hang' (never answers) or 'bad-shape'. */
+  let projectsFailure = null;
+  /** null or an HTTP status for list_workspaces to answer. */
+  let workspacesFailure = null;
   /** sessionId → answers, consumed in order (the last repeats). An answer is a `live` object, 'retired' or a raw body. */
   const sessions = new Map();
   const server = http.createServer(async (req, res) => {
@@ -26,6 +33,13 @@ export async function startFakeCc(t, { playbooks = { solo: ['plan', 'review'], r
       if (answer.ok === false) return send(200, answer);
       return send(200, { sessionId: body.sessionId, live: answer });
     }
+    if (req.url === '/mcp/tools/list_projects') {
+      if (projectsFailure === 'hang') return undefined;
+      if (projectsFailure === 'bad-shape') return send(200, { projects: [{ name: 'proj', workspace: 7 }] });
+      if (projectsFailure) return send(projectsFailure, { ok: false, code: 'INTERNAL' });
+      return send(200, { projects: projectRows.map((p) => ({ path: `/x/${p.name}`, liveCount: 0, ...p })) });
+    }
+    if (req.url === '/mcp/tools/list_workspaces') return workspacesFailure ? send(workspacesFailure, { ok: false, code: 'INTERNAL' }) : send(200, { workspaces: workspaceRows });
     if (req.url === '/api/playbooks') return send(200, { playbooks: Object.keys(playbooks).map((id) => ({ id })) });
     const m = /^\/api\/playbooks\/([^/]+)$/.exec(req.url);
     if (m && playbooks[m[1]]) return send(200, { id: m[1], stages: Object.fromEntries(playbooks[m[1]].map((s) => [s, {}])) });
@@ -37,6 +51,14 @@ export async function startFakeCc(t, { playbooks = { solo: ['plan', 'review'], r
     url: `http://127.0.0.1:${server.address().port}`,
     calls,
     describeCalls: () => calls.filter((c) => c.url === '/mcp/tools/describe_session').length,
+    listProjectsCalls: () => calls.filter((c) => c.url === '/mcp/tools/list_projects').length,
+    /** Replace the list_projects rows (a row may carry `degraded`). */
+    setProjects(list) { projectRows = list; },
+    setWorkspaces(list) { workspaceRows = list; },
+    /** Make list_projects fail: an HTTP status, 'hang', 'bad-shape'; null to answer again. */
+    failProjects(how) { projectsFailure = how; },
+    /** Make list_workspaces answer this HTTP status; null to answer again. */
+    failWorkspaces(status) { workspacesFailure = status; },
     /** Program a session: answers are consumed per call, the last repeats. */
     session(id, ...answers) { sessions.set(id, answers); },
   };

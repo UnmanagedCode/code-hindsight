@@ -103,7 +103,7 @@ export interface CcBackend {
 /** A memory scope as the backend stores it (docs/protocol.md → /-/api/scopes). An absent match key matches anything. */
 export interface Scope {
   name: string;
-  match: { projects?: string[]; sessions?: ('conductor' | 'worker')[]; stages?: string[] };
+  match: { projects?: string[]; workspaces?: string[]; sessions?: ('conductor' | 'worker')[]; stages?: string[] };
   bank: string;
   actions: ('recall' | 'retain')[];
 }
@@ -114,6 +114,13 @@ export interface ScopesView {
 }
 
 export interface StagesView { stages: { name: string; playbooks: string[] }[]; error: string | null }
+
+/** cc's projects (with the workspace each is in; null: none) and workspaces, for the scope pickers. */
+export interface CcProjectsView {
+  projects: { name: string; workspace: string | null }[];
+  workspaces: { name: string; projectCount: number }[];
+  error: string | null;
+}
 
 /** One memory activity entry; never holds prompt or memory text. */
 export interface ActivityEntry {
