@@ -9,7 +9,7 @@ import type { BackfillScan, BackfillSession } from '@/lib/types';
 const row = (key: string, over: Partial<BackfillSession> = {}): BackfillSession => ({
   key, handle: key.split(':')[0], backingId: key.split(':')[1], project: 'proj', worktree: 'main', kind: 'worker', stage: 'implement', title: `Session ${key}`,
   firstAt: '2026-01-01T00:00:00.000Z', lastAt: '2026-01-02T00:00:00.000Z', turns: 10, documents: 1, chars: 3000, bank: 'cc-proj', scope: 'all',
-  status: 'ready', cutoffAt: null, untimed: 0, malformed: 0, oversized: 0, estimate: { chunks: 1, inputTokens: 1000, outputTokens: 500 }, ...over,
+  status: 'ready', cutoffAt: null, untimed: 0, malformed: 0, oversized: 0, stored: 0, outdated: 0, orphans: 0, estimate: { chunks: 1, inputTokens: 1000, outputTokens: 500 }, ...over,
 });
 
 const scanOf = (sessions: BackfillSession[], over: Partial<BackfillScan> = {}): BackfillScan => ({
@@ -23,7 +23,7 @@ const scanOf = (sessions: BackfillSession[], over: Partial<BackfillScan> = {}): 
 
 const standard = () => scanOf([
   row('h1:b1'),
-  row('h2:b2', { estimate: { chunks: 2, inputTokens: 2000, outputTokens: 1000 }, cutoffAt: '2026-01-01T12:00:00.000Z' }),
+  row('h2:b2', { estimate: { chunks: 2, inputTokens: 2000, outputTokens: 1000 }, cutoffAt: '2026-01-01T12:00:00.000Z', outdated: 1, orphans: 2 }),
   row('h3:b3', { bank: 'cc-other', project: 'other', estimate: { chunks: 4, inputTokens: 4000, outputTokens: 2000 } }),
   row('h4:b4', { bank: 'cc-other', project: 'other', status: 'imported' }),
 ]);
@@ -70,6 +70,8 @@ describe('Backfill', () => {
     expect([box('h4:b4').checked, box('h4:b4').disabled]).toEqual([false, true]);
     expect(within(other).getByText('already imported')).toBeTruthy();
     expect(within(proj).getByText(/only before 2026-01-01 12:00:00Z/)).toBeTruthy();
+    // A5: a session whose stored parts no longer match is offered again, saying what the import changes.
+    expect(within(proj).getByText(/replaces 1 outdated stored parts · deletes 2 stored parts no longer needed/)).toBeTruthy();
     expect((within(proj).getAllByRole('checkbox')[0] as HTMLInputElement).checked).toBe(true);
     expect(within(document.querySelector('[data-skip-code="BACKFILL_UNPLACEABLE"]') as HTMLElement).getByText(/1 × BACKFILL_UNPLACEABLE: cc has no project/)).toBeTruthy();
   });

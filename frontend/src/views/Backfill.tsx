@@ -152,6 +152,8 @@ export function Backfill({ status }: { status: Status }) {
                           <span className="text-xs text-muted-foreground">
                             {[r.project, r.worktree, r.stage].filter(Boolean).join(' · ')} · {day(r.firstAt)} – {day(r.lastAt)} · {num(r.turns)} turns
                             {r.cutoffAt && <> · only before {r.cutoffAt.replace('T', ' ').replace(/\.\d+Z$/, 'Z')}</>}
+                            {r.outdated > 0 && <> · replaces {r.outdated} outdated stored parts</>}
+                            {r.orphans > 0 && <> · deletes {r.orphans} stored parts no longer needed</>}
                           </span>
                           {r.status === 'imported' && <Badge variant="secondary">already imported</Badge>}
                         </label>

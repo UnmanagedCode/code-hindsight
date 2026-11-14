@@ -150,6 +150,12 @@ export interface BackfillSession {
   untimed: number;
   malformed: number;
   oversized: number;
+  /** Parts the bank already holds with exactly this content. */
+  stored: number;
+  /** Parts the bank holds with other content (an import replaces them). */
+  outdated: number;
+  /** Stored parts numbered past this plan (an import deletes them). */
+  orphans: number;
   estimate: BackfillEstimate;
 }
 
@@ -180,7 +186,7 @@ export interface BackfillScan {
 
 export interface BackfillImportResult {
   sessions: number;
-  documents: { sent: number; alreadyImported: number; queued: number; retried: number };
+  documents: { sent: number; replaced: number; alreadyImported: number; queued: number; retried: number; deleted: number };
   failed: { key: string; code: string; message: string }[];
   skipped: { key: string; code: string; message: string }[];
   banks: string[];

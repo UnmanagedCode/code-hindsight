@@ -129,7 +129,7 @@ function Activity() {
     <Card>
       <CardHeader>
         <CardTitle>Activity</CardTitle>
-        <CardDescription>Recent recalls and retains, newest first. Entries name sessions, projects, stages and banks; they never hold prompt or memory text.</CardDescription>
+        <CardDescription>Recent recalls, retains and past-session scans and imports, newest first. Entries name sessions, projects, stages and banks; they never hold prompt or memory text.</CardDescription>
       </CardHeader>
       <CardContent>
         {entries === null ? <p className="text-sm text-muted-foreground">Loading…</p>
