@@ -30,17 +30,19 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 | GET | `/-/api/scopes` | `{scopes, choices: {actions, kinds, placeholders, limits}}` |
 | PUT | `/-/api/scopes` | `{scopes}` — the whole list, validated by `validateScopes` (`src/scopes.js`) and stored in `scopes.json`; `400 SCOPES_INVALID` with `params.fields: [{field: "scopes[i].…", message}]` changes nothing. Answers `{scopes}` |
 | POST | `/-/api/memory/preview-bank` | `{template, sample?: {project, worktree, kind}}` → `{bank}` or `{error}` (the same renderer as recall and retain) |
-| GET | `/-/api/memory/activity` | `{entries}` newest first; entry `{at, event: recall\|retain\|mcp-recall, outcome: ok\|error\|skipped, sessionId?, project?, worktree?, stage?, kind?, banks?, count?, code?, message?}` |
+| GET | `/-/api/memory/activity` | `{entries}` newest first; entry `{at, event: recall\|retain\|mcp-recall\|backfill-scan\|backfill-import, outcome: ok\|error\|skipped, sessionId?, project?, worktree?, stage?, kind?, banks?, count?, code?, message?}`. A backfill job adds one summary entry (`count`: sessions ready or imported; `banks`; `message`: the counts; a stopped import is `error` with its `code`), plus one `error` entry per session Hindsight refused |
+| GET | `/-/api/memory/backfill` | `{scan: <the latest backfill scan> \| null}` — held in memory, so `null` after a backend restart ([Backfill](#backfill)) |
 | GET | `/-/api/memory/stages` | `{stages: [{name, playbooks: [id]}], error}` — stage names across cc's playbooks; `error` is a string when cc could not be read |
 | GET | `/-/api/memory/cc-projects` | `{projects: [{name, workspace: string\|null}], workspaces: [{name, projectCount}], error}` — cc's projects (with the workspace each is in) and workspaces, both by name, for the scope pickers. Always 200: a list that could not be read is `[]` and `error` is the first failure's message (else `null`) |
 | GET | `/-/api/cc-backends` | `{backends: [{id, label, host, usable, refusal, models: [{model, label}]}]}` — never a token |
 | POST | `/-/api/start` | start / reconcile to the saved settings; answers status at once |
 | POST | `/-/api/restart` | stop, then start; answers status at once |
 | POST | `/-/api/stop` | stop the containers (kept); answers status when stopped |
-| POST | `/-/api/jobs/<kind>` | start a job (below); answers the job (`state: "running"`); `409 BUSY` while another runs |
+| POST | `/-/api/jobs/<kind>` | start a job (below); answers the job (`state: "running"`); `409 BUSY` while another job of any kind runs |
+| POST | `/-/api/jobs/<id>/cancel` | `{}` → the job; asks a running, cancellable job to stop (it ends `cancelled`). `404 NOT_FOUND`; `409 JOB_NOT_CANCELLABLE` for a Docker job or one that has ended |
 | POST | `/-/api/jobs/import` (`application/octet-stream`) | the body is streamed into `docker load`; answers the finished job |
 | GET | `/-/api/jobs` | `{jobs: [...]}` (most recent first, no tails) |
-| GET | `/-/api/jobs/<id>` | `{id, kind, state: running\|done\|failed, startedAt, endedAt, result, error, tail}` |
+| GET | `/-/api/jobs/<id>` | `{id, kind, state: running\|done\|failed\|cancelled, startedAt, endedAt, result, error, progress: {done, total, unit} \| null, cancellable, tail}` — `progress` and `cancellable` are set by the backfill jobs; Docker jobs report `null` and `false` |
 | GET | `/-/api/logs/<api\|cp>` | `{role, log}` — last 200 lines of the container's log |
 | GET | `/-/api/bundles/<name>` | the bundle file (`application/x-tar`, attachment); only names the plugin wrote into its bundle dir |
 
@@ -57,10 +59,46 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 | `export` | `{variant}` | `{name, path, size, sha256, images: [{ref, id}]}` |
 | `remove-images` | `{confirm: true}` | `{removed: [refs]}` (the pinned API refs and `CP_IMAGE` that were present) |
 | `delete-volume` | `{confirm: "<volume name>"}` | `{removed: "<volume name>" \| null}` (`null` when there was no volume) |
+| `backfill-scan` | `{fresh?: boolean}` | `{scanId, totals, hindsightChecked}`; the full scan is `GET /-/api/memory/backfill`. Refused `BACKFILL_NO_SCOPES` (no scope grants retain), `BACKFILL_CC_UNAVAILABLE` (no `CONDUCTOR_URL`), `SCOPES_INVALID`; fails `BACKFILL_CC_UNAVAILABLE` after `BACKFILL_LIMITS.ccFailuresMax` consecutive cc failures |
+| `backfill-import` | `{scanId, sessions: [key], confirm: true}` (body up to `BACKFILL_LIMITS.selectionMaxBytes`) | `{sessions, documents: {sent, alreadyImported, queued, retried}, failed: [{key, code, message}], skipped: [{key, code, message}], banks}`. Refused `CONFIRMATION_REQUIRED` (`params.expected: "confirm: true"`), `BACKFILL_STALE` (not the latest scan, or the saved scopes changed since), `BAD_REQUEST` (an empty list, or a key that is not a `ready` row of that scan), `HINDSIGHT_NOT_READY` |
 
 - `remove-images` and `delete-volume` refuse `CONFIRMATION_REQUIRED` without their confirmation and fail `CONTAINERS_RUNNING` while a container of this plugin runs. `trust-cp` refuses `CONFIRMATION_REQUIRED` (with `params.expected` = the current ID) when the ID does not match.
 - `build-cp` inspects `BUILD_HELPER.ref` (a digest reference), pulls it when missing, fails `HELPER_UNTRUSTED` unless its ID is in `BUILD_HELPER.ids`, then runs `docker run --rm --name <prefix>-build -v /var/run/docker.sock:/var/run/docker.sock <helper ID> docker buildx build <repo>#<UPSTREAM_REVISION> …` (`buildCpCommand` in `src/jobs.js`) and records the built image's ID as trusted.
-- After a successful `pull`, `build-cp`, `import` or `trust-cp`, Hindsight starts if it was asked to run and is in `error`; other jobs only re-read images and containers.
+- After a successful `pull`, `build-cp`, `import` or `trust-cp`, Hindsight starts if it was asked to run and is in `error`; the other Docker jobs only re-read images and containers. The backfill jobs never resolve docker and never touch Hindsight's lifecycle.
+- One job runs at a time across all kinds. `backfill-scan` and `backfill-import` are cancellable: they stop at their next file, document or request.
+
+### Backfill
+
+**Scan view** (`GET /-/api/memory/backfill`):
+
+```
+{scanId, scannedAt, scopesHash, hindsightChecked, llm: {mode, model|null}, basis: BACKFILL_ESTIMATE,
+ totals: {files, ready, imported, skipped, cached, resolved, estimate: {chunks, inputTokens, outputTokens}},
+ sessions: [{key: "<handle>:<backingId>", handle, backingId, project, worktree, kind, stage|null, title|null,
+             firstAt, lastAt, turns, documents, chars, bank, scope, status: ready|imported,
+             cutoffAt|null, untimed, malformed, oversized, estimate: {chunks, inputTokens, outputTokens}}],
+ skipped: [{key, handle|null, backingId, project?, worktree?, stage?, code, message}]}
+```
+
+- `scopesHash`: SHA-256 of the saved scopes' JSON at scan time; an import against another hash is `BACKFILL_STALE`.
+- `hindsightChecked: false`: Hindsight was not ready (or failed mid-scan), so live overlap and earlier imports were not checked for the rest.
+- `totals.estimate` sums the `ready` rows. `cutoffAt` is live memory's first turn time; `turns`, `documents`, `chars` and `estimate` then count only the earlier turns, and `untimed` the turns left out for want of a timestamp.
+- `estimate` per document of `chars` characters (`estimateDocument`, `src/backfill.js`): `chunks = ceil(chars / chunkChars)`; `inputTokens = ceil(chars / charsPerToken) + chunks × promptTokensPerChunk`; `outputTokens = chunks × outputTokensPerChunk`; LLM mode `none`: both token counts 0.
+- Skip codes and their meaning: [features → Import past sessions](features.md#import-past-sessions).
+
+**Placement** (`placeTranscript`, `src/ccSession.js`), for each top-level regular file `<id>.jsonl` (`id` a cc session id) in each directory of the transcripts root; symlinks and subdirectories are ignored:
+
+1. `describe_session {sessionId: <backing id>}`: `{ok: false, code: "SESSION_NOT_A_HANDLE", handle}` → describe `handle` (once per handle per scan); a row → that row, its `sessionId` the handle; `SESSION_UNLOCATABLE` / `SESSION_UNKNOWN` → `BACKFILL_UNPLACEABLE` (cached); no answer, an HTTP error or another shape → `BACKFILL_UNPLACEABLE` "cc did not answer" (not cached). Deadline `BACKFILL_LIMITS.describeTimeoutMs`.
+2. A `live` row → `SESSION_LIVE` (not cached). A `retired` row → session `{sessionId: handle, project, worktree: worktree ?? "main", kind: conductor iff project is .conduct, stage: retired.stage, playbook: retired.playbook}`, display title `retired.title`. No other source (no in-file `cwd`, no directory name).
+3. Scopes as for live retain (`withWorkspace`, `matchScopes(...).retain`).
+
+**Overlap** per handle, at scan and again at import: a cursor entry with `inflight` or a non-empty `pending` (read with `peek`) → `LIVE_RETAIN_PENDING`. Then `GET …/documents/cc-session:<handle>` in every bank a retain scope's template renders for the session (matching or not): the earliest parseable `timestamp` of its `original_text` lines is the cutoff (the earliest across banks); `original_text` null or no timestamp → `LIVE_OVERLAP_UNKNOWN`. Only turns stamped strictly before the cutoff are imported.
+
+**Documents:** one segment file's turns (the same reader rules as live retain) are split at turn boundaries into parts of at most `BACKFILL_LIMITS.documentMaxChars` rendered characters (a longer single turn is a part of its own). Part `n` (from 1) is document `cc-backfill:<handle>:<backingId>:p<n>`, retained with `update_mode: "replace"` and `operation_id = operationIdFor(bank, documentId, first turn id, last turn id)`. Per part, in order: the document exists → `alreadyImported`; else operation status `failed`/`cancelled` → retry (`retried`); `pending`/`processing`/`completed` → `queued`; not found → retain (`sent`). Sessions are sent one request at a time, in scan order. A `RETAIN_FAILED` with an HTTP 4xx `params.status` fails that session; any other failure stops the job.
+
+### Transcripts root
+
+`$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` (Claude Code's own rule; `claudeProjectsDir` in `src/config.js`). Read only by `backfill-scan` and `backfill-import`.
 
 ### Image trust (`src/trust.js`)
 
@@ -104,6 +142,9 @@ Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP f
 | recall | `POST /v1/default/banks/<bank>/memories/recall` `{query, budget, max_tokens}` (`RECALL_BUDGET`, `RECALL_MAX_TOKENS`); **no `types` filter** (LLM none stores `world` chunks); `404` (bank never created) is an empty result |
 | retain | `POST /v1/default/banks/<bank>/memories` `{items: [{content, document_id: "cc-session:<id>", update_mode: "append", timestamp, context, metadata}], async: true, operation_id}`; creates a missing bank, and an append onto a missing document stores the content as a new document. `content` is JSONL, one `{role, content, timestamp}` per turn. `metadata`: `source`, `ccSessionId`, `project`, `worktree`, `kind`, `stage` (omitted without one) |
 | `operation_id` | `operationIdFor` (`src/retainCursor.js`): a v4-shaped UUID from the SHA-256 of `bank`, document id, first and last turn id, so a resend of a batch repeats it and Hindsight returns the original operation |
+| backfill retain | as retain, but `document_id: "cc-backfill:<handle>:<backingId>:p<n>"`, `update_mode: "replace"`, `timestamp` = the part's first parseable turn timestamp (else the file's mtime), context suffixed "Imported from the session's saved transcript after it ended.", `metadata` adds `origin: "backfill"`, `segment: <backingId>`, `part: "<n>"` (every value a string) |
+| document | `GET /v1/default/banks/<bank>/documents/<document id>` → `original_text`; `404` = none (backfill: earlier imports and live overlap) |
+| operation | `GET /v1/default/banks/<bank>/operations/<operation id>` → `status: pending\|processing\|completed\|failed\|cancelled\|not_found`; `404` = not found. `POST …/operations/<operation id>/retry` re-runs a failed one (backfill only) |
 
 ## Hindsight states
 
@@ -119,6 +160,7 @@ Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP f
 | `shutdown-failed.json` (0600) | `{at, error}` when a SIGTERM could not start that stop; shown as `status.lastShutdownFailure` and removed when Hindsight is next ready |
 | `scopes.json` (0600) | `{scopes}`: the memory scopes; absent = memory off |
 | `memory/cursors.json` (0600) | per `CC_SESSION_ID`: `{lastId, lastTs, inflight?, pending, at}` — the last retained turn; the batch being sent (kept so a retry resends it unchanged); and `pending`, the windows of unsent turns `{bank \| null, session, lastId, lastTs}` in order, each with the bank its own stage chose. A Stop whose tail carries a timestamp more than `MEMORY_LIMITS.clockSkewMs` ahead of the backend's clock is refused and logged `RETAIN_FUTURE` (it would otherwise make later Stops look old). A Stop whose tail is provably older than the newest recorded end is ignored (best effort where nothing can be proven). An entry of the wrong shape is dropped (`CURSOR_INVALID`); a file unreadable as a whole is moved aside to `memory/cursors.json.corrupt`. Turn ids must be non-empty and at most `TURN_ID_MAX` characters (else `400`); entries older than `CURSOR_MAX_AGE_MS` are pruned on write. Losing it can duplicate turns |
+| `memory/backfill-placements.json` (0600) | `{version: 1, files: {"<dir>/<backingId>.jsonl": {size, mtimeMs, handle, outcome: placed\|unplaceable, session?, title?, detail?, summary?: {turns, parts: [chars], firstAt, lastAt, malformed, oversized}}}}` — what cc said about each transcript and its parse summary, used while the file's size and mtime are unchanged; cc's settled refusals are kept, live sessions and cc failures never. Entries of files gone are pruned after each scan; `fresh` rewrites it. Unreadable as a whole → moved aside to `memory/backfill-placements.json.corrupt` and rebuilt. Never holds transcript text |
 | `logs/memory.jsonl` (+ `.1`) | the activity log (rotated at `ACTIVITY_LIMITS.rotateBytes`) |
 | `trusted-cp.json` (0600) | `{id, source: build\|confirmed, at}`: the CP image ID allowed to run |
 | `run/` | short-lived `--env-file`s for `docker run`, removed after each run |
@@ -172,6 +214,7 @@ Both published ports need a key except: API `/health*`, `/version`, `/metrics`, 
 | `GET $CONDUCTOR_URL/api/settings/models` (`backends[].{id,label,env:[{key,value}]}`, `backendModels`) | the cc-backend link and its picker; a row whose `ANTHROPIC_BASE_URL` host is loopback (`isLoopbackHost` in `src/llmEnv.js`, over the WHATWG-normalized host; best-effort, literal addresses and `localhost`) is refused `CC_BACKEND_LOOPBACK` | `CC_UNREACHABLE` / `CC_ROUTE_CHANGED` |
 | `GET $CONDUCTOR_URL/api/plugins/code-hindsight/status` (`autoStart`) | the Auto-start hint | hint omitted |
 | `POST $CONDUCTOR_URL/mcp/tools/describe_session` `{sessionId}` (`live.{project, worktree.worktreeName, playbook, stage}`) | placing a session for scope matching, on every hook or tool call (`DESCRIBE_TIMEOUT_MS`); kind is `conductor` iff `live.project` is `.conduct` | `SESSION_UNRESOLVED`; no `live` arm or `SESSION_UNKNOWN` → `SESSION_NOT_LIVE` |
+| the same, with a transcript's backing id, then its handle (`SESSION_NOT_A_HANDLE.handle`; a retired row's `project`, `worktree`, `retired.{stage, playbook, title}`) | placing a saved transcript for the backfill scan ([Backfill](#backfill)); deadline `BACKFILL_LIMITS.describeTimeoutMs`, one call at a time | `SESSION_UNLOCATABLE` / `SESSION_UNKNOWN` → `BACKFILL_UNPLACEABLE`; no answer → the same, uncached; repeated → `BACKFILL_CC_UNAVAILABLE` |
 | `GET $CONDUCTOR_URL/api/playbooks`, `GET …/api/playbooks/<id>` (`stages` keys) | the stage suggestions in the Memory tab (cached `STAGES_TTL_MS`) | `error` string in `/-/api/memory/stages` |
 | `POST $CONDUCTOR_URL/mcp/tools/list_projects` `{}` (`projects[].{name, workspace: string\|null, degraded?}`) | workspace matching, only when a scope's outcome depends on it (one project → workspace index cached `WORKSPACES_TTL_MS`, never served older; a project missing from it is read again once; deadline `WORKSPACES_TIMEOUT_MS`; concurrent refreshes share one read); the project picker (deadline 5 s). `.conduct` is not listed and is in no workspace without asking. A `degraded` row's `workspace: null` means unknown | `WORKSPACE_UNRESOLVED` (also for a project missing from a fresh read or a `degraded` row); `error` string in `/-/api/memory/cc-projects` |
 | `POST $CONDUCTOR_URL/mcp/tools/list_workspaces` `{}` (`workspaces[].{name, projectCount}`) | the workspace picker (not cached) | `error` string in `/-/api/memory/cc-projects` |

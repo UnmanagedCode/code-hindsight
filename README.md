@@ -2,7 +2,7 @@
 
 A code-conductor (cc) plugin that runs [Hindsight](https://hindsight.vectorize.io), an agent memory server, in Docker on the cc host and shows Hindsight's control-plane UI inside cc at `/plugins/code-hindsight/`.
 
-It manages two containers (the Hindsight API with its embedded Postgres, and a control plane built for cc's mount path), keeps memories in a named Docker volume, works offline from exported image bundles, and reports every failure by name with the action that fixes it. It also gives cc sessions memory: Claude Code hooks recall from and retain into Hindsight banks chosen by user-configured scopes. Memory is off until a scope exists.
+It manages two containers (the Hindsight API with its embedded Postgres, and a control plane built for cc's mount path), keeps memories in a named Docker volume, works offline from exported image bundles, and reports every failure by name with the action that fixes it. It also gives cc sessions memory: Claude Code hooks recall from and retain into Hindsight banks chosen by user-configured scopes, and past sessions' saved transcripts can be imported on request (Memory → Import past sessions). Memory is off until a scope exists.
 
 ## Quick start
 
@@ -46,6 +46,7 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 - If `memory/cursors.json` is lost, turns already retained can be retained again.
 - `memory/cursors.json` is one file, rewritten synchronously on each Stop and each drain step, and it holds each session's unacknowledged batch. Hundreds of sessions blocked at once on large batches make it large, and writing it can slow concurrent recalls.
 - With LLM mode `none`, retain stores raw chunks without fact extraction.
+- Import past sessions: a backfilled session goes wholly to the bank its **last recorded stage** selects; a running session is imported only after it ends; sessions of projects cc no longer has registered are unplaceable (reported, never imported). The first scan asks cc about every transcript and can take many minutes (later scans reuse cached placements). With an LLM configured, an import's extraction queues in Hindsight ahead of later live retains. The token estimate is rough.
 - If Hindsight stays unavailable long enough that a session's backlog of unsent turns overflows, or the turns leave the transcript tail the hook sends, they are dropped (logged as `RETAIN_DROPPED`), never sent to another bank.
 - Inside the control plane, attachment links and images, the logo in the memory constellation and the favicon 404 (upstream builds those URLs without the base path).
 - The control plane is only usable through cc's mount (`/plugins/code-hindsight/`); its port alone has no UI session.

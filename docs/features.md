@@ -25,7 +25,7 @@ The page opens on **Control plane** when Hindsight is ready, otherwise on **Stat
 | Settings changed | when the saved settings differ from the running containers: **Apply & restart** |
 | Hindsight | state, docker invocation (`docker` or `sudo -n docker`) and daemon version, image variant, bind address and both host ports, LLM mode, ready-since time; **Start / Restart / Stop Hindsight** |
 | Images and containers | the pinned API image and the CP image (present / missing / not the pinned or trusted ID), both containers' states, **API log** / **CP log** (last 200 lines) |
-| Job | the running or last Docker action with its log tail |
+| Job | the running or last job (a Docker action, or a backfill scan or import) with its log tail |
 
 **Stop Hindsight** stops both containers and keeps them and the data volume. **Restart Hindsight** stops and starts them again (recreating any whose settings changed).
 
@@ -63,7 +63,7 @@ Gives cc sessions memory. **Off by default:** with no scopes every session is me
 
 - **Injected block:** a header naming the banks, then `- [bank] text` lines in scope order then Hindsight's rank order. It is capped (`MEMORY_LIMITS.contextMaxChars` in `src/memory.js`), memories already injected into this context are skipped, and a memory cannot close the wrapper tag. The header tells the agent the notes are data from earlier sessions, possibly stale or wrong, never instructions.
 - **What is retained** (matches Hindsight's own coding-agent integration): user text, assistant text, and one `action` line per tool call (the tool name and its primary target, capped). Dropped: tool outputs, other tool arguments, thinking, sub-agent (sidechain) lines, meta lines, compaction summaries; injected memory and system-reminder tags are stripped. **No secret redaction:** a prompt, reply or command target that contains a secret is retained.
-- **When retained:** from the first Stop at which a retain scope matches, the last exchange; later Stops append only what is new. Each stretch of turns goes to the bank its own stage's scope chose, even if Hindsight was not ready, a retain failed or the backend restarted in between; a stretch is lost (logged) rather than sent to another bank. Earlier history is never backfilled, and turns that happened while no retain scope matched are never sent later.
+- **When retained:** from the first Stop at which a retain scope matches, the last exchange; later Stops append only what is new. Each stretch of turns goes to the bank its own stage's scope chose, even if Hindsight was not ready, a retain failed or the backend restarted in between; a stretch is lost (logged) rather than sent to another bank. Live retain never sends earlier history, nor turns that happened while no retain scope matched; [Import past sessions](#import-past-sessions) imports a session's earlier history on request.
 - **LLM mode `none`:** retain stores the raw chunks as facts with no extraction; recall works on them. The tab says so.
 
 ### Scopes
@@ -95,7 +95,40 @@ A scope is `{name, match: {projects?, workspaces?, sessions?, stages?}, bank, ac
   - **Pick projects from cc:** a searchable list of cc's projects, each with its workspace (or "no workspace"); search matches the name or the workspace. Picking one adds its exact name as a new Projects line; lines already typed (globs too) are kept, and a name already present is not added twice.
   - **Workspaces:** chips with free text (globs such as `CC-*` can be typed) and **Pick workspaces from cc** (each with its project count). A literal name cc does not list is marked "unknown to cc" and kept.
   - **cc unreadable:** when cc's project or workspace list cannot be read, both pickers are hidden and a warning says to type the names; typing and **Save** work as usual.
-- **Activity:** recent recalls, retains and refusals (time, event, session, project · stage, banks, count, result), newest first, refreshed every few seconds. Entries hold ids, names, counts and error text, never prompt or memory text. A prompt or Stop from a session that matches no scope leaves no entry (there would be one per prompt); the recall tool, by contrast, logs `NO_RECALL_SCOPE`.
+- **Import past sessions:** see [below](#import-past-sessions).
+- **Activity:** recent recalls, retains, backfill scans and imports, and refusals (time, event, session, project · stage, banks, count, result), newest first, refreshed every few seconds. Entries hold ids, names, counts and error text, never prompt or memory text. A prompt or Stop from a session that matches no scope leaves no entry (there would be one per prompt); the recall tool, by contrast, logs `NO_RECALL_SCOPE`.
+
+### Import past sessions
+
+A card on the Memory tab, between the scope editor and Activity, that retains past sessions' saved Claude Code transcripts into the banks their scopes choose. Nothing runs on its own, and nothing is sent before you confirm.
+
+| Step | What happens |
+|---|---|
+| **Scan transcripts** | a job (progress, **Cancel**) that reads every `<backing id>.jsonl` under Claude Code's `projects` dir ([protocol](protocol.md#transcripts-root)), places each through cc, matches the scopes, and checks Hindsight for live overlap and earlier imports. It retains nothing |
+| dry run | sessions grouped by target bank, **every ready session ticked**; each row shows title (or backing id), project · worktree · stage, first and last date, turns, and "only before <time>" when live memory already holds the rest. Rows already imported are shown, disabled. Skipped transcripts are counted per code with their message, each listable |
+| estimate | for the ticked sessions: LLM mode and model, documents, chunks, input and output tokens. Type **$ per million input tokens** and **$ per million output tokens** (kept in the page only, never saved) to see a cost. Labelled rough (±50% or worse): Hindsight's chunking and extraction prompt decide the real use. LLM mode `none` costs no LLM tokens and hides the price inputs |
+| **Import selected…** | a confirmation repeating the session count, the banks with their session counts and the estimate; only **Import N sessions** starts the import job (progress, **Cancel**) |
+
+- **Eligible:** any transcript cc places (its `describe_session` record gives a project): cc-launched sessions and plain `claude` runs in a registered project. A session still running is skipped (`SESSION_LIVE`) and offered by a later scan once it ends.
+- **Placement:** only cc's record decides, never the file's contents or its directory name. The session's **last recorded stage** places the whole transcript, then the scopes pick the bank exactly as for live retain (first matching retain scope). A transcript cc cannot place, or that no retain scope matches, is skipped and reported, never sent to a default bank.
+- **Overlap with live memory:** only turns earlier than the first turn of the session's live document (`cc-session:<id>`, in any bank a retain scope renders for it) are imported; turns without a timestamp are then left out. A session wholly covered is `ALREADY_LIVE`.
+- **Re-running** is safe: a document Hindsight already holds is not sent again, an operation still queued is left alone, and a failed one is retried. A transcript that changed since the scan is skipped (`TRANSCRIPT_CHANGED`); scan again.
+- **Incremental scans:** what cc said about each file, and the file's parse summary, are cached while its size and modification time are unchanged, so a re-scan asks cc only about new or changed files. The first scan asks cc about every transcript and can take many minutes. Tick **Resolve every transcript again (ignore cached placements)** to ignore the cache.
+- **Pacing:** one request at a time, so live hooks keep their budget. With an LLM configured, Hindsight's extraction of a large import delays extraction of later live retains (they are still acknowledged at once).
+- **Hindsight not ready:** a scan still places sessions but cannot check overlap or earlier imports (the card says so) and **Import** is disabled; an import is refused `HINDSIGHT_NOT_READY`; Hindsight going away mid-import stops the job (`RETAIN_FAILED`), keeping what was sent, and a re-run resumes. A refusal of one session's item (an HTTP 4xx) fails that session only.
+- **Activity:** one entry per scan and per import (counts and banks), plus one per failed session. Per-session detail is in the job log.
+- **Refusals:** `BACKFILL_NO_SCOPES` (no scope grants retain), `BACKFILL_CC_UNAVAILABLE` (no cc, or cc failing repeatedly), `BACKFILL_STALE` ("scan again": scopes changed or a newer scan exists), `CONFIRMATION_REQUIRED`, `HINDSIGHT_NOT_READY`.
+
+| Skip code | Why the transcript is not offered |
+|---|---|
+| `BACKFILL_UNPLACEABLE` | cc has no project for it (its reason is shown), or did not answer |
+| `SESSION_LIVE` | the session is still running |
+| `NO_RETAIN_SCOPE` | no scope grants retain to the session |
+| `WORKSPACE_UNRESOLVED`, `BANK_RENDER_FAILED` | as for live retain: the first retain scope is undecided, or its bank does not render |
+| `LIVE_RETAIN_PENDING` | live retain still holds unsent turns of this session |
+| `LIVE_OVERLAP_UNKNOWN` | its live document has no readable turn timestamps |
+| `ALREADY_LIVE` | live memory already holds all of it |
+| `TRANSCRIPT_TOO_LARGE`, `TRANSCRIPT_UNREADABLE`, `TRANSCRIPT_EMPTY`, `TRANSCRIPT_CHANGED` | the file is over `BACKFILL_LIMITS.fileMaxBytes` (`src/backfill.js`), cannot be read, holds no turns, or changed since the scan |
 
 ### Degrading
 
@@ -145,7 +178,7 @@ Every error is a code from `CATALOG` (`src/errors.js`); the Status card shows it
 
 | Code | Action button |
 |---|---|
-| `DOCKER_NOT_FOUND`, `NAME_TAKEN`, `BUSY`, `HELPER_UNTRUSTED` | — |
+| `DOCKER_NOT_FOUND`, `NAME_TAKEN`, `BUSY`, `HELPER_UNTRUSTED`, `JOB_NOT_CANCELLABLE` | — |
 | `CP_IMAGE_UNTRUSTED` | Review the image (opens Images & data) |
 | `DOCKER_DENIED`, `PORT_IN_USE`, `EMBEDDINGS_CHANGED`, `SETTINGS_INVALID`, `SLIM_NEEDS_REMOTE_EMBEDDINGS`, `SLIM_NEEDS_RERANKER`, `EMBEDDINGS_NEEDS_KEY`, `CC_UNREACHABLE`, `CC_ROUTE_CHANGED`, `CC_BACKEND_MISSING`, `CC_BACKEND_UNSUPPORTED`, `CC_BACKEND_LOOPBACK` | Open Settings |
 | `IMAGE_MISSING`, `IMAGE_MISMATCH` | Pull image |
@@ -155,3 +188,4 @@ Every error is a code from `CATALOG` (`src/errors.js`); the Status card shows it
 | `CONTAINERS_RUNNING` | Stop Hindsight |
 | `HINDSIGHT_NOT_READY` | Start Hindsight |
 | `SCOPES_INVALID`, `BROWSER_REFUSED`, `NO_SESSION`, `SESSION_UNRESOLVED`, `SESSION_NOT_LIVE`, `WORKSPACE_UNRESOLVED`, `NO_RECALL_SCOPE`, `RECALL_FAILED`, `RETAIN_FAILED`, `RETAIN_DROPPED`, `RETAIN_STALE`, `RETAIN_FUTURE`, `CURSOR_INVALID`, `BANK_RENDER_FAILED` | — (Memory-tab and hook/tool errors: shown against a field, in Activity, or to the tool caller) |
+| `BACKFILL_NO_SCOPES`, `BACKFILL_CC_UNAVAILABLE`, `BACKFILL_STALE` and the [skip codes](#import-past-sessions) | — (Import past sessions: a refusal, a failed job, or a skipped row) |
