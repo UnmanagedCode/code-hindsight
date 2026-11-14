@@ -92,36 +92,38 @@ export function parseTranscript(text) {
 }
 
 /**
- * Every turn of a transcript file, streamed (never a tail window: a whole session is wanted).
- * Lines are split on the newline byte and decoded only when complete, so a character split across
- * read chunks survives. A line growing past `lineMaxBytes` is skipped while it streams, never
- * buffered whole (`oversized`); a line that is not a JSON object is counted `malformed`. Line
- * numbers are absolute, so ids match `parseTranscript` over the same text. Open and read errors throw.
- * @returns {Promise<{turns: object[], lines: number, malformed: number, oversized: number}>}
+ * Every turn of a transcript file, streamed (never a tail window: a whole session is wanted) and
+ * yielded one at a time, so a caller that only summarises keeps no turn text. Lines are split on
+ * the newline byte and decoded only when complete, so a character split across read chunks
+ * survives. A line growing past `lineMaxBytes` is skipped while it streams, never buffered whole
+ * (`stats.oversized`); a line that is not a JSON object is counted `stats.malformed`. Line numbers
+ * are absolute, so ids match `parseTranscript` over the same text. The file is opened without
+ * following a symlink. Open and read errors (and an aborted `signal`) throw.
+ * @param {string} file
+ * @param {{lineMaxBytes?: number, signal?: AbortSignal, stats?: {lines: number, malformed: number, oversized: number}}} [o]
  */
-export async function readTranscriptFile(file, { lineMaxBytes, signal } = {}) {
-  const turns = [];
-  let index = 0;
-  let malformed = 0;
-  let oversized = 0;
+export async function* transcriptTurns(file, { lineMaxBytes, signal, stats = { lines: 0, malformed: 0, oversized: 0 } } = {}) {
   let parts = [];
   let size = 0;
   let skipping = false;
+  /** The turns of the line just completed. */
   const finish = () => {
+    let out = [];
     if (!skipping) {
-      const out = parseLine(Buffer.concat(parts, size).toString('utf8'), index);
-      if (out === null) malformed++; else turns.push(...out);
+      const parsed = parseLine(Buffer.concat(parts, size).toString('utf8'), stats.lines);
+      if (parsed === null) stats.malformed++; else out = parsed;
     }
-    index++;
+    stats.lines++;
     parts = [];
     size = 0;
     skipping = false;
+    return out;
   };
   const take = (chunk) => {
     if (skipping) return;
     if (lineMaxBytes !== undefined && size + chunk.length > lineMaxBytes) {
       skipping = true;
-      oversized++;
+      stats.oversized++;
       parts = [];
       size = 0;
       return;
@@ -129,17 +131,28 @@ export async function readTranscriptFile(file, { lineMaxBytes, signal } = {}) {
     parts.push(chunk);
     size += chunk.length;
   };
-  for await (const chunk of fs.createReadStream(file, { highWaterMark: 64 * 1024, signal })) {
+  const flags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+  for await (const chunk of fs.createReadStream(file, { flags, highWaterMark: 64 * 1024, signal })) {
     let from = 0;
     for (let nl = chunk.indexOf(0x0a, from); nl >= 0; nl = chunk.indexOf(0x0a, from)) {
       take(chunk.subarray(from, nl));
-      finish();
+      yield* finish();
       from = nl + 1;
     }
     if (from < chunk.length) take(chunk.subarray(from));
   }
-  if (size > 0 || skipping) finish();
-  return { turns, lines: index, malformed, oversized };
+  if (size > 0 || skipping) yield* finish();
+}
+
+/**
+ * Every turn of a transcript file at once (`transcriptTurns`, collected).
+ * @returns {Promise<{turns: object[], lines: number, malformed: number, oversized: number}>}
+ */
+export async function readTranscriptFile(file, { lineMaxBytes, signal } = {}) {
+  const stats = { lines: 0, malformed: 0, oversized: 0 };
+  const turns = [];
+  for await (const t of transcriptTurns(file, { lineMaxBytes, signal, stats })) turns.push(t);
+  return { turns, ...stats };
 }
 
 /** Turns of the transcript file's end; [] when it cannot be read. */

@@ -1,5 +1,5 @@
 // Hindsight's HTTP API as this plugin uses it: recall from a bank, retain into one, and (for the
-// backfill importer) read a document and an operation's status and retry a failed one. Talks to
+// backfill importer) read and delete a document, read an operation's status and retry a failed one. Talks to
 // the supervisor's current connection (URL and Bearer key); never to a bank the caller names
 // beyond the id it is given.
 import { AppError } from './errors.js';
@@ -95,6 +95,11 @@ export function createHindsightClient({ connection, fetchImpl = fetch }) {
       const body = await call(bank, `operations/${encodeURIComponent(operationId)}`, { signal, what: `reading operation ${operationId}` });
       if (body === null) return 'not_found';
       return typeof body.status === 'string' ? body.status : 'not_found';
+    },
+
+    /** Delete a document and the memories extracted from it; false when there was none. */
+    async deleteDocument(bank, documentId, { signal } = {}) {
+      return (await call(bank, `documents/${encodeURIComponent(documentId)}`, { method: 'DELETE', signal, what: `deleting document ${documentId}` })) !== null;
     },
 
     /** Ask Hindsight to run a failed or cancelled operation again. */

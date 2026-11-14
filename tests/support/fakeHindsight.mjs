@@ -1,5 +1,5 @@
 // A fake Hindsight API for the memory and backfill tests: Bearer-checked recall and retain over
-// in-memory banks, plus a document read and operation status / retry. A bank that was never created
+// in-memory banks, plus a document read and delete and operation status / retry. A bank that was never created
 // answers recall with 404; retain creates it and appends to the document (`update_mode: "append"`)
 // or replaces it (otherwise, Hindsight's default); a repeated operation_id returns the original
 // operation and changes nothing. `down` closes every connection unanswered.
@@ -50,7 +50,7 @@ export async function startFakeHindsight(t) {
     const d = /^\/v1\/default\/banks\/([^/]+)\/documents\/([^/]+)$/.exec(req.url);
     const o = /^\/v1\/default\/banks\/([^/]+)\/operations\/([^/]+)(\/retry)?$/.exec(req.url);
     const bank = decodeURIComponent((m ?? d ?? o)?.[1] ?? '') || null;
-    const kind = m ? (m[2] ? 'recall' : 'retain') : d ? 'document' : o ? (o[3] ? 'retry' : 'operation') : 'other';
+    const kind = m ? (m[2] ? 'recall' : 'retain') : d ? (req.method === 'DELETE' ? 'delete' : 'document') : o ? (o[3] ? 'retry' : 'operation') : 'other';
     const id = d ? decodeURIComponent(d[2]) : o ? decodeURIComponent(o[2]) : undefined;
     requests.push({ kind, bank, id, method: req.method, body, auth: req.headers.authorization });
     if (h.down) return req.socket.destroy();
@@ -60,6 +60,10 @@ export async function startFakeHindsight(t) {
     if (d && req.method === 'GET') {
       const doc = banks.get(bank)?.docs.get(id);
       return doc ? send(200, { id, bank_id: bank, original_text: doc.join('\n') }) : send(404, { detail: 'document not found' });
+    }
+    if (d && req.method === 'DELETE') {
+      if (!banks.get(bank)?.docs.delete(id)) return send(404, { detail: 'document not found' });
+      return send(200, { success: true, document_id: id, memory_units_deleted: 0, message: 'deleted' });
     }
     if (o && !o[3] && req.method === 'GET') {
       const status = opStatuses.get(id) ?? (seenOps.has(id) ? 'completed' : null);

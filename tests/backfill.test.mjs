@@ -10,6 +10,8 @@ import { mkRoot, boot, waitFor } from './helpers.mjs';
 import { startFakeCc, live } from './support/fakeCc.mjs';
 import { startFakeHindsight, FAKE_KEY } from './support/fakeHindsight.mjs';
 import { claudeDir, writeTranscript, exchanges, userLine, assistantLine, at } from './support/transcripts.mjs';
+import { readTranscriptFile } from '../claude/hooks/transcript.mjs';
+import { renderTurn } from '../src/retainItem.js';
 import { createScopesStore, validateScopes } from '../src/scopes.js';
 import { createCcClient } from '../src/ccSession.js';
 import { createHindsightClient } from '../src/hindsightClient.js';
@@ -20,7 +22,7 @@ import { createJobs } from '../src/jobs.js';
 import { createCpTrust } from '../src/trust.js';
 import { resourceNames, ownerId } from '../src/containerSpec.js';
 import { createPlacementCache } from '../src/backfillPlacements.js';
-import { createBackfill, BACKFILL_LIMITS, BACKFILL_ESTIMATE, backfillDocumentId, estimateDocument } from '../src/backfill.js';
+import { createBackfill, BACKFILL_LIMITS, BACKFILL_ESTIMATE, backfillDocumentId, estimateDocument, contentHash } from '../src/backfill.js';
 
 const DIR = '-x-proj';
 const H = (n) => `h-${n}`;
@@ -28,6 +30,13 @@ const B = (n) => `b-${n}`;
 const KEY = (n, b = B(n)) => `${H(n)}:${b}`;
 const scope = (over = {}) => ({ name: 'all', match: {}, bank: 'cc-{project}', actions: ['retain'], ...over });
 const lines = (text) => text.split('\n').map((l) => JSON.parse(l));
+const NONE = { sent: 0, replaced: 0, alreadyImported: 0, queued: 0, retried: 0, deleted: 0 };
+/** The operation id the importer derives for a one-part session read from `file`. */
+async function onePartOp(file, n) {
+  const { turns } = await readTranscriptFile(file);
+  const doc = backfillDocumentId(H(n), B(n), 1);
+  return operationIdFor('cc-proj', doc, turns[0].id, turns.at(-1).id, contentHash(turns.map(renderTurn).join('\n')));
+}
 
 async function setup(t, { scopes = [scope()], limits = BACKFILL_LIMITS, llmMode = 'manual' } = {}) {
   const r = mkRoot(t);
@@ -268,7 +277,7 @@ test('an import leaves memory/cursors.json byte-identical and a live retain for 
   ok(await x.scan());
   ok(await x.import([KEY(1)]));
   assert.deepEqual(fs.readFileSync(file), bytes, 'byte-identical after an import');
-  assert.ok(x.cursorCalls.length > 0 && x.cursorCalls.every((k) => k === 'peek'), `only peek: ${[...new Set(x.cursorCalls)]}`);
+  assert.ok(x.cursorCalls.length > 0 && x.cursorCalls.every((k) => k === 'peeker'), `only a read-only peeker: ${[...new Set(x.cursorCalls)]}`);
 
   const release = x.hs.hold();
   const running = x.import([KEY(2)]);
@@ -412,9 +421,9 @@ test('re-running an import sends nothing: existing documents count as already im
   x.place(2);
   ok(await x.scan());
   const first = ok(await x.import([KEY(1), KEY(2)]));
-  assert.deepEqual([first.sessions, first.documents], [2, { sent: 2, alreadyImported: 0, queued: 0, retried: 0 }]);
+  assert.deepEqual([first.sessions, first.documents], [2, { ...NONE, sent: 2 }]);
   const second = ok(await x.import([KEY(1), KEY(2)]));
-  assert.deepEqual(second.documents, { sent: 0, alreadyImported: 2, queued: 0, retried: 0 });
+  assert.deepEqual(second.documents, { ...NONE, alreadyImported: 2 });
   assert.equal(x.hs.retains().length, 2);
   ok(await x.scan());
   assert.deepEqual([x.row(KEY(1)).status, x.row(KEY(2)).status], ['imported', 'imported']);
@@ -424,21 +433,19 @@ test('re-running an import sends nothing: existing documents count as already im
 // A5 / invariant: a lost ack never doubles extraction; a queued operation is left alone; a failed one is retried, not deduped away.
 test('a resend carries the same operation_id; a queued operation is not resent; a failed operation is retried through the retry route', async (t) => {
   const x = await setup(t);
-  x.place(1, { body: exchanges(1, { prefix: 'one-' }) });
-  x.place(2, { body: exchanges(1, { prefix: 'two-' }) });
-  x.place(3, { body: exchanges(1, { prefix: 'three-' }) });
+  const files = [1, 2, 3].map((n) => x.place(n, { body: exchanges(1, { prefix: `s${n}-` }) }));
   ok(await x.scan());
-  const op = (n, prefix) => operationIdFor('cc-proj', backfillDocumentId(H(n), B(n), 1), `${prefix}u0`, `${prefix}a0`);
-  x.hs.opStatus(op(2, 'two-'), 'processing');
-  x.hs.opStatus(op(3, 'three-'), 'failed');
+  const op = await Promise.all(files.map((f, i) => onePartOp(f, i + 1)));
+  x.hs.opStatus(op[1], 'processing');
+  x.hs.opStatus(op[2], 'failed');
   x.hs.retainStatus = 503;
   const failed = await x.import([KEY(1)]);
   assert.equal(failed.state, 'failed');
   x.hs.retainStatus = null;
   const result = ok(await x.import([KEY(1), KEY(2), KEY(3)]));
-  assert.deepEqual(result.documents, { sent: 1, alreadyImported: 0, queued: 1, retried: 1 });
-  assert.deepEqual(x.hs.retains().map((q) => q.body.operation_id), [op(1, 'one-'), op(1, 'one-')], 'the resend repeats the operation id; sessions 2 and 3 were not resent');
-  assert.deepEqual(x.hs.of('retry').map((q) => q.id), [op(3, 'three-')]);
+  assert.deepEqual(result.documents, { ...NONE, sent: 1, queued: 1, retried: 1 });
+  assert.deepEqual(x.hs.retains().map((q) => q.body.operation_id), [op[0], op[0]], 'the resend repeats the operation id; sessions 2 and 3 were not resent');
+  assert.deepEqual(x.hs.of('retry').map((q) => q.id), [op[2]]);
 });
 
 // A5 / invariant: backfilled memories keep their original time; nothing is dated "now".
@@ -509,10 +516,11 @@ test('Hindsight going down mid-import stops the job failed with progress kept; a
   assert.equal(end.error.code, 'RETAIN_FAILED');
   assert.match(end.error.message, /importing again resumes/);
   const stopped = x.activity.list()[0];
-  assert.deepEqual([stopped.event, stopped.outcome, stopped.code, stopped.count], ['backfill-import', 'error', 'RETAIN_FAILED', 1]);
+  // Session 1's part was sent, but the session did not finish (its orphan check hit the outage): count 0.
+  assert.deepEqual([stopped.event, stopped.outcome, stopped.code, stopped.count], ['backfill-import', 'error', 'RETAIN_FAILED', 0]);
   x.hs.down = false;
   const again = ok(await x.import([KEY(1), KEY(2), KEY(3)]));
-  assert.deepEqual(again.documents, { sent: 2, alreadyImported: 1, queued: 0, retried: 0 });
+  assert.deepEqual(again.documents, { ...NONE, sent: 2, alreadyImported: 1 });
   for (const n of [1, 2, 3]) assert.equal(x.hs.doc('cc-proj', backfillDocumentId(H(n), B(n), 1)).length, 1);
   assert.equal(x.hs.retains().length, 3);
 });
@@ -529,8 +537,8 @@ test('a changed transcript between scan and import is skipped TRANSCRIPT_CHANGED
   assert.deepEqual(retainedDocs(x.hs).map((d) => d.document_id), [backfillDocumentId(H(2), B(2), 1)]);
 });
 
-// A6 / invariant: Cancel stops a running import cleanly; what was sent stays, and a re-run picks up the rest.
-test('a cancelled import ends cancelled and logs its summary', async (t) => {
+// A6 / invariant: Cancel stops a running import cleanly and is never logged as a success; a re-run picks up the rest.
+test('a cancelled import ends cancelled and logs a skipped (not ok) summary', async (t) => {
   const x = await setup(t);
   x.place(1);
   x.place(2);
@@ -542,7 +550,169 @@ test('a cancelled import ends cancelled and logs its summary', async (t) => {
   release();
   const end = await done;
   assert.equal(end.state, 'cancelled');
+  assert.deepEqual([x.activity.list()[0].event, x.activity.list()[0].outcome], ['backfill-import', 'skipped']);
   assert.match(x.activity.list()[0].message, /^Cancelled: /);
   const again = ok(await x.import([KEY(1), KEY(2)]));
   assert.equal(again.documents.sent + again.documents.alreadyImported + again.documents.queued, 2);
+});
+
+// --- Review round: content-checked parts, single reads, caps, auth, swaps ---
+
+// A5 / invariant: a stored part counts as imported only when it holds exactly what would be sent now.
+test('a cutoff that moves earlier makes stored parts outdated and orphaned: the import replaces and deletes them, then a re-run sends nothing', async (t) => {
+  // One exchange (two rendered lines) per part.
+  const x = await setup(t, { limits: { ...BACKFILL_LIMITS, documentMaxChars: 300 } });
+  x.place(1, { body: exchanges(5, { text: (i, who) => `${who} ${i} ${'w'.repeat(60)}` }) });
+  ok(await x.scan());
+  const before = x.row(KEY(1)).documents;
+  ok(await x.import([KEY(1)]));
+  assert.ok(before >= 4, `${before} parts`);
+  // Live memory now starts at turn 3: only u0, a0, u1 are earlier.
+  x.hs.putDoc('cc-proj', `cc-session:${H(1)}`, JSON.stringify({ role: 'assistant', content: 'x', timestamp: at(3) }));
+  ok(await x.scan());
+  const row = x.row(KEY(1));
+  assert.equal(row.status, 'ready', 'not "imported": the stored parts hold turns live memory now has');
+  assert.equal(row.stored + row.outdated, row.documents);
+  assert.deepEqual([row.documents, row.stored, row.outdated, row.orphans], [2, 1, 1, before - 2], 'p1 [u0, a0] unchanged; p2 now [u1] alone');
+  const deletesBefore = x.hs.of('delete').length;
+  const result = ok(await x.import([KEY(1)]));
+  assert.equal(result.documents.replaced, row.outdated);
+  assert.equal(result.documents.deleted, row.orphans);
+  assert.equal(x.hs.of('delete').length - deletesBefore, row.orphans + 1, 'deleted upwards until one was missing');
+  const kept = Array.from({ length: row.documents }, (_, i) => x.hs.doc('cc-proj', backfillDocumentId(H(1), B(1), i + 1))[0]);
+  assert.deepEqual(kept.flatMap((c) => lines(c)).map((l) => l.timestamp), [at(0), at(1), at(2)]);
+  assert.equal(x.hs.doc('cc-proj', backfillDocumentId(H(1), B(1), row.documents + 1)), undefined);
+  const replacedOps = x.hs.retains().slice(-row.outdated).map((q) => q.body.operation_id);
+  const firstOps = x.hs.retains().slice(0, before).map((q) => q.body.operation_id);
+  assert.ok(replacedOps.every((o) => !firstOps.includes(o)), 'a replacement carries a fresh operation id');
+  ok(await x.scan());
+  assert.deepEqual([x.row(KEY(1)).status, x.row(KEY(1)).orphans], ['imported', 0]);
+});
+
+// A5 / invariant: an import of a partly stored session sends only the parts Hindsight lacks.
+test('a partially imported session sends only its missing parts', async (t) => {
+  const x = await setup(t, { limits: { ...BACKFILL_LIMITS, documentMaxChars: 300 } });
+  x.place(1, { body: exchanges(4, { text: (i, who) => `${who} ${i} ${'w'.repeat(60)}` }) });
+  ok(await x.scan());
+  const n = x.row(KEY(1)).documents;
+  assert.ok(n > 2);
+  // An earlier import that stopped after its first part.
+  const release = x.hs.hold();
+  const running = x.import([KEY(1)]);
+  await waitFor(() => x.hs.retains().length === 1);
+  x.hs.down = true;
+  release();
+  assert.equal((await running).state, 'failed');
+  x.hs.down = false;
+  ok(await x.scan());
+  assert.deepEqual([x.row(KEY(1)).status, x.row(KEY(1)).stored, x.row(KEY(1)).outdated], ['ready', 1, 0]);
+  const from = x.hs.retains().length;
+  const result = ok(await x.import([KEY(1)]));
+  assert.deepEqual(result.documents, { ...NONE, sent: n - 1, alreadyImported: 1 });
+  assert.deepEqual(x.hs.retains().slice(from).map((q) => q.body.items[0].metadata.part), Array.from({ length: n - 1 }, (_, i) => String(i + 2)));
+});
+
+// A2 / invariant: a transcript that cannot be read is skipped on its own; Hindsight checks go on for the rest.
+test('a transcript read failure while checking overlap skips that file TRANSCRIPT_UNREADABLE and keeps Hindsight checks on for the scan', async (t) => {
+  const x = await setup(t);
+  const f1 = x.place(1);
+  x.place(2);
+  ok(await x.scan());
+  ok(await x.import([KEY(2)]));
+  x.hs.putDoc('cc-proj', `cc-session:${H(1)}`, JSON.stringify({ role: 'user', content: 'x', timestamp: at(2) }));
+  fs.chmodSync(f1, 0o000);
+  ok(await x.scan());
+  assert.equal(x.skip(B(1)).code, 'TRANSCRIPT_UNREADABLE');
+  assert.match(x.skip(B(1)).message, /EACCES/);
+  assert.equal(x.backfill.latestScan().hindsightChecked, true);
+  assert.equal(x.row(KEY(2)).status, 'imported');
+});
+
+// A2 / memory-bound invariant: a scan opens each transcript at most once, even with a cutoff, and keeps no turn text.
+test('a scan reads each transcript at most once; a session over sessionMaxChars is skipped TRANSCRIPT_SESSION_TOO_LARGE', async (t) => {
+  const x = await setup(t, { limits: { ...BACKFILL_LIMITS, sessionMaxChars: 2000 } });
+  const f1 = x.place(1, { body: exchanges(4) });
+  x.hs.putDoc('cc-proj', `cc-session:${H(1)}`, JSON.stringify({ role: 'user', content: 'x', timestamp: at(3) }));
+  const f2 = x.place(2, { body: exchanges(40, { text: (i, who) => `${who} ${i} ${'z'.repeat(80)}` }) });
+  const opened = [];
+  const real = fs.createReadStream;
+  fs.createReadStream = (file, ...rest) => { opened.push(file); return real(file, ...rest); };
+  t.after(() => { fs.createReadStream = real; });
+  ok(await x.scan({ fresh: true }));
+  assert.deepEqual([opened.filter((f) => f === f1).length, opened.filter((f) => f === f2).length], [1, 1]);
+  assert.deepEqual([x.row(KEY(1)).turns, x.row(KEY(1)).cutoffAt], [3, at(3)]);
+  assert.equal(x.skip(B(2)).code, 'TRANSCRIPT_SESSION_TOO_LARGE');
+  assert.match(x.skip(B(2)).message, /2000/);
+});
+
+// A5 / invariant: a turn too large for one document skips its session; nothing is truncated, and nothing is sent.
+test('a turn larger than documentMaxChars skips its session TRANSCRIPT_TURN_TOO_LARGE', async (t) => {
+  const x = await setup(t, { limits: { ...BACKFILL_LIMITS, documentMaxChars: 400 } });
+  x.place(1, { body: [...exchanges(1), userLine('big', 'b'.repeat(500), at(10))] });
+  x.place(2);
+  ok(await x.scan());
+  assert.equal(x.skip(B(1)).code, 'TRANSCRIPT_TURN_TOO_LARGE');
+  assert.match(x.skip(B(1)).message, /nothing is truncated/);
+  assert.equal(x.row(KEY(2)).status, 'ready');
+});
+
+// A6 / invariant: an auth refusal is Hindsight being unusable, not one bad item: the job stops.
+test('a 401 or 403 from Hindsight stops the import; another 4xx fails only its session', async (t) => {
+  for (const status of [401, 403]) {
+    const x = await setup(t);
+    x.place(1);
+    x.place(2);
+    ok(await x.scan());
+    x.hs.allStatus = status;
+    const from = x.hs.requests.length;
+    const end = await x.import([KEY(1), KEY(2)]);
+    assert.equal(end.state, 'failed', `HTTP ${status}`);
+    assert.deepEqual([end.error.code, end.error.params.status], ['RETAIN_FAILED', status]);
+    assert.equal(x.hs.requests.length - from, 1, 'stopped at the first refused call');
+  }
+  const x = await setup(t);
+  x.place(1);
+  x.place(2);
+  ok(await x.scan());
+  x.hs.retainStatus = 422;
+  const result = ok(await x.import([KEY(1), KEY(2)]));
+  assert.equal(result.failed.length, 2);
+});
+
+// A6 / invariant: the import sends the very file the scan saw; a swapped file (even a symlink to the same bytes) is a change.
+test('a transcript swapped for a symlink between scan and import is skipped TRANSCRIPT_CHANGED', async (t) => {
+  const x = await setup(t);
+  const f = x.place(1);
+  ok(await x.scan());
+  const copy = path.join(x.r.root, 'copy.jsonl');
+  fs.copyFileSync(f, copy);
+  const st = fs.statSync(f);
+  fs.utimesSync(copy, st.atime, st.mtime);
+  fs.rmSync(f);
+  fs.symlinkSync(copy, f);
+  const result = ok(await x.import([KEY(1)]));
+  assert.deepEqual(result.skipped.map((k) => k.code), ['TRANSCRIPT_CHANGED']);
+  assert.deepEqual(x.hs.retains(), []);
+});
+
+// A4 / invariant: no import without a scan to confirm.
+test('an import before any scan is refused BACKFILL_STALE', async (t) => {
+  const x = await setup(t);
+  assert.throws(() => x.jobs.start('backfill-import', { scanId: 'anything', sessions: ['h-1:b-1'], confirm: true }), { code: 'BACKFILL_STALE' });
+});
+
+// A6 / invariant: Cancel stops a scan inside a file's placement; what was learned before it is kept.
+test('cancelling a scan mid-file ends it cancelled and keeps the placements learned so far', async (t) => {
+  const x = await setup(t);
+  x.place(1);
+  writeTranscript(x.projects, DIR, 'b-2-hangs', exchanges(1));
+  x.cc.session('b-2-hangs', () => {});
+  const { job, done } = x.jobs.start('backfill-scan', {});
+  await waitFor(() => x.cc.describedIds().includes('b-2-hangs'));
+  x.jobs.cancel(job.id);
+  const end = await done;
+  assert.equal(end.state, 'cancelled');
+  assert.equal(x.backfill.latestScan(), null, 'a cancelled scan publishes no result');
+  const cached = JSON.parse(fs.readFileSync(x.placements.file, 'utf8'));
+  assert.deepEqual(Object.keys(cached.files), [`${DIR}/${B(1)}.jsonl`]);
 });

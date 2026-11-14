@@ -236,3 +236,18 @@ test('POST /-/api/jobs/:id/cancel and GET /-/api/memory/backfill answer their sh
   assert.equal(scan.status, 409);
   assert.equal((await scan.json()).code, 'BACKFILL_NO_SCOPES');
 });
+
+// A4 / invariant: an import request may name every session of a large scan (BACKFILL_LIMITS.selectionMaxBytes), and no more.
+test('a backfill-import body larger than the default limit is read up to selectionMaxBytes; beyond it is refused 413', async (t) => {
+  const { BACKFILL_LIMITS } = await import('../src/backfill.js');
+  const { url } = await boot(t, { seed: { images: {} } });
+  // Each key and its JSON quoting take 76 bytes: at least `bytes` in all.
+  const keys = (bytes) => Array.from({ length: Math.ceil(bytes / 70) }, (_, i) => `${'h'.repeat(36)}:${String(i).padStart(36, '0')}`);
+  const big = await post(`${url}/-/api/jobs/backfill-import`, { scanId: 'x', sessions: keys(512 * 1024), confirm: true });
+  assert.equal(big.status, 409, 'read and validated (no scan yet), not refused for size');
+  assert.equal((await big.json()).code, 'BACKFILL_STALE');
+  const pull = await post(`${url}/-/api/jobs/pull`, { variant: 'full', pad: 'x'.repeat(512 * 1024) });
+  assert.equal(pull.status, 413, 'other kinds keep the default limit');
+  const huge = await post(`${url}/-/api/jobs/backfill-import`, { scanId: 'x', sessions: keys(BACKFILL_LIMITS.selectionMaxBytes + 1024), confirm: true });
+  assert.equal(huge.status, 413);
+});

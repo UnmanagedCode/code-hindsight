@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { mkRoot } from './helpers.mjs';
-import { parseTranscript, readTranscriptTail, readTranscriptFile, trimTurnsToBytes, ACTION_TARGET_CAP, TRANSCRIPT_READ_BYTES } from '../claude/hooks/transcript.mjs';
+import { parseTranscript, readTranscriptTail, readTranscriptFile, transcriptTurns, trimTurnsToBytes, ACTION_TARGET_CAP, TRANSCRIPT_READ_BYTES } from '../claude/hooks/transcript.mjs';
 import { everyKind, exchanges, userLine } from './support/transcripts.mjs';
 
 const j = (o) => JSON.stringify(o);
@@ -148,4 +148,27 @@ test('sidechain, meta, compact-summary, thinking and tool_result content never r
   assert.deepEqual(out.turns.map((x) => [x.id, x.role]), [['kept-user', 'user'], ['kept-asst', 'assistant'], ['kept-asst#0', 'action'], ['u0', 'user'], ['a0', 'assistant']]);
   assert.doesNotMatch(JSON.stringify(out.turns), /SECRET|injected/);
   assert.equal(userLine('x', 'y', null).includes('timestamp'), false, 'the fixture can write a line without a timestamp');
+});
+
+// A6 / invariant: Cancel reaches the reader; a read stops when its signal aborts, before or during it.
+test('readTranscriptFile and transcriptTurns stop with an AbortError when their signal aborts', async (t) => {
+  const file = path.join(mkRoot(t).root, 'abort.jsonl');
+  fs.writeFileSync(file, `${Array.from({ length: 2000 }, (_, i) => user(`u${i}`, 'x'.repeat(200))).join('\n')}\n`);
+  await assert.rejects(readTranscriptFile(file, { signal: AbortSignal.abort() }), { name: 'AbortError' });
+  const ac = new AbortController();
+  const seen = [];
+  await assert.rejects((async () => {
+    for await (const turn of transcriptTurns(file, { signal: ac.signal })) { seen.push(turn.id); ac.abort(); }
+  })(), { name: 'AbortError' });
+  assert.ok(seen.length >= 1 && seen.length < 2000, `stopped after ${seen.length} turns`);
+});
+
+// A6 / invariant: a symlink in place of a transcript is never followed.
+test('transcriptTurns refuses to read through a symlink', async (t) => {
+  const root = mkRoot(t).root;
+  const target = path.join(root, 'target.jsonl');
+  fs.writeFileSync(target, `${user('u1', 'one')}\n`);
+  const link = path.join(root, 'link.jsonl');
+  fs.symlinkSync(target, link);
+  await assert.rejects(readTranscriptFile(link), { code: 'ELOOP' });
 });

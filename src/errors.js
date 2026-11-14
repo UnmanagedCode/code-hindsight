@@ -202,6 +202,8 @@ export const CATALOG = Object.freeze({
   ALREADY_LIVE: { title: 'Already in live memory', message: () => 'Live memory already holds all of this session.', action: null, status: 409 },
   TRANSCRIPT_TOO_LARGE: { title: 'The transcript is too large', message: (p) => `The file is ${s(p.size)} bytes, over the importer's limit of ${s(p.max)}; it is not read.`, action: null, status: 409 },
   TRANSCRIPT_UNREADABLE: { title: 'The transcript could not be read', message: (p) => `Reading the file failed (${s(p.detail)}).`, action: null, status: 409 },
+  TRANSCRIPT_SESSION_TOO_LARGE: { title: 'The session is too large to import', message: (p) => `Its turns render to more than ${s(p.max)} characters, the importer's per-session limit; it is not imported.`, action: null, status: 409 },
+  TRANSCRIPT_TURN_TOO_LARGE: { title: 'A turn is too large to import', message: (p) => `One turn renders to more than ${s(p.max)} characters, the largest document the importer sends; the session is not imported (nothing is truncated).`, action: null, status: 409 },
   TRANSCRIPT_EMPTY: { title: 'The transcript holds nothing to retain', message: () => 'The file has no user, assistant or tool-call turns.', action: null, status: 409 },
   TRANSCRIPT_CHANGED: { title: 'The transcript changed since the scan', message: () => 'Its size or modification time differs from what the scan saw; scan again to import it.', action: null, status: 409 },
   BUSY: {
