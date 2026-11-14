@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from 'react';
 import { LoaderCircleIcon } from 'lucide-react';
-import { api } from '@/lib/api';
+import { api, send } from '@/lib/api';
 import type { Job, LoadedImage } from '@/lib/types';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 
-const STATE_BADGE = { running: 'info', done: 'success', failed: 'destructive' } as const;
+const STATE_BADGE = { running: 'info', done: 'success', failed: 'destructive', cancelled: 'warning' } as const;
 const STANDING: Record<LoadedImage['status'], string> = {
   pinned: 'pinned release',
   'not-pinned': 'not the pinned release — will not run',
@@ -48,6 +49,7 @@ function Loaded({ loaded }: { loaded: LoadedImage[] }) {
 /** One job's progress, polled until it ends; `onEnd` fires once when it does. */
 export function JobPanel({ jobId, onEnd, intervalMs = 1000 }: { jobId: string; onEnd?: (j: Job) => void; intervalMs?: number }) {
   const [job, setJob] = useState<Job | null>(null);
+  const [cancelError, setCancelError] = useState<string | null>(null);
   const endRef = useRef(onEnd);
   endRef.current = onEnd;
   useEffect(() => {
@@ -66,13 +68,25 @@ export function JobPanel({ jobId, onEnd, intervalMs = 1000 }: { jobId: string; o
     return () => { stop = true; };
   }, [jobId, intervalMs]);
   if (!job) return null;
+  const cancel = async () => {
+    setCancelError(null);
+    try { setJob(await send<Job>(`-/api/jobs/${encodeURIComponent(job.id)}/cancel`, 'POST')); } catch (e) { setCancelError(e instanceof Error ? e.message : String(e)); }
+  };
   return (
     <div className="space-y-2 rounded-md border p-3" data-job={job.kind}>
       <div className="flex items-center gap-2 text-sm">
         {job.state === 'running' && <LoaderCircleIcon className="size-4 animate-spin" />}
         <span className="font-medium">{job.kind}</span>
         <Badge variant={STATE_BADGE[job.state]}>{job.state}</Badge>
+        {job.cancellable && job.state === 'running' && <Button type="button" size="sm" variant="outline" className="ml-auto" onClick={() => void cancel()}>Cancel</Button>}
       </div>
+      {job.progress && (
+        <div className="flex items-center gap-2 text-xs">
+          <progress aria-label="Progress" className="h-2 flex-1" value={job.progress.done} max={Math.max(job.progress.total, 1)} />
+          <span>{job.progress.done} / {job.progress.total} {job.progress.unit}</span>
+        </div>
+      )}
+      {cancelError && <p className="text-sm text-destructive" role="alert">{cancelError}</p>}
       {Array.isArray(job.result?.loaded) && <Loaded loaded={job.result.loaded as LoadedImage[]} />}
       {job.kind === 'import' && imageList((job.result?.manifest as { images?: unknown } | null)?.images) && (
         <BundleIds label="Image IDs listed in the bundle (from its export)" images={imageList((job.result!.manifest as { images: unknown }).images)!} />

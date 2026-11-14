@@ -6,6 +6,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { CcPicker } from '@/components/CcPicker';
+import { Backfill } from '@/views/Backfill';
 import { api, ApiError, send } from '@/lib/api';
 import type { ActivityEntry, CcProjectsView, FieldError, Scope, ScopesView, StagesView, Status } from '@/lib/types';
 
@@ -303,6 +304,8 @@ export function Memory({ status }: { status: Status }) {
           </div>
         </CardContent>
       </Card>
+
+      <Backfill status={status} />
 
       <Activity />
     </div>
