@@ -516,8 +516,7 @@ test('Hindsight going down mid-import stops the job failed with progress kept; a
   assert.equal(end.error.code, 'RETAIN_FAILED');
   assert.match(end.error.message, /importing again resumes/);
   const stopped = x.activity.list()[0];
-  // Session 1's part was sent, but the session did not finish (its orphan check hit the outage): count 0.
-  assert.deepEqual([stopped.event, stopped.outcome, stopped.code, stopped.count], ['backfill-import', 'error', 'RETAIN_FAILED', 0]);
+  assert.deepEqual([stopped.event, stopped.outcome, stopped.code, stopped.count], ['backfill-import', 'error', 'RETAIN_FAILED', 1]);
   x.hs.down = false;
   const again = ok(await x.import([KEY(1), KEY(2), KEY(3)]));
   assert.deepEqual(again.documents, { ...NONE, sent: 2, alreadyImported: 1 });
@@ -578,7 +577,7 @@ test('a cutoff that moves earlier makes stored parts outdated and orphaned: the 
   const result = ok(await x.import([KEY(1)]));
   assert.equal(result.documents.replaced, row.outdated);
   assert.equal(result.documents.deleted, row.orphans);
-  assert.equal(x.hs.of('delete').length - deletesBefore, row.orphans + 1, 'deleted upwards until one was missing');
+  assert.deepEqual(x.hs.of('delete').slice(deletesBefore).map((q) => q.id), Array.from({ length: row.orphans }, (_, i) => backfillDocumentId(H(1), B(1), before - i)), 'only the listed orphans, highest first');
   const kept = Array.from({ length: row.documents }, (_, i) => x.hs.doc('cc-proj', backfillDocumentId(H(1), B(1), i + 1))[0]);
   assert.deepEqual(kept.flatMap((c) => lines(c)).map((l) => l.timestamp), [at(0), at(1), at(2)]);
   assert.equal(x.hs.doc('cc-proj', backfillDocumentId(H(1), B(1), row.documents + 1)), undefined);
@@ -715,4 +714,111 @@ test('cancelling a scan mid-file ends it cancelled and keeps the placements lear
   assert.equal(x.backfill.latestScan(), null, 'a cancelled scan publishes no result');
   const cached = JSON.parse(fs.readFileSync(x.placements.file, 'utf8'));
   assert.deepEqual(Object.keys(cached.files), [`${DIR}/${B(1)}.jsonl`]);
+});
+
+// --- Review round 2: the import acts only on the confirmed plan ---
+
+/** A session imported as `parts` one-exchange parts, then a cutoff that keeps only u0, a0, u1: two parts now, the rest orphans. */
+async function orphaned(t) {
+  const x = await setup(t, { limits: { ...BACKFILL_LIMITS, documentMaxChars: 300 } });
+  const file = x.place(1, { body: exchanges(6, { text: (i, who) => `${who} ${i} ${'w'.repeat(60)}` }) });
+  ok(await x.scan());
+  ok(await x.import([KEY(1)]));
+  x.hs.putDoc('cc-proj', `cc-session:${H(1)}`, JSON.stringify({ role: 'assistant', content: 'x', timestamp: at(3) }));
+  ok(await x.scan());
+  assert.deepEqual([x.row(KEY(1)).documents, x.row(KEY(1)).orphans], [2, 4], 'p3..p6 orphaned');
+  return { x, file };
+}
+const stored = (x) => [...x.hs.banks.get('cc-proj').docs.keys()].filter((k) => k.startsWith('cc-backfill:')).map((k) => Number(k.split(':p')[1])).sort((a, b) => a - b);
+
+// A5 / invariant: no stored part is ever stranded: deletion runs highest first, and the scan's probe crosses gaps.
+test('an interrupted deletion leaves a block the next scan finds; the orphan probe crosses gaps', async (t) => {
+  const { x } = await orphaned(t);
+  x.hs.script.delete = [null, 503];
+  const end = await x.import([KEY(1)]);
+  assert.equal(end.state, 'failed', 'a 5xx on DELETE stops the job');
+  assert.deepEqual(stored(x), [1, 2, 3, 4, 5], 'p6 deleted first; p3..p5 left as one block');
+  ok(await x.scan());
+  assert.deepEqual([x.row(KEY(1)).status, x.row(KEY(1)).orphans], ['ready', 3]);
+  // A gap (as an ascending deletion interrupted after its first delete would leave) does not hide the rest.
+  x.hs.banks.get('cc-proj').docs.delete(backfillDocumentId(H(1), B(1), 3));
+  ok(await x.scan());
+  assert.equal(x.row(KEY(1)).orphans, 2);
+  const result = ok(await x.import([KEY(1)]));
+  assert.equal(result.documents.deleted, 2);
+  assert.deepEqual(stored(x), [1, 2]);
+  ok(await x.scan());
+  assert.deepEqual([x.row(KEY(1)).status, x.row(KEY(1)).orphans], ['imported', 0]);
+});
+
+// A4 / invariant: the import does exactly what the confirmed dry run showed, or nothing for that session.
+test('a plan that changed between scan and import is skipped with no delete and no send', async (t) => {
+  const { x, file } = await orphaned(t);
+  const sends = x.hs.retains().length;
+  // Live memory's start moves again after the scan.
+  x.hs.putDoc('cc-proj', `cc-session:${H(1)}`, JSON.stringify({ role: 'assistant', content: 'x', timestamp: at(1) }));
+  const moved = ok(await x.import([KEY(1)]));
+  assert.deepEqual(moved.skipped.map((k) => k.code), ['LIVE_CUTOFF_MOVED']);
+  assert.deepEqual([x.hs.of('delete').length, x.hs.retains().length], [0, sends]);
+
+  // The file rewritten in place: same size, mtime and inode, other content.
+  x.hs.putDoc('cc-proj', `cc-session:${H(1)}`, JSON.stringify({ role: 'assistant', content: 'x', timestamp: at(3) }));
+  const T = new Date('2026-03-01T00:00:00.000Z');
+  fs.utimesSync(file, T, T);
+  ok(await x.scan());
+  const st = fs.statSync(file);
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace('user 0', 'USER 0'));
+  fs.utimesSync(file, T, T);
+  assert.deepEqual([fs.statSync(file).ino, fs.statSync(file).size, fs.statSync(file).mtimeMs], [st.ino, st.size, st.mtimeMs]);
+  const rewritten = ok(await x.import([KEY(1)]));
+  assert.deepEqual(rewritten.skipped.map((k) => k.code), ['TRANSCRIPT_CHANGED']);
+  assert.match(rewritten.skipped[0].message, /inode|content/);
+  assert.deepEqual([x.hs.of('delete').length, x.hs.retains().length], [0, sends]);
+});
+
+// A6 / invariant: what a session sent before it stopped is always counted.
+test('a session that fails part-way still counts the parts it sent', async (t) => {
+  const x = await setup(t, { limits: { ...BACKFILL_LIMITS, documentMaxChars: 300 } });
+  x.place(1, { body: exchanges(3, { text: (i, who) => `${who} ${i} ${'w'.repeat(60)}` }) });
+  ok(await x.scan());
+  x.hs.script.retain = [null, 400];
+  const result = ok(await x.import([KEY(1)]));
+  assert.deepEqual(result.failed.map((f) => f.code), ['RETAIN_FAILED']);
+  assert.equal(result.documents.sent, 1);
+  assert.equal(result.sessions, 0);
+  assert.match(x.activity.list()[0].message, /^0 sessions \(1 documents\) sent/);
+});
+
+// A6 / invariant: an import never reports success for parts the file no longer yields.
+test('a second pass that does not yield every planned part skips the session TRANSCRIPT_CHANGED', async (t) => {
+  const x = await setup(t, { limits: { ...BACKFILL_LIMITS, documentMaxChars: 300 } });
+  const file = x.place(1, { body: exchanges(3, { text: (i, who) => `${who} ${i} ${'w'.repeat(60)}` }) });
+  ok(await x.scan());
+  // The import's second read sees only the first exchange (the file cut short between its two reads).
+  const short = path.join(x.r.root, 'short.jsonl');
+  fs.writeFileSync(short, `${fs.readFileSync(file, 'utf8').split('\n').slice(0, 2).join('\n')}\n`);
+  const real = fs.createReadStream;
+  let opens = 0;
+  fs.createReadStream = (f, ...rest) => real(f === file && ++opens === 2 ? short : f, ...rest);
+  t.after(() => { fs.createReadStream = real; });
+  const result = ok(await x.import([KEY(1)]));
+  assert.deepEqual(result.skipped.map((k) => k.code), ['TRANSCRIPT_CHANGED']);
+  assert.deepEqual([result.sessions, result.documents.sent], [0, 1], 'p1 went out before the shortfall was seen, and is counted');
+  assert.deepEqual(x.hs.retains().map((q) => q.body.items[0].metadata.part), ['1']);
+});
+
+// A2 / invariant: a placement cache of another version is never read as this one's.
+test('a version-1 placement cache is moved aside and the cache rebuilt', async (t) => {
+  const x = await setup(t);
+  x.place(1);
+  fs.mkdirSync(path.dirname(x.placements.file), { recursive: true });
+  const old = JSON.stringify({ version: 1, files: { [`${DIR}/${B(1)}.jsonl`]: { size: 1, mtimeMs: 1, handle: H(1), outcome: 'placed', summary: { turns: 4, parts: [100] } } } });
+  fs.writeFileSync(x.placements.file, old);
+  const end = await x.scan();
+  ok(end);
+  assert.equal(fs.readFileSync(`${x.placements.file}.corrupt`, 'utf8'), old);
+  assert.match(end.tail, /another version/);
+  assert.equal(end.result.totals.resolved, 1);
+  assert.equal(JSON.parse(fs.readFileSync(x.placements.file, 'utf8')).version, 2);
+  assert.equal(x.row(KEY(1)).status, 'ready');
 });

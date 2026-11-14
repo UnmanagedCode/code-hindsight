@@ -30,6 +30,8 @@ export const BACKFILL_LIMITS = Object.freeze({
   describeTimeoutMs: 15_000,
   /** This many consecutive cc failures abort a scan. */
   ccFailuresMax: 5,
+  /** The scan's orphan probe stops after this many consecutive missing part numbers (it tolerates gaps). */
+  orphanProbeMisses: 3,
   /** Body limit of an import request (it names every chosen session). */
   selectionMaxBytes: 4 * MiB,
 });
@@ -245,8 +247,9 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
 
   /**
    * What the bank holds of a session's planned parts: `stored` (same content), `outdated` (the id
-   * exists with other content) and `orphans` (parts numbered past the plan, found by probing
-   * upwards until one is missing).
+   * exists with other content) and `orphanParts`, the part numbers past the plan that exist, probed
+   * upwards across gaps until `orphanProbeMisses` consecutive numbers are missing (an interrupted
+   * deletion can leave a gap).
    */
   async function storedState(bank, handle, backingId, parts, signal) {
     let stored = 0;
@@ -256,9 +259,11 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
       if (!doc) continue;
       if (doc.originalText !== null && contentHash(doc.originalText) === parts[n - 1].hash) stored++; else outdated++;
     }
-    let orphans = 0;
-    while (await hindsight.getDocument(bank, backfillDocumentId(handle, backingId, parts.length + orphans + 1), { signal })) orphans++;
-    return { stored, outdated, orphans };
+    const orphanParts = [];
+    for (let n = parts.length + 1, misses = 0; misses < limits.orphanProbeMisses; n++) {
+      if (await hindsight.getDocument(bank, backfillDocumentId(handle, backingId, n), { signal })) { orphanParts.push(n); misses = 0; } else misses++;
+    }
+    return { stored, outdated, orphanParts };
   }
 
   async function scan({ fresh }, { line, progress, signal }) {
@@ -268,7 +273,7 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
     const peek = cursors.peeker();
     const files = listFiles(line);
     progress(0, files.length, 'files');
-    if (placements.load({ fresh }).corrupt) line('the placement cache was unreadable: moved aside to memory/backfill-placements.json.corrupt; every transcript is resolved again');
+    if (placements.load({ fresh }).corrupt) line('the placement cache was unreadable or of another version: moved aside to memory/backfill-placements.json.corrupt; every transcript is resolved again');
     const handles = new Map();
     const cutoffs = new Map();
     let ccFailures = 0;
@@ -349,12 +354,12 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
         const no = refusal(summary, cut);
         if (no) { skip(f, handle, session, no.code, no.params); continue; }
 
-        let state = { stored: 0, outdated: 0, orphans: 0 };
+        let state = { stored: 0, outdated: 0, orphanParts: [] };
         let status = 'ready';
         if (hindsightChecked) {
           try {
             state = await storedState(aim.bank, handle, f.backingId, summary.parts, signal);
-            if (state.stored === summary.parts.length && !state.orphans) status = 'imported';
+            if (state.stored === summary.parts.length && !state.orphanParts.length) status = 'imported';
           } catch (e) { stopChecking(e); }
         }
         const chars = summary.parts.reduce((a, p) => a + p.chars, 0);
@@ -364,9 +369,13 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
           key, handle, backingId: f.backingId, project: session.project, worktree: session.worktree, kind: session.kind, stage: session.stage,
           title: entry.title ?? null, firstAt: summary.firstAt, lastAt: summary.lastAt, turns: summary.turns, documents: summary.parts.length, chars,
           bank: aim.bank, scope: aim.scope, status, cutoffAt: cut === null ? null : new Date(cut).toISOString(), untimed: summary.untimed,
-          malformed: summary.malformed, oversized: summary.oversized, ...state, estimate,
+          malformed: summary.malformed, oversized: summary.oversized, stored: state.stored, outdated: state.outdated, orphans: state.orphanParts.length, estimate,
         });
-        rows.set(key, { file: f.file, size: st.size, mtimeMs: st.mtimeMs, dev: st.dev, ino: st.ino, session, bank: aim.bank, status });
+        // Exactly what the user confirms: an import acts on this plan or skips the session, never on a recomputed difference.
+        rows.set(key, {
+          file: f.file, size: st.size, mtimeMs: st.mtimeMs, dev: st.dev, ino: st.ino, session, bank: aim.bank, status,
+          plan: { cutoffMs: cut, hashes: summary.parts.map((p) => p.hash), orphanParts: state.orphanParts },
+        });
       }
       progress(files.length, files.length, 'files');
     } finally {
@@ -394,22 +403,28 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
     return { scanId: view.scanId, totals: view.totals, hindsightChecked };
   }
 
-  /** Stream a transcript again and hand each wanted part, with its turns, to `onPart` (one part's text held at a time). */
+  /**
+   * Stream a transcript again and hand each wanted part, with its turns, to `onPart` (one part's
+   * text held at a time). A Skip `TRANSCRIPT_CHANGED` when the file no longer yields every wanted part.
+   */
   async function eachWantedPart(file, cutoffMs, wanted, signal, onPart) {
     const splitter = createSplitter(limits.documentMaxChars, (n) => wanted.has(n));
+    const seen = new Set();
+    const hand = async (part) => { if (part?.turns) { seen.add(part.n); await onPart(part); } };
     for await (const t of transcriptTurns(file, { lineMaxBytes: limits.lineMaxBytes, signal })) {
       if (!beforeCutoff(t, cutoffMs)) continue;
-      const closed = splitter.add(t, renderTurn(t));
-      if (closed?.turns) await onPart(closed);
+      await hand(splitter.add(t, renderTurn(t)));
     }
-    const last = splitter.end();
-    if (last?.turns) await onPart(last);
+    await hand(splitter.end());
+    if ([...wanted.keys()].some((n) => !seen.has(n))) throw new Skip('TRANSCRIPT_CHANGED');
   }
 
-  /** Import one session's parts; returns its counts. Throws a Skip, a per-item refusal or a fatal error. */
-  async function importOne(row, handle, backingId, plan, cut, st, signal) {
+  /**
+   * Import one session's confirmed plan, adding to `counts` as it goes (so a session that stops
+   * part-way still reports what it sent). Throws a Skip, a per-item refusal or a fatal error.
+   */
+  async function importOne(row, handle, backingId, plan, cut, st, signal, counts) {
     const { bank, session } = row;
-    const counts = { sent: 0, replaced: 0, alreadyImported: 0, queued: 0, retried: 0, deleted: 0 };
     const send = new Map();
     for (let n = 1; n <= plan.parts.length; n++) {
       throwIfAborted(signal);
@@ -440,10 +455,16 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
         if (replace) counts.replaced++; else counts.sent++;
       });
     }
-    // Parts numbered past the plan (an earlier import of a longer cut) hold turns live memory now has.
-    for (let n = plan.parts.length + 1; await hindsight.deleteDocument(bank, backfillDocumentId(handle, backingId, n), { signal }); n++) counts.deleted++;
-    return counts;
+    // Only the orphans the confirmed scan listed (an earlier import of a longer cut, holding turns
+    // live memory now has), highest first: an interruption leaves a lower block the next scan finds.
+    for (const n of [...row.plan.orphanParts].sort((a, b) => b - a)) {
+      throwIfAborted(signal);
+      if (await hindsight.deleteDocument(bank, backfillDocumentId(handle, backingId, n), { signal })) counts.deleted++;
+    }
   }
+
+  /** Whether a recomputed plan is exactly the one the scan showed. */
+  const samePlan = (confirmed, plan) => plan.parts.length === confirmed.hashes.length && plan.parts.every((p, i) => p.hash === confirmed.hashes[i]);
 
   async function importSessions({ keys }, { line, progress, signal }) {
     const list = savedScopes();
@@ -473,6 +494,8 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
         if (!cutoffs.has(handle)) cutoffs.set(handle, liveCutoff(list, session, signal));
         const cut = await cutoffs.get(handle);
         if (cut instanceof Skip) { skip(key, cut.code, cut.params); continue; }
+        // Act only on the confirmed dry run: a moved cutoff or other content means scan again.
+        if (cut !== row.plan.cutoffMs) { skip(key, 'LIVE_CUTOFF_MOVED'); continue; }
         let plan;
         try { plan = await summarize(row.file, cut, signal); } catch (e) {
           throwIfAborted(signal);
@@ -481,8 +504,11 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
         }
         const no = refusal(plan, cut);
         if (no) { skip(key, no.code, no.params); continue; }
-        let counts;
-        try { counts = await importOne(row, handle, backingId, plan, cut, st, signal); } catch (e) {
+        if (!samePlan(row.plan, plan)) { skip(key, 'TRANSCRIPT_CHANGED'); continue; }
+        const counts = { sent: 0, replaced: 0, alreadyImported: 0, queued: 0, retried: 0, deleted: 0 };
+        const tally = () => { for (const k of Object.keys(counts)) result.documents[k] += counts[k]; };
+        try { await importOne(row, handle, backingId, plan, cut, st, signal, counts); } catch (e) {
+          tally();
           if (e instanceof Skip) { skip(key, e.code, e.params); continue; }
           if (signal.aborted || !refusedItem(e)) throw e;
           // Hindsight refused this session's item: report it and go on; other failures stop the job.
@@ -491,7 +517,7 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
           line(`${key}: failed ${e.code} (HTTP ${e.params.status})`);
           continue;
         }
-        for (const k of Object.keys(counts)) result.documents[k] += counts[k];
+        tally();
         result.sessions++;
         banks.add(bank);
         line(`${key} → ${bank}: ${plan.parts.length} documents (${counts.sent} sent, ${counts.replaced} replaced, ${counts.alreadyImported} already imported, ${counts.queued} already queued, ${counts.retried} retried; ${counts.deleted} orphaned parts deleted)${plan.untimed ? `; ${plan.untimed} turns without a timestamp left out` : ''}`);

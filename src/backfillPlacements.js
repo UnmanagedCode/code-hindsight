@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { readJsonFile, writePrivateFileAtomic } from './fsPrivate.js';
 
-export const PLACEMENTS_VERSION = 1;
+export const PLACEMENTS_VERSION = 2;
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -17,8 +17,9 @@ export function createPlacementCache(dataDir) {
   return {
     file,
     /**
-     * Read the file for a scan (`fresh`: start empty, ignoring it). A file unreadable as a whole is
-     * moved aside to `.corrupt` (replacing an older one) and the scan starts empty.
+     * Read the file for a scan (`fresh`: start empty, ignoring it). A file unreadable as a whole, or
+     * of another `PLACEMENTS_VERSION`, is moved aside to `.corrupt` (replacing an older one) and the
+     * scan starts empty: it is a cache, rebuilt from cc and the transcripts.
      * @returns {{corrupt: boolean}}
      */
     load({ fresh = false } = {}) {

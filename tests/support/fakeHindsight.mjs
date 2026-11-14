@@ -28,6 +28,8 @@ export async function startFakeHindsight(t) {
     down: false,
     /** Answer every request with this HTTP status instead. */
     allStatus: null,
+    /** Per request kind, statuses consumed one per request: null answers normally, a number answers that status. */
+    script: {},
     /** Give an operation id a status. */
     opStatus(id, status) { opStatuses.set(id, status); },
     /** Store a document's text (e.g. a live `cc-session:` document). */
@@ -57,6 +59,8 @@ export async function startFakeHindsight(t) {
     const send = (status, payload) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(payload)); };
     if (req.headers.authorization !== `Bearer ${FAKE_KEY}`) return send(401, { detail: 'bad key' });
     if (h.allStatus) return send(h.allStatus, { detail: 'boom' });
+    const scripted = h.script[kind]?.length ? h.script[kind].shift() : null;
+    if (scripted) return send(scripted, { detail: 'scripted' });
     if (d && req.method === 'GET') {
       const doc = banks.get(bank)?.docs.get(id);
       return doc ? send(200, { id, bank_id: bank, original_text: doc.join('\n') }) : send(404, { detail: 'document not found' });

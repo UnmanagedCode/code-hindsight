@@ -205,7 +205,8 @@ export const CATALOG = Object.freeze({
   TRANSCRIPT_SESSION_TOO_LARGE: { title: 'The session is too large to import', message: (p) => `Its turns render to more than ${s(p.max)} characters, the importer's per-session limit; it is not imported.`, action: null, status: 409 },
   TRANSCRIPT_TURN_TOO_LARGE: { title: 'A turn is too large to import', message: (p) => `One turn renders to more than ${s(p.max)} characters, the largest document the importer sends; the session is not imported (nothing is truncated).`, action: null, status: 409 },
   TRANSCRIPT_EMPTY: { title: 'The transcript holds nothing to retain', message: () => 'The file has no user, assistant or tool-call turns.', action: null, status: 409 },
-  TRANSCRIPT_CHANGED: { title: 'The transcript changed since the scan', message: () => 'Its size or modification time differs from what the scan saw; scan again to import it.', action: null, status: 409 },
+  TRANSCRIPT_CHANGED: { title: 'The transcript changed since the scan', message: () => "It is not what the scan read: its size or modification time changed, the file was swapped for another (a different device or inode, or a symlink), or its content no longer gives the parts the scan showed. Scan again to import it.", action: null, status: 409 },
+  LIVE_CUTOFF_MOVED: { title: "Live memory's start moved since the scan", message: () => "The session's live document now starts at a different turn than the scan saw, so the import would differ from what you confirmed. Nothing was sent or deleted for it; scan again.", action: null, status: 409 },
   BUSY: {
     title: 'Another action is running',
     message: (p) => `Wait for "${s(p.job)}" to finish.`,
