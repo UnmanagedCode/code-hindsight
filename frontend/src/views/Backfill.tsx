@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -65,12 +65,18 @@ export function Backfill({ status }: { status: Status }) {
   const [confirming, setConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const shownScanId = useRef<string | null>(null);
   const load = useCallback(() => {
-    api<{ scan: BackfillScan | null }>('-/api/memory/backfill').then((r) => setScan(r.scan), () => {});
+    api<{ scan: BackfillScan | null }>('-/api/memory/backfill').then((r) => {
+      // A new scan selects every ready session (the confirm step is the safeguard), in the same render as its rows.
+      if (r.scan?.scanId !== shownScanId.current) {
+        shownScanId.current = r.scan?.scanId ?? null;
+        setSelected(new Set((r.scan?.sessions ?? []).filter((x) => x.status === 'ready').map((x) => x.key)));
+      }
+      setScan(r.scan);
+    }, () => {});
   }, []);
   useEffect(load, [load]);
-  // A new scan selects every ready session: the confirm step is the safeguard.
-  useEffect(() => { setSelected(new Set((scan?.sessions ?? []).filter((s) => s.status === 'ready').map((s) => s.key))); }, [scan?.scanId]);
 
   const busy = running || !!status.job;
   const start = async (kind: 'backfill-scan' | 'backfill-import', body: unknown) => {
