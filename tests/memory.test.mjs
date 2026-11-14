@@ -9,7 +9,7 @@ import { mkRoot } from './helpers.mjs';
 import { startFakeCc, live } from './support/fakeCc.mjs';
 import { startFakeHindsight, FAKE_KEY } from './support/fakeHindsight.mjs';
 import { createScopesStore, validateScopes } from '../src/scopes.js';
-import { createCcClient } from '../src/ccSession.js';
+import { createCcClient, WORKSPACES_TTL_MS } from '../src/ccSession.js';
 import { createHindsightClient } from '../src/hindsightClient.js';
 import { createRetainCursors } from '../src/retainCursor.js';
 import { createActivityLog } from '../src/activity.js';
@@ -20,7 +20,7 @@ const scope = (over = {}) => ({ name: 'all', match: {}, bank: 'cc-{project}', ac
 const turn = (n, role = 'assistant', content = `turn ${n}`) => ({ id: `u${n}`, role, content, timestamp: `2026-01-01T00:00:${String(n).padStart(2, '0')}.000Z` });
 const lines = (doc) => doc.flatMap((c) => c.split('\n')).map((l) => JSON.parse(l));
 
-async function setup(t, { scopes = [scope()], limits = MEMORY_LIMITS, describeTimeoutMs } = {}) {
+async function setup(t, { scopes = [scope()], limits = MEMORY_LIMITS, describeTimeoutMs, workspacesTimeoutMs } = {}) {
   const r = mkRoot(t);
   const cc = await startFakeCc(t);
   const hs = await startFakeHindsight(t);
@@ -30,12 +30,14 @@ async function setup(t, { scopes = [scope()], limits = MEMORY_LIMITS, describeTi
   const state = { ready: true };
   const activity = createActivityLog({ dataDir: r.dataDir, log: () => {} });
   const hindsight = createHindsightClient({ connection: () => (state.ready ? { apiUrl: hs.url, apiKey: FAKE_KEY } : null) });
-  const ccClient = createCcClient({ conductorUrl: cc.url, describeTimeoutMs });
+  /** Moves the cc client's clock (and only its clock) forward: `ccClock.offset += ms`. */
+  const ccClock = { offset: 0 };
+  const ccClient = createCcClient({ conductorUrl: cc.url, describeTimeoutMs, workspacesTimeoutMs, now: () => Date.now() + ccClock.offset });
   const build = () => {
     const cursors = createRetainCursors(r.dataDir);
     return { cursors, memory: createMemory({ scopes: store, cc: ccClient, hindsight, cursors, activity, limits }) };
   };
-  const x = { r, cc, hs, activity, state, save, ...build() };
+  const x = { r, cc, hs, activity, state, save, ccClock, ...build() };
   /** A backend restart: a new memory and cursor store over the same data dir, nothing in memory carried over. */
   x.restart = () => Object.assign(x, build());
   cc.session(S, live());
@@ -600,4 +602,76 @@ test('a tail stamped in the future is refused and logged, and the next honest St
   await x.memory.retainForHook(S, [...t1, turn(3, 'user', 'q2'), turn(4, 'assistant', 'a2')]);
   await x.memory.idle();
   assert.deepEqual(bodies(x, 'cc-proj'), ['q1', 'a1', 'q2', 'a2']);
+});
+
+const wsScope = (over = {}) => scope({ name: 'ws', match: { workspaces: ['WS'] }, bank: 'ws-{project}', ...over });
+
+test('a workspace scope recalls from and retains into its bank for a member project; once cc moves the project out, past the TTL, the session is memoryless', async (t) => {
+  const x = await setup(t, { scopes: [wsScope()] });
+  x.hs.bank('ws-proj', [{ id: 'm', text: 'a workspace note' }]);
+  const next = growing();
+  assert.match((await recall(x.memory, S, 'q')).context, /a workspace note/);
+  await x.memory.retainForHook(S, next('x'));
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'ws-proj'), ['xq1', 'xa1']);
+  x.cc.setProjects([{ name: 'proj', workspace: null }]);
+  x.ccClock.offset += WORKSPACES_TTL_MS;
+  x.memory.resetContext(S);
+  assert.equal((await recall(x.memory, S, 'q')).context, null);
+  await x.memory.retainForHook(S, next('x'));
+  await x.memory.idle();
+  assert.equal(x.hs.retains().length, 1, 'nothing more retained once the project left the workspace');
+  assert.deepEqual(errors(x.activity), []);
+});
+
+test('a failed workspace lookup on recall: the workspace scope gives no bank, another matching scope still recalls, and it is logged', async (t) => {
+  const x = await setup(t, { scopes: [wsScope({ actions: ['recall'] }), scope({ name: 'all', bank: 'all', actions: ['recall'] })] });
+  x.hs.bank('ws-proj', [{ id: 'w', text: 'workspace note' }]);
+  x.hs.bank('all', [{ id: 'a', text: 'shared note' }]);
+  x.cc.failProjects(500);
+  const out = await recall(x.memory, S, 'q');
+  assert.match(out.context, /shared note/);
+  assert.doesNotMatch(out.context, /workspace note/);
+  assert.deepEqual(x.hs.recalls().map((r) => r.bank), ['all']);
+  const err = errors(x.activity);
+  assert.deepEqual(err.map((e) => e.code), ['WORKSPACE_UNRESOLVED']);
+  assert.match(err[0].message, /Scope ws: .*project proj: .*HTTP 500/);
+});
+
+test('a failed workspace lookup at Stop never retains into a later scope: nothing is recorded, and the next resolved Stop takes those turns into the workspace bank', async (t) => {
+  const x = await setup(t, { scopes: [wsScope({ bank: 'a-{project}', actions: ['retain'] }), scope({ name: 'catch-all', bank: 'b', actions: ['retain'] })] });
+  const next = growing();
+  await x.memory.retainForHook(S, next('x'));
+  await x.memory.idle();
+  const before = JSON.stringify(x.cursors.get(S));
+  x.ccClock.offset += WORKSPACES_TTL_MS;
+  x.cc.failProjects(500);
+  assert.deepEqual(await x.memory.retainForHook(S, next('x')), { status: 'unresolved' });
+  await x.memory.idle();
+  assert.equal(JSON.stringify(x.cursors.get(S)), before, 'nothing recorded in the cursor');
+  assert.equal(x.hs.retains().length, 1, 'nothing sent, to b or anywhere');
+  assert.deepEqual(errors(x.activity).map((e) => e.code), ['WORKSPACE_UNRESOLVED']);
+  x.cc.failProjects(null);
+  assert.deepEqual(await x.memory.retainForHook(S, next('x')), { status: 'accepted' });
+  await x.memory.idle();
+  assert.deepEqual(bodies(x, 'a-proj'), ['xq1', 'xa1', 'xq2', 'xa2', 'xq3', 'xa3']);
+  assert.equal(x.hs.retains().some((r) => r.bank === 'b'), false);
+});
+
+test('the recall tool with only an undecidable workspace scope fails WORKSPACE_UNRESOLVED, logged, not NO_RECALL_SCOPE', async (t) => {
+  const x = await setup(t, { scopes: [wsScope({ actions: ['recall'] })] });
+  x.cc.failProjects(500);
+  await assert.rejects(x.memory.recallForMcp(S, 'q'), { code: 'WORKSPACE_UNRESOLVED' });
+  assert.deepEqual(errors(x.activity).map((e) => [e.event, e.code]), [['mcp-recall', 'WORKSPACE_UNRESOLVED']]);
+  assert.equal(x.hs.requests.length, 0);
+});
+
+test('scopes without workspaces never ask cc for project membership', async (t) => {
+  const x = await setup(t, { scopes: [scope({ match: { projects: ['pr*'] } }), scope({ name: 'staged', match: { stages: ['plan'] }, bank: 'p' })] });
+  await recall(x.memory, S, 'q');
+  await x.memory.retainForHook(S, [turn(1, 'user'), turn(2)]);
+  await x.memory.idle();
+  await x.memory.recallForMcp(S, 'q');
+  assert.equal(x.cc.listProjectsCalls(), 0);
+  assert.equal(x.hs.retains().length, 1);
 });

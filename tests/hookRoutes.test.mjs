@@ -168,6 +168,37 @@ test('/-/api/memory/stages lists cc\'s playbook stages and reports a failed read
   assert.ok(failed.error);
 });
 
+test('/-/api/memory/cc-projects lists cc\'s projects with their workspace and cc\'s workspaces; a failed read still answers 200 with an error', async (t) => {
+  const cc = await startFakeCc(t, { projects: [{ name: 'proj', workspace: 'WS' }, { name: 'loner', workspace: null }] });
+  const { url } = await boot(t, { start: false, cc: cc.url });
+  const ok = await (await fetch(`${url}/-/api/memory/cc-projects`)).json();
+  assert.deepEqual(ok, { projects: [{ name: 'loner', workspace: null }, { name: 'proj', workspace: 'WS' }], workspaces: [{ name: 'WS', projectCount: 1 }], error: null });
+  cc.failWorkspaces(500);
+  const half = await (await fetch(`${url}/-/api/memory/cc-projects`)).json();
+  assert.equal(half.projects.length, 2);
+  assert.deepEqual(half.workspaces, []);
+  assert.match(half.error, /HTTP 500/);
+  const none = await boot(t, { start: false });
+  const res = await fetch(`${none.url}/-/api/memory/cc-projects`);
+  assert.equal(res.status, 200);
+  const failed = await res.json();
+  assert.deepEqual([failed.projects, failed.workspaces], [[], []]);
+  assert.equal(typeof failed.error, 'string');
+});
+
+test('/-/api/scopes refuses a bad workspaces entry by field, and round-trips a valid one', async (t) => {
+  const { url } = await boot(t, { start: false });
+  const h = { ...JSON_CT, 'sec-fetch-site': 'same-origin' };
+  const bad = await fetch(`${url}/-/api/scopes`, { method: 'PUT', headers: h, body: JSON.stringify({ scopes: [{ name: 'x', match: { workspaces: ['a/b'] }, bank: 'b', actions: ['recall'] }] }) });
+  assert.equal(bad.status, 400);
+  const err = await bad.json();
+  assert.equal(err.code, 'SCOPES_INVALID');
+  assert.equal(err.params.fields[0].field, 'scopes[0].match.workspaces');
+  const good = [{ name: 'x', match: { projects: ['code-*'], workspaces: ['CC-Dev', 'CC-*'] }, bank: 'cc-{project}', actions: ['recall', 'retain'] }];
+  assert.equal((await fetch(`${url}/-/api/scopes`, { method: 'PUT', headers: h, body: JSON.stringify({ scopes: good }) })).status, 200);
+  assert.deepEqual((await (await fetch(`${url}/-/api/scopes`)).json()).scopes, good);
+});
+
 test('a retain whose last turn has an empty id is refused and leaves the stored progress alone (no CURSOR_INVALID)', async (t) => {
   const x = await setup(t);
   const turn = (n, role) => ({ id: `u${n}`, role, content: `c${n}`, timestamp: `2026-01-01T00:00:0${n}.000Z` });

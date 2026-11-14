@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { validateScopes, matchScopes, renderBank, createScopesStore, globMatches, SCOPE_LIMITS } from '../src/scopes.js';
+import { validateScopes, matchScopes, needsWorkspace, renderBank, createScopesStore, globMatches, SCOPE_LIMITS } from '../src/scopes.js';
 import { mkRoot } from './helpers.mjs';
 
 const scope = (over = {}) => ({ name: 's', match: {}, bank: 'cc-{project}', actions: ['recall', 'retain'], ...over });
@@ -37,7 +37,7 @@ test('validation refuses more scopes than the limit', () => {
 });
 
 test('default off: no scopes match nothing', () => {
-  assert.deepEqual(matchScopes([], session()), { recall: [], retain: null, skipped: [] });
+  assert.deepEqual(matchScopes([], session()), { recall: [], retain: null, retainUnresolved: false, skipped: [] });
 });
 
 test('an absent match key matches anything; stage null never matches a stages list', () => {
@@ -140,4 +140,68 @@ test('glob matching never blows up: a many-star glob against a non-matching name
 test('glob semantics: * spans any run (including none), ? exactly one, everything else literal', () => {
   const cases = [['*', ''], ['a*', 'a'], ['*b', 'ab'], ['a*c*e', 'abcde'], ['a?c', 'abc'], ['a?c', 'ac'], ['a.c', 'abc'], ['**', 'x'], ['a*b', 'acbc']];
   assert.deepEqual(cases.map(([g, n]) => globMatches(g, n)), [true, true, true, true, true, false, false, true, false]);
+});
+
+test('validation refuses an empty, badly-charactered, duplicated or over-long workspaces list, naming the field', () => {
+  const field = ['scopes[0].match.workspaces'];
+  assert.deepEqual(fieldsOf([scope({ match: { workspaces: [] } })]), field);
+  assert.deepEqual(fieldsOf([scope({ match: { workspaces: ['a/b'] } })]), field);
+  assert.deepEqual(fieldsOf([scope({ match: { workspaces: ['WS', 'WS'] } })]), field);
+  assert.deepEqual(fieldsOf([scope({ match: { workspaces: Array.from({ length: SCOPE_LIMITS.listMax + 1 }, (_, i) => `w${i}`) } })]), field);
+  assert.deepEqual(ok([scope({ match: { workspaces: ['CC-*', 'HOME'] } })])[0].match, { workspaces: ['CC-*', 'HOME'] });
+});
+
+test('a scope list without workspaces validates unchanged, matches as before and never needs a workspace', () => {
+  const raw = [scope({ name: 'a', match: { projects: ['code-*'], sessions: ['worker'], stages: ['implement'] }, bank: 'a-{project}' }), scope({ name: 'b', bank: 'b', actions: ['recall'] })];
+  const list = ok(raw);
+  assert.deepEqual(list, raw);
+  const s = session({ project: 'code-x' });
+  assert.equal(needsWorkspace(list, s), false);
+  assert.deepEqual(matchScopes(list, s), { recall: [{ scope: 'a', bank: 'a-code-x' }, { scope: 'b', bank: 'b' }], retain: { scope: 'a', bank: 'a-code-x' }, retainUnresolved: false, skipped: [] });
+});
+
+test('projects OR workspaces, ANDed with sessions and stages; workspace globs are case-sensitive and a project in no workspace never matches them', () => {
+  const both = ok([scope({ match: { projects: ['code-*'], workspaces: ['WS'] } })]);
+  const hit = (list, over) => matchScopes(list, session(over)).recall.length === 1;
+  assert.equal(hit(both, { project: 'code-a', workspace: 'OTHER' }), true, 'a project glob alone matches');
+  assert.equal(hit(both, { project: 'proj', workspace: 'WS' }), true, 'a workspace alone matches');
+  assert.equal(hit(both, { project: 'proj', workspace: 'OTHER' }), false);
+  assert.equal(hit(both, { project: 'proj', workspace: null }), false, 'no workspace never matches a workspaces list');
+  const staged = ok([scope({ match: { workspaces: ['WS'], stages: ['plan'], sessions: ['worker'] } })]);
+  assert.equal(hit(staged, { workspace: 'WS', stage: 'implement' }), false, 'the stage still has to match');
+  assert.equal(hit(staged, { workspace: 'WS', stage: 'plan', kind: 'conductor' }), false, 'the kind still has to match');
+  assert.equal(hit(staged, { workspace: 'WS', stage: 'plan' }), true);
+  const w = (glob, workspace) => hit(ok([scope({ match: { workspaces: [glob] } })]), { workspace });
+  assert.equal(w('cc-dev', 'CC-Dev'), false);
+  assert.equal(w('CC-Dev', 'CC-Dev'), true);
+  assert.equal(w('CC-*', 'CC-Dev'), true);
+  assert.equal(w('CC-?ev', 'CC-Dev'), true);
+});
+
+test('a failed workspace lookup leaves only the scopes that depend on it undecided, and retain never falls through past one', () => {
+  const failed = session({ workspaceError: 'project proj: cc did not answer in time' });
+  const list = ok([
+    scope({ name: 'ws', match: { workspaces: ['WS'] }, bank: 'ws', actions: ['recall', 'retain'] }),
+    scope({ name: 'by-glob', match: { projects: ['pr*'], workspaces: ['WS'] }, bank: 'glob', actions: ['recall'] }),
+    scope({ name: 'wrong-stage', match: { workspaces: ['WS'], stages: ['plan'] }, bank: 'staged', actions: ['recall'] }),
+    scope({ name: 'catch-all', bank: 'all', actions: ['recall', 'retain'] }),
+  ]);
+  const m = matchScopes(list, failed);
+  assert.deepEqual(m.recall.map((r) => r.bank), ['glob', 'all'], 'the undecided scope gives no bank; the others still recall');
+  assert.equal(m.retain, null, 'retain does not fall through to catch-all');
+  assert.equal(m.retainUnresolved, true);
+  assert.deepEqual(m.skipped, [{ scope: 'ws', code: 'WORKSPACE_UNRESOLVED', detail: 'project proj: cc did not answer in time' }], 'a scope ruled out by its stage is a plain no');
+  const recallOnly = ok([scope({ name: 'ws', match: { workspaces: ['WS'] }, bank: 'ws', actions: ['recall'] }), scope({ name: 'later', bank: 'later', actions: ['retain'] })]);
+  assert.deepEqual(matchScopes(recallOnly, failed).retain, { scope: 'later', bank: 'later' }, 'an undecided recall-only scope does not block a later retain');
+});
+
+test('needsWorkspace is true only when a scope\'s outcome depends on the workspace', () => {
+  const s = session({ project: 'proj', stage: 'implement', kind: 'worker' });
+  const needs = (match) => needsWorkspace(ok([scope({ match })]), s);
+  assert.equal(needs({ workspaces: ['WS'] }), true);
+  assert.equal(needs({ projects: ['other'], workspaces: ['WS'] }), true);
+  assert.equal(needs({ projects: ['pr*'], workspaces: ['WS'] }), false, 'a project glob already matched');
+  assert.equal(needs({ workspaces: ['WS'], stages: ['plan'] }), false, 'the stage rules it out');
+  assert.equal(needs({ workspaces: ['WS'], sessions: ['conductor'] }), false, 'the kind rules it out');
+  assert.equal(needs({ projects: ['other'] }), false);
 });

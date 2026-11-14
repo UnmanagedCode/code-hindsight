@@ -3,7 +3,7 @@
 // routes never see an exception. Owns the recall budget, the injected-context format, the set of
 // memories already injected per session, and the one-in-flight-per-session retain worker.
 import { AppError } from './errors.js';
-import { matchScopes } from './scopes.js';
+import { matchScopes, needsWorkspace } from './scopes.js';
 import { windowTurns, lastExchangeBoundary, endsAfter, provablyBehind, isOlderTail, isValidCursor, tailEnd, operationIdFor } from './retainCursor.js';
 
 export const MEMORY_LIMITS = Object.freeze({
@@ -63,6 +63,17 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     try { return await cc.resolveSession(sessionId); } catch (e) {
       activity.add({ event, outcome: e.code === 'SESSION_NOT_LIVE' ? 'skipped' : 'error', sessionId, code: e.code ?? 'SESSION_UNRESOLVED', message: e.message });
       return null;
+    }
+  }
+
+  /**
+   * The session with its cc workspace placed (`workspace`, or `workspaceError` when it could not
+   * be looked up); unchanged when no scope's outcome depends on it, so cc is asked only then.
+   */
+  async function placeWorkspace(list, session) {
+    if (!needsWorkspace(list, session)) return session;
+    try { return { ...session, workspace: await cc.workspaceOf(session.project) }; } catch (e) {
+      return { ...session, workspaceError: e?.params?.detail ?? e?.message ?? String(e) };
     }
   }
 
@@ -280,8 +291,9 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
       try {
         const list = loadScopes('recall', sessionId);
         if (!list.length) return NONE;
-        const session = await resolve('recall', sessionId);
-        if (!session) return NONE;
+        const resolved = await resolve('recall', sessionId);
+        if (!resolved) return NONE;
+        const session = await placeWorkspace(list, resolved);
         const m = matchScopes(list, session);
         logSkipped('recall', session, m);
         if (!m.recall.length) return NONE;
@@ -307,10 +319,13 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
         const list = loadScopes('retain', sessionId);
         if (!list.length) return { status: 'off' };
         if (!turns.length) return { status: 'empty' };
-        const session = await resolve('retain', sessionId);
-        if (!session) return { status: 'unresolved' };
+        const resolved = await resolve('retain', sessionId);
+        if (!resolved) return { status: 'unresolved' };
+        const session = await placeWorkspace(list, resolved);
         const m = matchScopes(list, session);
         logSkipped('retain', session, m);
+        // Like an unresolved session: nothing recorded, so the next Stop that resolves takes these turns.
+        if (m.retainUnresolved) return { status: 'unresolved' };
         if (record(sessionId, turns, session, m.retain)) kick(sessionId, turns);
         return { status: 'accepted' };
       } catch (e) {
@@ -324,19 +339,23 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
 
     /**
      * The recall tool: text for the calling session, from exactly the banks its scopes allow now.
-     * @throws {AppError} NO_SESSION, SESSION_NOT_LIVE, SESSION_UNRESOLVED, NO_RECALL_SCOPE, HINDSIGHT_NOT_READY, RECALL_FAILED
+     * @throws {AppError} NO_SESSION, SESSION_NOT_LIVE, SESSION_UNRESOLVED, WORKSPACE_UNRESOLVED, NO_RECALL_SCOPE, HINDSIGHT_NOT_READY, RECALL_FAILED
      */
     async recallForMcp(sessionId, query) {
       if (!sessionId) throw new AppError('NO_SESSION');
       const list = loadScopes('mcp-recall', sessionId);
       if (!list.length) throw new AppError('NO_RECALL_SCOPE');
-      let session;
-      try { session = await cc.resolveSession(sessionId); } catch (e) {
+      let resolved;
+      try { resolved = await cc.resolveSession(sessionId); } catch (e) {
         activity.add({ event: 'mcp-recall', outcome: e.code === 'SESSION_NOT_LIVE' ? 'skipped' : 'error', sessionId, code: e.code, message: e.message });
         throw e;
       }
+      const session = await placeWorkspace(list, resolved);
       const m = matchScopes(list, session);
       logSkipped('mcp-recall', session, m);
+      const undecided = m.skipped.find((k) => k.code === 'WORKSPACE_UNRESOLVED');
+      // Already logged by logSkipped; the caller learns why rather than a plain "no scope".
+      if (!m.recall.length && undecided) throw new AppError('WORKSPACE_UNRESOLVED', { scope: undecided.scope, detail: undecided.detail });
       if (!m.recall.length) {
         activity.add({ event: 'mcp-recall', outcome: 'skipped', sessionId, ...ctx(session), code: 'NO_RECALL_SCOPE' });
         throw new AppError('NO_RECALL_SCOPE');

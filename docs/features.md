@@ -68,26 +68,33 @@ Gives cc sessions memory. **Off by default:** with no scopes every session is me
 
 ### Scopes
 
-A scope is `{name, match: {projects?, sessions?, stages?}, bank, actions}`. Scopes are checked in list order on every prompt.
+A scope is `{name, match: {projects?, workspaces?, sessions?, stages?}, bank, actions}`. Scopes are checked in list order on every prompt.
 
 | Field | Meaning |
 |---|---|
 | `match` keys | **an absent key matches anything**; an empty list is refused (omit the key instead) |
 | `projects` | globs over the session's project: `*` any run of characters (a leading dot too), `?` one character, other characters literal |
+| `workspaces` | globs over the cc workspace the session's project is in, same syntax as `projects`, case-sensitive (`cc-dev` does not match `CC-Dev`). A project in no workspace, and `.conduct`, never match it. Membership is read from cc when matching (see below), so a project added to the workspace later matches too |
 | `sessions` | `conductor` and/or `worker`. A conductor's project is `.conduct` |
 | `stages` | the session's playbook stage must be listed. A session with no stage never matches a `stages` list. Names cc does not know are warned about in the UI and kept (playbooks come and go) |
 | `bank` | a template with `{project}`, `{worktree}`, `{kind}`; literal text uses lowercase `a-z 0-9 . _ : -` |
 | `actions` | `recall` and/or `retain` |
 
+- **Combining keys:** a scope matches when `sessions` AND `stages` match AND (`projects` OR `workspaces` matches). With only one of `projects` / `workspaces` present, that one decides; with neither, any project matches.
+- **Workspace lookup:** cc is asked for workspace membership only when some scope's outcome depends on it (its `sessions` and `stages` match, it has `workspaces`, and none of its `projects` globs matched); scope lists without `workspaces` never ask. If cc cannot answer, every scope that depends on it is undecided: it is neither a match nor a non-match (`WORKSPACE_UNRESOLVED`, see Degrading).
+- **Workspace membership lag (known limitation):** membership is cached for `WORKSPACES_TTL_MS` (`src/ccSession.js`), so a project moved into or out of a workspace changes what it matches within that time. A project cc did not list in the cached copy is looked up again at once.
 - **Recall** merges every matching scope that grants it, in order; the same bank twice counts once; at most `SCOPE_LIMITS.recallMaxBanks` banks (`src/scopes.js`).
-- **Retain** goes to the **first** matching scope that grants it. If that scope's bank does not render, the session retains nothing (`BANK_RENDER_FAILED` in the activity log); it never falls through to a later scope.
+- **Retain** goes to the **first** matching scope that grants it. If that scope's bank does not render, the session retains nothing (`BANK_RENDER_FAILED` in the activity log); it never falls through to a later scope. Likewise when the first retain scope not ruled out by its other keys is undecided (`WORKSPACE_UNRESOLVED`).
 - **Bank rendering:** each placeholder value is lowercased, characters outside `a-z 0-9 . _ -` become `-`, runs collapse, leading `. _ -` is trimmed (`.conduct` → `conduct`); the main checkout's `{worktree}` is `main`. The result must be a valid bank id, else `BANK_RENDER_FAILED`. Different projects can sanitize to the same bank.
 - **Stage and bank change mid-session:** the session is resolved on every call, so a stage change moves recall and retain to the matching scopes at once; later turns go to the new bank's `cc-session:<id>` document.
 
 ### The tab
 
 - **Header:** says "Memory is off" when no scopes are saved; warns when Hindsight is not ready (sessions are memoryless) and when its LLM mode is `none`.
-- **Scope editor:** ordered cards (move up/down, delete, **Add scope**) with name, projects (one glob per line), sessions, stages (suggestions from cc's playbooks), bank template with a live preview, and actions. **Save** sends the whole list; a refusal (`SCOPES_INVALID`) shows against the field it names.
+- **Scope editor:** ordered cards (move up/down, delete, **Add scope**) with name, projects (one glob per line), workspaces, sessions, stages (suggestions from cc's playbooks), bank template with a live preview, and actions. **Save** sends the whole list; a refusal (`SCOPES_INVALID`) shows against the field it names.
+  - **Pick projects from cc:** a searchable list of cc's projects, each with its workspace (or "no workspace"); search matches the name or the workspace. Picking one adds its exact name as a new Projects line; lines already typed (globs too) are kept, and a name already present is not added twice.
+  - **Workspaces:** chips with free text (globs such as `CC-*` can be typed) and **Pick workspaces from cc** (each with its project count). A literal name cc does not list is marked "unknown to cc" and kept.
+  - **cc unreadable:** when cc's project or workspace list cannot be read, both pickers are hidden and a warning says to type the names; typing and **Save** work as usual.
 - **Activity:** recent recalls, retains and refusals (time, event, session, project · stage, banks, count, result), newest first, refreshed every few seconds. Entries hold ids, names, counts and error text, never prompt or memory text. A prompt or Stop from a session that matches no scope leaves no entry (there would be one per prompt); the recall tool, by contrast, logs `NO_RECALL_SCOPE`.
 
 ### Degrading
@@ -102,6 +109,7 @@ Every failure yields a memoryless turn and an Activity entry; the hooks always e
 | a bank's recall failed or timed out (other banks still answer) | `RECALL_FAILED` |
 | retain failed (the same batch is resent with the next turn) | `RETAIN_FAILED` |
 | a bank template did not render | `BANK_RENDER_FAILED` |
+| cc could not say which workspace the session's project is in (cc unset, unreachable, slower than `WORKSPACES_TIMEOUT_MS`, a bad answer, the project missing from cc's list or its record unreadable). One entry per undecided scope. Recall: that scope adds no bank, other matching scopes still recall. Retain: when it is the first retain scope not ruled out, nothing is recorded or sent (never to a later scope); the next Stop that resolves takes those turns into its own bank. Recall tool: answers this code instead of `NO_RECALL_SCOPE` when no other scope gave a bank | `WORKSPACE_UNRESOLVED` |
 | stored retain progress was unreadable (one entry of the wrong shape, or the whole file, moved aside) and was reset; the next retain starts from the last exchange | `CURSOR_INVALID` |
 | a Stop's turns were stamped beyond the clock-skew allowance (`MEMORY_LIMITS.clockSkewMs`) in the future and were not recorded | `RETAIN_FUTURE` |
 | a late Stop's turns were already behind the retained position and were ignored (nothing lost, nothing sent twice) | `RETAIN_STALE` |
@@ -146,4 +154,4 @@ Every error is a code from `CATALOG` (`src/errors.js`); the Status card shows it
 | `UNHEALTHY`, `CRASHED`, `CP_LOGIN_FAILED` | Restart Hindsight |
 | `CONTAINERS_RUNNING` | Stop Hindsight |
 | `HINDSIGHT_NOT_READY` | Start Hindsight |
-| `SCOPES_INVALID`, `BROWSER_REFUSED`, `NO_SESSION`, `SESSION_UNRESOLVED`, `SESSION_NOT_LIVE`, `NO_RECALL_SCOPE`, `RECALL_FAILED`, `RETAIN_FAILED`, `RETAIN_DROPPED`, `RETAIN_STALE`, `RETAIN_FUTURE`, `CURSOR_INVALID`, `BANK_RENDER_FAILED` | — (Memory-tab and hook/tool errors: shown against a field, in Activity, or to the tool caller) |
+| `SCOPES_INVALID`, `BROWSER_REFUSED`, `NO_SESSION`, `SESSION_UNRESOLVED`, `SESSION_NOT_LIVE`, `WORKSPACE_UNRESOLVED`, `NO_RECALL_SCOPE`, `RECALL_FAILED`, `RETAIN_FAILED`, `RETAIN_DROPPED`, `RETAIN_STALE`, `RETAIN_FUTURE`, `CURSOR_INVALID`, `BANK_RENDER_FAILED` | — (Memory-tab and hook/tool errors: shown against a field, in Activity, or to the tool caller) |
