@@ -1,4 +1,5 @@
 // Process configuration from the environment cc gives a plugin backend.
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -17,5 +18,7 @@ export function loadConfig(env = process.env) {
     conductorUrl: env.CONDUCTOR_URL || null,
     pluginId: env.CONDUCTOR_PLUGIN_ID || 'code-hindsight',
     distDir: path.join(root, 'frontend', 'dist'),
+    /** Where Claude Code keeps session transcripts (its own rule): what the backfill importer scans. */
+    claudeProjectsDir: path.join(env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude'), 'projects'),
   };
 }

@@ -20,6 +20,8 @@ import { createCcClient } from './ccSession.js';
 import { createHindsightClient } from './hindsightClient.js';
 import { createRetainCursors } from './retainCursor.js';
 import { createActivityLog } from './activity.js';
+import { createBackfill } from './backfill.js';
+import { createPlacementCache } from './backfillPlacements.js';
 import { createMemory } from './memory.js';
 import { createHookRoutes } from './hookRoutes.js';
 import { serveStatic, sendText } from './http.js';
@@ -34,10 +36,10 @@ async function fetchPluginRow(conductorUrl, pluginId) {
 /**
  * @param {ReturnType<import('./config.js').loadConfig>} config
  * @param {object} [overrides] collaborators tests replace (env for the docker binaries, the
- *   resource prefix, a bind detector, supervisor timeouts and clock)
+ *   resource prefix, a bind detector, supervisor timeouts and clock, the Hindsight connection)
  */
 export function createApp(config, overrides = {}) {
-  const { env = process.env, prefix = RESOURCE_PREFIX, detectBind = detectBindAddress, supervisorOptions = {} } = overrides;
+  const { env = process.env, prefix = RESOURCE_PREFIX, detectBind = detectBindAddress, supervisorOptions = {}, hindsightConnection } = overrides;
   ensurePrivateDir(config.dataDir);
   const runDir = ensurePrivateDir(path.join(config.dataDir, 'run'));
   const settings = createSettingsStore(config.dataDir);
@@ -57,19 +59,22 @@ export function createApp(config, overrides = {}) {
   let supervisor;
   const cpSession = createCpSession({ target: () => supervisor.cpAddress(), accessKey: () => secrets.get().cpAccessKey });
   supervisor = createSupervisor({ docker, settings, secrets, cpTrust, names, owner, dataDir: config.dataDir, detectBind, fetchCcModels: ccModels, cpSession, ...supervisorOptions });
-  const jobs = createJobs({ docker, supervisor, cpTrust, names, owner, dataDir: config.dataDir });
-  const cpProxy = createCpProxy({ target: supervisor.cpTarget, session: cpSession, notReadyError: supervisor.notReadyError });
   const scopes = createScopesStore(config.dataDir);
   const cc = createCcClient({ conductorUrl: config.conductorUrl });
   const activity = createActivityLog({ dataDir: config.dataDir });
-  const memory = createMemory({
-    scopes, cc, activity,
-    hindsight: createHindsightClient({ connection: () => supervisor.connection() }),
-    cursors: createRetainCursors(config.dataDir),
+  const hindsight = createHindsightClient({ connection: hindsightConnection ?? (() => supervisor.connection()) });
+  const cursors = createRetainCursors(config.dataDir);
+  const backfill = createBackfill({
+    scopes, cc, hindsight, cursors, activity, settings,
+    placements: createPlacementCache(config.dataDir),
+    transcriptsRoot: config.claudeProjectsDir,
   });
+  const jobs = createJobs({ docker, supervisor, cpTrust, names, owner, dataDir: config.dataDir, kinds: backfill.kinds });
+  const cpProxy = createCpProxy({ target: supervisor.cpTarget, session: cpSession, notReadyError: supervisor.notReadyError });
+  const memory = createMemory({ scopes, cc, activity, hindsight, cursors });
   const hookRoutes = createHookRoutes({ memory });
   const api = createRoutes({
-    supervisor, jobs, docker, settings, secrets, fetchCcModels: ccModels, scopes, activity, cc,
+    supervisor, jobs, docker, settings, secrets, fetchCcModels: ccModels, scopes, activity, cc, backfill,
     fetchPluginRow: () => fetchPluginRow(config.conductorUrl, config.pluginId),
     detectBind, containerNames: { api: names.api, cp: names.cp },
   });
@@ -96,6 +101,6 @@ export function createApp(config, overrides = {}) {
         if (!res.headersSent) sendText(res, 500, 'Internal error'); else res.destroy();
       });
     },
-    supervisor, jobs, docker, settings, secrets, cpTrust, names, owner, cpSession, scopes, memory, activity,
+    supervisor, jobs, docker, settings, secrets, cpTrust, names, owner, cpSession, scopes, memory, activity, backfill,
   };
 }

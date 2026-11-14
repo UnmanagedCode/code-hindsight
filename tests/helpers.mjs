@@ -98,17 +98,20 @@ export async function waitFor(fn, { timeoutMs = 5_000, stepMs = 10 } = {}) {
 
 /**
  * Boot the app (createApp) on 127.0.0.1:0 over the fakes and a temp data dir. Resolves
- * {url, app, r}. `cc` is an optional fake cc base URL.
+ * {url, app, r}. `cc` is an optional fake cc base URL; `claudeProjectsDir` a temp transcripts
+ * root (default: an empty temp path); `hindsight` replaces the supervisor's connection to
+ * Hindsight (`() => ({apiUrl, apiKey}) | null`, for a fake Hindsight).
  */
-export async function boot(t, { mode = '', sudoMode, seed, settings, distDir, cc = null, probe = async () => 0, start = true, trusted = true } = {}) {
+export async function boot(t, { mode = '', sudoMode, seed, settings, distDir, cc = null, probe = async () => 0, start = true, trusted = true, claudeProjectsDir, hindsight } = {}) {
   const http = await import('node:http');
   const { createApp } = await import('../src/app.js');
   const r = mkRoot(t);
   seedDocker(r, seed);
   if (settings) writeSettings(r, settings);
   if (trusted) trustCp(r);
-  const config = { port: 0, dataDir: r.dataDir, conductorUrl: cc, pluginId: 'code-hindsight', distDir: distDir ?? path.join(r.root, 'no-dist') };
-  const app = createApp(config, { env: fakeEnv(r, { mode, sudoMode }), detectBind: () => '127.0.0.1', supervisorOptions: { probe, clock: fakeClock(), watch: false, log: () => {} } });
+  // Never the real transcripts: a temp dir unless the test writes its own.
+  const config = { port: 0, dataDir: r.dataDir, conductorUrl: cc, pluginId: 'code-hindsight', distDir: distDir ?? path.join(r.root, 'no-dist'), claudeProjectsDir: claudeProjectsDir ?? path.join(r.root, 'claude-config', 'projects') };
+  const app = createApp(config, { env: fakeEnv(r, { mode, sudoMode }), detectBind: () => '127.0.0.1', supervisorOptions: { probe, clock: fakeClock(), watch: false, log: () => {} }, hindsightConnection: hindsight });
   const server = http.createServer(app.handle);
   await new Promise((res) => server.listen(0, '127.0.0.1', res));
   t.after(() => { server.closeAllConnections(); server.close(); });

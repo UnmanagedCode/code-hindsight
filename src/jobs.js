@@ -1,6 +1,7 @@
-// User-initiated Docker actions. Nothing here runs on its own: every network-touching or
-// destructive operation is a job the user starts. One job at a time; each writes a log under
-// the data dir and keeps a tail in memory for the UI.
+// User-initiated actions. Nothing here runs on its own: every network-touching or destructive
+// operation is a job the user starts. One job at a time across every kind; each writes a log
+// under the data dir and keeps a tail in memory for the UI. The Docker actions live here; other
+// features register their own kinds (`kinds`), which report progress and can be cancelled.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -15,6 +16,7 @@ import { ensurePrivateDir } from './fsPrivate.js';
 import { IMAGE_ID_RE, isPinnedApiImage, isPinnedHelper } from './trust.js';
 import { createTarAppender, createTarScanner } from './tarStream.js';
 
+/** The Docker actions: they resolve docker first and re-read Hindsight's state after. */
 export const JOB_KINDS = Object.freeze(['pull', 'build-cp', 'import', 'trust-cp', 'export', 'remove-images', 'delete-volume']);
 /** Jobs that can fix a start precondition; only these may start Hindsight when they succeed. */
 const PRECONDITION_JOBS = new Set(['pull', 'build-cp', 'import', 'trust-cp']);
@@ -49,14 +51,19 @@ const BUNDLE_RE = /^code-hindsight-[0-9A-Za-z.-]+-(full|slim)\.tar$/;
  * @param {ReturnType<import('./containerSpec.js').resourceNames>} o.names
  * @param {string} o.owner
  * @param {string} o.dataDir
+ * @param {Record<string, {validate(params: unknown): object, run(params: object, io: {line(l: string): void, progress(done: number, total: number, unit: string): void, signal: AbortSignal}): Promise<unknown>, cancellable: boolean}>} [o.kinds]
+ *   registered kinds: `validate` throws a catalog error or returns the params `run` gets
  */
-export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir, now = () => Date.now() }) {
+export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir, kinds = {}, now = () => Date.now() }) {
   const logDir = path.join(dataDir, 'logs', 'jobs');
   const bundleDir = path.join(dataDir, 'bundles');
   const jobs = new Map();
   let running = null;
 
-  const view = (j) => ({ id: j.id, kind: j.kind, state: j.state, startedAt: j.startedAt, endedAt: j.endedAt, result: j.result, error: j.error, tail: j.tail.join('\n') });
+  const view = (j) => ({
+    id: j.id, kind: j.kind, state: j.state, startedAt: j.startedAt, endedAt: j.endedAt, result: j.result, error: j.error,
+    progress: j.progress, cancellable: j.cancellable, tail: j.tail.join('\n'),
+  });
 
   async function assertStopped() {
     for (const n of [names.api, names.cp]) {
@@ -189,6 +196,7 @@ export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir,
 
   /** Validate a job request; returns normalized params or throws a catalog error. */
   function validate(kind, params) {
+    if (Object.hasOwn(kinds, kind)) return kinds[kind].validate(params ?? {});
     if (!JOB_KINDS.includes(kind)) throw new AppError('NOT_FOUND', { detail: `no job "${kind}"` });
     const p = params ?? {};
     if (kind === 'pull' || kind === 'export') {
@@ -231,35 +239,62 @@ export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir,
       ensurePrivateDir(logDir);
       const logFile = path.join(logDir, `${id}.log`);
       const fd = fs.openSync(logFile, 'a', 0o600);
-      const job = { id, kind, state: 'running', startedAt: new Date(now()).toISOString(), endedAt: null, result: null, error: null, tail: [] };
+      const registered = Object.hasOwn(kinds, kind) ? kinds[kind] : null;
+      const controller = new AbortController();
+      const job = {
+        id, kind, state: 'running', startedAt: new Date(now()).toISOString(), endedAt: null, result: null, error: null, tail: [],
+        progress: null, cancellable: !!registered?.cancellable, controller,
+      };
       const line = (l) => {
         fs.writeSync(fd, `${l}\n`);
         job.tail.push(l);
         if (job.tail.length > TAIL_LINES) job.tail.splice(0, job.tail.length - TAIL_LINES);
       };
+      const progress = (done, total, unit) => { job.progress = { done, total, unit }; };
       jobs.set(id, job);
       while (jobs.size > KEEP_JOBS) jobs.delete(jobs.keys().next().value);
       running = job;
       const done = (async () => {
         try {
-          await docker.resolve();
-          job.result = await handlers[kind](p, line);
+          if (registered) {
+            job.result = await registered.run(p, { line, progress, signal: controller.signal });
+          } else {
+            await docker.resolve();
+            job.result = await handlers[kind](p, line);
+          }
           job.state = 'done';
         } catch (e) {
-          const err = toAppError(e, 'JOB_FAILED', { job: kind });
-          job.error = err.toJSON();
-          job.state = 'failed';
-          line(`failed: ${err.message}`);
+          if (controller.signal.aborted) {
+            job.state = 'cancelled';
+            line('cancelled');
+          } else {
+            const err = toAppError(e, 'JOB_FAILED', { job: kind });
+            job.error = err.toJSON();
+            job.state = 'failed';
+            line(`failed: ${err.message}`);
+          }
         } finally {
           job.endedAt = new Date(now()).toISOString();
+          job.controller = null;
           fs.closeSync(fd);
           running = null;
         }
-        // Only a job that can fix a start precondition may start Hindsight; the others re-read.
-        if (job.state === 'done') await (PRECONDITION_JOBS.has(kind) ? supervisor.afterPrecondition() : supervisor.refresh()).catch(() => {});
+        // Only a Docker job that can fix a start precondition may start Hindsight; the others re-read.
+        if (!registered && job.state === 'done') await (PRECONDITION_JOBS.has(kind) ? supervisor.afterPrecondition() : supervisor.refresh()).catch(() => {});
         return view(job);
       })();
       return { job: view(job), done };
+    },
+    /**
+     * Ask a running, cancellable job to stop; it ends `cancelled` at its next check.
+     * @throws {AppError} NOT_FOUND, JOB_NOT_CANCELLABLE
+     */
+    cancel(id) {
+      const job = jobs.get(id);
+      if (!job) throw new AppError('NOT_FOUND', { detail: 'no such job' });
+      if (job.state !== 'running' || !job.cancellable) throw new AppError('JOB_NOT_CANCELLABLE', { job: job.kind, ended: job.state !== 'running' });
+      job.controller.abort();
+      return view(job);
     },
     get: (id) => (jobs.has(id) ? view(jobs.get(id)) : null),
     list: () => [...jobs.values()].reverse().map((j) => ({ ...view(j), tail: undefined })),

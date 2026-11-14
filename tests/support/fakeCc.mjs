@@ -1,4 +1,5 @@
-// A fake cc for the memory tests: `describe_session` answers programmable per call,
+// A fake cc for the memory and backfill tests: `describe_session` answers programmable per call
+// (live sessions, retired handles, transcript segments that name their handle, unlocatable ids),
 // `/api/playbooks[/:id]` serves the given playbooks, and `list_projects` / `list_workspaces`
 // serve programmable rows (or fail on demand). Every request is logged.
 import http from 'node:http';
@@ -61,6 +62,17 @@ export async function startFakeCc(t, { playbooks = { solo: ['plan', 'review'], r
     failWorkspaces(status) { workspacesFailure = status; },
     /** Program a session: answers are consumed per call, the last repeats. */
     session(id, ...answers) { sessions.set(id, answers); },
+    /** A transcript segment: describe_session on its backing id names the handle that owns it. */
+    segment(backingId, handle) { sessions.set(backingId, [{ ok: false, code: 'SESSION_NOT_A_HANDLE', handle, reason: 'a backing segment id' }]); },
+    /** A retired handle, as describe_session answers it (project and worktree at the top, the last stage under `retired`). */
+    retired(handle, { project = 'proj', worktree = null, stage = 'implement', playbook = 'relay', title = null } = {}) {
+      const row = { sessionId: handle, project, worktree, path: `/x/${project}`, retired: { playbook, stage, title, archived: false, lastActivity: '2026-01-01T00:00:00.000Z' } };
+      sessions.set(handle, [(send) => send(200, row)]);
+    },
+    /** An id whose directory no registered project owns. */
+    unlocatable(id) { sessions.set(id, [{ ok: false, code: 'SESSION_UNLOCATABLE', reason: 'no registered project owns its directory' }]); },
+    /** describe_session calls naming `id`. */
+    describedIds: () => calls.filter((c) => c.url === '/mcp/tools/describe_session').map((c) => c.body.sessionId),
   };
 }
 

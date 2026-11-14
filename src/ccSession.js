@@ -1,6 +1,7 @@
-// What this plugin reads from cc: the live facts about a session (project, worktree, stage), the
-// stage names of cc's playbooks, and which cc workspace each project is in (plus the workspace
-// list, for the scope editor). Read-only; all go through documented cc routes.
+// What this plugin reads from cc: the live facts about a session (project, worktree, stage), where a
+// saved transcript file belongs (for the backfill importer), the stage names of cc's playbooks, and
+// which cc workspace each project is in (plus the workspace list, for the scope editor). Read-only;
+// all go through documented cc routes.
 import { AppError } from './errors.js';
 
 export const DESCRIBE_TIMEOUT_MS = 1000;
@@ -17,6 +18,9 @@ const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,64}$/;
 export const isSessionId = (v) => typeof v === 'string' && SESSION_ID_RE.test(v);
 
 const isStr = (v) => typeof v === 'string';
+const nonEmpty = (v) => typeof v === 'string' && v.length > 0;
+/** cc's refusals that mean "cc has no place for this id": a settled answer, safe to remember. */
+const PLACE_REFUSALS = new Set(['SESSION_UNLOCATABLE', 'SESSION_UNKNOWN']);
 
 /**
  * @param {{conductorUrl: string|null, fetchImpl?: typeof fetch, now?: () => number, describeTimeoutMs?: number, workspacesTimeoutMs?: number}} o
@@ -53,6 +57,42 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
     const index = new Map(rows.map((p) => [p.name, { workspace: p.workspace, degraded: p.degraded != null && p.degraded !== false }]));
     projectsCache = { at: now(), index };
     return index;
+  }
+
+  /** describe_session's raw answer; throws when cc does not answer (network, deadline, HTTP, not JSON). */
+  async function describe(sessionId, timeoutMs, signal) {
+    const deadline = AbortSignal.timeout(timeoutMs);
+    const res = await fetchImpl(new URL('/mcp/tools/describe_session', conductorUrl), {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ sessionId }),
+      signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
+    });
+    if (!res.ok) throw new Error(`describe_session answered HTTP ${res.status}`);
+    return res.json();
+  }
+
+  /** How a describe_session answer places a session (see `placeTranscript`). */
+  function interpret(body, handle) {
+    if (body?.ok === false) {
+      return { outcome: 'unplaceable', handle, detail: `${body.code ?? 'error'}${body.reason ? `: ${body.reason}` : ''}`, cacheable: PLACE_REFUSALS.has(body.code) };
+    }
+    if (body?.live && typeof body.live === 'object') return { outcome: 'live', handle };
+    const r = body?.retired;
+    if (!r || typeof r !== 'object' || !nonEmpty(body.project)) {
+      return { outcome: 'unplaceable', handle, detail: 'cc did not answer: describe_session carried no live or retired project', cacheable: false, ccError: true };
+    }
+    return {
+      outcome: 'placed',
+      handle,
+      session: {
+        sessionId: handle,
+        project: body.project,
+        worktree: nonEmpty(body.worktree) ? body.worktree : 'main',
+        kind: body.project === CONDUCTOR_PROJECT ? 'conductor' : 'worker',
+        stage: nonEmpty(r.stage) ? r.stage : null,
+        playbook: nonEmpty(r.playbook) ? r.playbook : null,
+      },
+      title: nonEmpty(r.title) ? r.title : null,
+    };
   }
 
   const freshIndex = () => (now() - projectsCache.at < WORKSPACES_TTL_MS ? projectsCache.index : null);
@@ -92,6 +132,46 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
         stage: typeof live.stage === 'string' && live.stage ? live.stage : null,
         playbook: typeof live.playbook === 'string' && live.playbook ? live.playbook : null,
       };
+    },
+
+    /** Whether this backend has a cc to ask (CONDUCTOR_URL is set). */
+    isConfigured: () => !!conductorUrl,
+
+    /**
+     * Where a saved transcript belongs, from cc's record only (never the file's contents or its
+     * directory name). The file name is a backing id: `describe_session` on it names the handle that
+     * owns it (`SESSION_NOT_A_HANDLE.handle`) or answers that session's row; the handle is then
+     * described once per `handles` memo. A retired session is placed with its last recorded stage.
+     * - `{outcome: 'placed', handle, session, title}`
+     * - `{outcome: 'live', handle}`: still running
+     * - `{outcome: 'unplaceable', handle?, detail, cacheable, ccError?}`: `cacheable` only when cc
+     *   answered that it has no place for it; `ccError` when cc did not answer at all.
+     * Throws only when `signal` aborts.
+     * @param {string} backingId
+     * @param {{timeoutMs: number, signal?: AbortSignal, handles?: Map<string, Promise<object>>}} o
+     */
+    async placeTranscript(backingId, { timeoutMs, signal, handles = new Map() }) {
+      const ask = async (id) => {
+        try { return { body: await describe(id, timeoutMs, signal) }; } catch (e) {
+          if (signal?.aborted) throw e;
+          return { error: e?.name === 'TimeoutError' ? `no answer within ${timeoutMs} ms` : (e?.message ?? String(e)) };
+        }
+      };
+      const noAnswer = (handle, error) => ({ outcome: 'unplaceable', ...(handle ? { handle } : {}), detail: `cc did not answer: ${error}`, cacheable: false, ccError: true });
+      if (!conductorUrl) return noAnswer(null, 'CONDUCTOR_URL is unset');
+      const first = await ask(backingId);
+      if (first.error) return noAnswer(null, first.error);
+      const body = first.body;
+      if (body?.ok === false && body.code === 'SESSION_NOT_A_HANDLE') {
+        if (!isSessionId(body.handle)) return noAnswer(null, 'SESSION_NOT_A_HANDLE named no handle');
+        if (!handles.has(body.handle)) handles.set(body.handle, ask(body.handle));
+        const second = await handles.get(body.handle);
+        return second.error ? noAnswer(body.handle, second.error) : interpret(second.body, body.handle);
+      }
+      if (body?.ok === false) return interpret(body, undefined);
+      const handle = isSessionId(body?.sessionId) ? body.sessionId : backingId;
+      if (!handles.has(handle)) handles.set(handle, Promise.resolve(first));
+      return interpret(body, handle);
     },
 
     /** Stage names across cc's playbooks: `[{name, playbooks: [id]}]`, cached for a minute. Throws when cc cannot be read. */

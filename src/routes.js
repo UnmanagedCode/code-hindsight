@@ -9,6 +9,7 @@ import { USER_SECRETS } from './secrets.js';
 import { summarizeCcBackends } from './llmEnv.js';
 import { VARIANTS, API_IMAGES, CP_IMAGE, HINDSIGHT_VERSION } from './pins.js';
 import { bundleName } from './jobs.js';
+import { BACKFILL_LIMITS } from './backfill.js';
 import { validateScopes, renderBank, templateProblem, SCOPE_ACTIONS, SESSION_KINDS, PLACEHOLDERS, SCOPE_LIMITS } from './scopes.js';
 
 const AUTOSTART_CACHE_MS = 10_000;
@@ -26,11 +27,12 @@ const isJson = (req) => /^application\/json\b/i.test(String(req.headers['content
  * @param {ReturnType<import('./scopes.js').createScopesStore>} o.scopes
  * @param {ReturnType<import('./activity.js').createActivityLog>} o.activity
  * @param {ReturnType<import('./ccSession.js').createCcClient>} o.cc
+ * @param {{latestScan(): object|null}} o.backfill
  * @param {() => Promise<{autoStart?: boolean} | null>} o.fetchPluginRow cc's row for this plugin
  * @param {() => string} o.detectBind
  * @param {{api: string, cp: string}} o.containerNames
  */
-export function createRoutes({ supervisor, jobs, docker, settings: settingsStore, secrets, fetchCcModels, fetchPluginRow, detectBind, containerNames, scopes, activity, cc, now = () => Date.now() }) {
+export function createRoutes({ supervisor, jobs, docker, settings: settingsStore, secrets, fetchCcModels, fetchPluginRow, detectBind, containerNames, scopes, activity, cc, backfill, now = () => Date.now() }) {
   let autoStart = { at: 0, value: undefined };
 
   async function readAutoStart() {
@@ -107,6 +109,7 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
       return renderBank(template, { project: String(s.project ?? 'example'), worktree: String(s.worktree ?? 'main'), kind: String(s.kind ?? 'worker') });
     }],
     ['GET', '/-/api/memory/activity', () => ({ entries: activity.list() })],
+    ['GET', '/-/api/memory/backfill', () => ({ scan: backfill.latestScan() })],
     ['GET', '/-/api/memory/stages', async () => {
       try { return { stages: await cc.fetchStages(), error: null }; } catch (e) { return { stages: [], error: e?.message ?? String(e) }; }
     }],
@@ -129,12 +132,17 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
       if (!j) throw new AppError('NOT_FOUND', { detail: 'no such job' });
       return j;
     }],
+    ['POST', '/-/api/jobs/:id/cancel', async (req, _res, p) => {
+      await readJson(req);
+      return jobs.cancel(p.id);
+    }],
     ['POST', '/-/api/jobs/:kind', async (req, _res, p) => {
       if (p.kind === 'import' && /^application\/octet-stream\b/i.test(String(req.headers['content-type'] ?? ''))) {
         const { done } = jobs.start('import', { stdin: req });
         return done;
       }
-      const { job } = jobs.start(p.kind, await readJson(req));
+      // A backfill selection names every chosen session; it may outgrow the default body limit.
+      const { job } = jobs.start(p.kind, await readJson(req, p.kind === 'backfill-import' ? BACKFILL_LIMITS.selectionMaxBytes : undefined));
       return job;
     }],
     ['GET', '/-/api/logs/:role', async (_req, _res, p) => {

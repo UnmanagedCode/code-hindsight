@@ -10,6 +10,7 @@ import { createDocker } from '../src/docker.js';
 import { createJobs, buildCpCommand, bundleName, BUNDLE_MANIFEST } from '../src/jobs.js';
 import { createCpTrust } from '../src/trust.js';
 import { createTarScanner } from '../src/tarStream.js';
+import { AppError } from '../src/errors.js';
 import { resourceNames, ownerId } from '../src/containerSpec.js';
 import { API_IMAGES, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, UPSTREAM_REVISION } from '../src/pins.js';
 import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, goodApiImage, goodCpImage, helperImage, CP_ID, fakeBundle } from './helpers.mjs';
@@ -231,3 +232,78 @@ test('export, delete-volume and remove-images never trigger a start', async (t) 
 });
 
 const chunks = (buf, n) => { const out = []; for (let i = 0; i < buf.length; i += n) out.push(buf.subarray(i, i + n)); return out; };
+
+// Registered (non-Docker) kinds: the backfill jobs run through this same runner.
+function makeRegistered(t, kinds) {
+  const r = mkRoot(t);
+  fs.mkdirSync(r.dataDir, { recursive: true, mode: 0o700 });
+  const resolves = [];
+  const hooks = [];
+  const docker = { resolve: async () => { resolves.push(1); }, pull: async () => {}, inspectImage: async () => null };
+  const supervisor = { afterPrecondition: async () => { hooks.push('after'); }, refresh: async () => { hooks.push('refresh'); } };
+  const jobs = createJobs({ docker, supervisor, cpTrust: createCpTrust(r.dataDir), names, owner: ownerId(r.dataDir), dataDir: r.dataDir, kinds });
+  return { jobs, resolves, hooks };
+}
+const gate = () => { let open; const p = new Promise((res) => { open = res; }); return { p, open }; };
+
+// A6 / invariant: a registered kind reports progress and never touches Docker or Hindsight's lifecycle.
+test('a registered kind reports progress, skips docker.resolve and the supervisor hook', async (t) => {
+  const g = gate();
+  const seen = [];
+  const { jobs, resolves, hooks } = makeRegistered(t, {
+    work: {
+      cancellable: true,
+      validate: (p) => { if (p.n === undefined) throw new AppError('BAD_REQUEST', { detail: 'n' }); return { n: p.n }; },
+      async run({ n }, { line, progress }) { progress(1, n, 'files'); line('one'); await g.p; progress(n, n, 'files'); return { n }; },
+    },
+  });
+  assert.throws(() => jobs.start('work', {}), { code: 'BAD_REQUEST' });
+  const { job, done } = jobs.start('work', { n: 3 });
+  assert.equal(job.cancellable, true);
+  await new Promise((res) => setImmediate(res));
+  seen.push(jobs.get(job.id).progress);
+  g.open();
+  const end = await done;
+  assert.deepEqual(seen, [{ done: 1, total: 3, unit: 'files' }]);
+  assert.deepEqual([end.state, end.result, end.progress], ['done', { n: 3 }, { done: 3, total: 3, unit: 'files' }]);
+  assert.match(end.tail, /one/);
+  assert.deepEqual([resolves.length, hooks.length], [0, 0]);
+});
+
+// A6 / invariant: only a running, cancellable job can be cancelled; it ends `cancelled`, not failed.
+test('cancel aborts a running cancellable job → state cancelled; a docker job or an ended job is refused JOB_NOT_CANCELLABLE', async (t) => {
+  const g = gate();
+  const { jobs } = makeRegistered(t, {
+    slow: {
+      cancellable: true,
+      validate: () => ({}),
+      async run(_p, { signal }) { await new Promise((_res, rej) => signal.addEventListener('abort', () => rej(new Error('aborted')))); },
+    },
+  });
+  assert.throws(() => jobs.cancel('nope'), { code: 'NOT_FOUND' });
+  const { job, done } = jobs.start('slow', {});
+  const view = jobs.cancel(job.id);
+  assert.equal(view.id, job.id);
+  const end = await done;
+  assert.deepEqual([end.state, end.error], ['cancelled', null]);
+  assert.match(end.tail, /cancelled/);
+  assert.throws(() => jobs.cancel(job.id), (e) => e.code === 'JOB_NOT_CANCELLABLE' && e.params.ended === true);
+  const docker = jobs.start('pull', { variant: 'full' });
+  assert.equal(docker.job.cancellable, false);
+  assert.throws(() => jobs.cancel(docker.job.id), (e) => e.code === 'JOB_NOT_CANCELLABLE' && e.params.ended === false);
+  await docker.done;
+  g.open();
+});
+
+// A6 / invariant: one job at a time across every kind.
+test('a backfill job and a docker job cannot run together (BUSY)', async (t) => {
+  const g = gate();
+  const { jobs } = makeRegistered(t, { 'backfill-scan': { cancellable: true, validate: () => ({}), run: () => g.p } });
+  const scan = jobs.start('backfill-scan', {});
+  assert.throws(() => jobs.start('pull', { variant: 'full' }), (e) => e.code === 'BUSY' && e.params.job === 'backfill-scan');
+  g.open();
+  await scan.done;
+  const pull = jobs.start('pull', { variant: 'full' });
+  assert.throws(() => jobs.start('backfill-scan', {}), (e) => e.code === 'BUSY' && e.params.job === 'pull');
+  await pull.done;
+});
