@@ -29,8 +29,8 @@ test('claudePlugin resolves to a Claude Code plugin root that is not cc\'s own',
   assert.ok(fs.existsSync(path.join(root, 'skills', 'memory', 'SKILL.md')));
 });
 
-test('the hooks: recall, an async retain and a clear|compact reset, each timeout above the hook deadline above the backend budget', async () => {
-  const { HOOK_TIMEOUTS } = await import('../claude/hooks/limits.mjs');
+test('the hooks: recall, an async retain and a clear|compact reset, each timeout above the hook deadline above the recall deadline', async () => {
+  const { HOOK_TIMEOUTS, forceExitMs } = await import('../claude/hooks/limits.mjs');
   const { DESCRIBE_TIMEOUT_MS, WORKSPACES_TIMEOUT_MS } = await import('../src/ccSession.js');
   const { MEMORY_LIMITS } = await import('../src/memory.js');
   const hooks = JSON.parse(fs.readFileSync(path.join(REPO, 'claude', 'hooks', 'hooks.json'), 'utf8')).hooks;
@@ -43,14 +43,15 @@ test('the hooks: recall, an async retain and a clear|compact reset, each timeout
   assert.match(one('SessionStart').command, /hook\.mjs" reset$/);
   const seconds = { recall: one('UserPromptSubmit').timeout, retain: one('Stop').timeout, reset: one('SessionStart').timeout };
   for (const [event, s] of Object.entries(seconds)) assert.ok(s * 1000 > HOOK_TIMEOUTS[event], `${event}: hooks.json timeout must exceed the hook's own deadline`);
-  assert.ok(DESCRIBE_TIMEOUT_MS + WORKSPACES_TIMEOUT_MS + MEMORY_LIMITS.recallTimeoutMs < HOOK_TIMEOUTS.recall, 'the backend budget fits inside the recall hook deadline');
+  for (const [event, s] of Object.entries(seconds)) assert.ok(s * 1000 > forceExitMs(HOOK_TIMEOUTS[event]), `${event}: hooks.json timeout must exceed the hook process's force-exit timer, or Claude Code kills a hook that would have exited cleanly`);
+  assert.ok(MEMORY_LIMITS.recallDeadlineMs < HOOK_TIMEOUTS.recall, 'the backend recall deadline is inside the recall hook deadline');
   assert.ok(DESCRIBE_TIMEOUT_MS + WORKSPACES_TIMEOUT_MS < HOOK_TIMEOUTS.retain, 'resolving a Stop fits inside the retain hook deadline');
 });
 
-test('the recall tool\'s backend budget fits inside cc\'s mcp.timeoutMs', async () => {
-  const { DESCRIBE_TIMEOUT_MS, WORKSPACES_TIMEOUT_MS } = await import('../src/ccSession.js');
+test('the recall tool\'s backend deadline fits inside cc\'s mcp.timeoutMs, which stays within cc\'s cap', async () => {
   const { MEMORY_LIMITS } = await import('../src/memory.js');
-  assert.ok(DESCRIBE_TIMEOUT_MS + WORKSPACES_TIMEOUT_MS + MEMORY_LIMITS.recallTimeoutMs < manifest.mcp.timeoutMs, 'cc must not abort the recall tool before the backend\'s own deadlines answer');
+  assert.ok(MEMORY_LIMITS.recallDeadlineMs < manifest.mcp.timeoutMs, 'cc must not abort the recall tool before the backend\'s own deadline answers');
+  assert.ok(manifest.mcp.timeoutMs <= 120_000, 'cc clamps mcp.timeoutMs to its MCP_TIMEOUT_CAP; a larger value would be silently lowered');
 });
 
 test('the manifest mcp.tools are exactly the tools the backend serves, at the endpoint it serves', async (t) => {

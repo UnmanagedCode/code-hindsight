@@ -151,10 +151,10 @@ Every failure yields a memoryless turn and an Activity entry; the hooks always e
 | cc could not place the session | `SESSION_UNRESOLVED` |
 | session retired or unknown | `SESSION_NOT_LIVE` |
 | Hindsight not ready (retain resends later) | `HINDSIGHT_NOT_READY` |
-| a bank's recall failed or timed out (other banks still answer) | `RECALL_FAILED` |
+| a bank's recall failed or did not answer before the recall deadline (banks that answered still count) | `RECALL_FAILED` |
 | retain failed (the same batch is resent with the next turn) | `RETAIN_FAILED` |
 | a bank template did not render | `BANK_RENDER_FAILED` |
-| cc could not say which workspace the session's project is in (cc unset, unreachable, slower than `WORKSPACES_TIMEOUT_MS`, a bad answer, the project missing from cc's list or its record unreadable). One entry per undecided scope. Recall: that scope adds no bank, other matching scopes still recall. Retain: when it is the first retain scope not ruled out, nothing is recorded or sent (never to a later scope); the next Stop that resolves takes those turns into its own bank. Recall tool: answers this code instead of `NO_RECALL_SCOPE` when no other scope gave a bank | `WORKSPACE_UNRESOLVED` |
+| cc could not say which workspace the session's project is in (cc unset, unreachable, slower than its deadline (`WORKSPACES_TIMEOUT_MS` at Stop and import, the recall deadline on recall), a bad answer, the project missing from cc's list or its record unreadable). One entry per undecided scope. Recall: that scope adds no bank, and other matching scopes still recall when the lookup fails before the recall deadline; a lookup that uses up the deadline leaves them an aborted signal, so their banks fail too (`RECALL_FAILED`). Retain: when it is the first retain scope not ruled out, nothing is recorded or sent (never to a later scope); the next Stop that resolves takes those turns into its own bank. Recall tool: answers this code instead of `NO_RECALL_SCOPE` when no other scope gave a bank | `WORKSPACE_UNRESOLVED` |
 | stored retain progress was unreadable (one entry of the wrong shape, or the whole file, moved aside) and was reset; the next retain starts from the last exchange | `CURSOR_INVALID` |
 | a Stop's turns were stamped beyond the clock-skew allowance (`MEMORY_LIMITS.clockSkewMs`) in the future and were not recorded | `RETAIN_FUTURE` |
 | a late Stop's turns were already behind the retained position and were ignored (nothing lost, nothing sent twice) | `RETAIN_STALE` |

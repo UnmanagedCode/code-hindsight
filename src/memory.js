@@ -8,8 +8,12 @@ import { buildRetainItem } from './retainItem.js';
 import { windowTurns, lastExchangeBoundary, endsAfter, provablyBehind, isOlderTail, isValidCursor, tailEnd, operationIdFor } from './retainCursor.js';
 
 export const MEMORY_LIMITS = Object.freeze({
-  /** Per-bank recall deadline; with the describe_session deadline it must stay under the hook's. */
-  recallTimeoutMs: 2000,
+  /**
+   * One deadline for a whole recall (session lookup, workspace lookup and bank fan-out), started when
+   * the recall begins. Hindsight's rerank takes tens of seconds under load, so it is generous; it must
+   * stay under the hook's and the recall tool's.
+   */
+  recallDeadlineMs: 60_000,
   /** Below the 10,000 characters after which Claude Code persists hook context to a file. */
   contextMaxChars: 8000,
   memoryTextMaxChars: 1500,
@@ -59,23 +63,23 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     }
   }
 
-  async function resolve(event, sessionId) {
-    try { return await cc.resolveSession(sessionId); } catch (e) {
+  async function resolve(event, sessionId, signal) {
+    try { return await cc.resolveSession(sessionId, signal && { signal }); } catch (e) {
       activity.add({ event, outcome: e.code === 'SESSION_NOT_LIVE' ? 'skipped' : 'error', sessionId, code: e.code ?? 'SESSION_UNRESOLVED', message: e.message });
       return null;
     }
   }
 
-  const placeWorkspace = (list, session) => withWorkspace(list, session, cc.workspaceOf);
+  const placeWorkspace = (list, session, signal) => withWorkspace(list, session, signal ? (p) => cc.workspaceOf(p, { signal }) : cc.workspaceOf);
 
   function logSkipped(event, session, m) {
     for (const k of m.skipped) fail(event, session, session.sessionId, new AppError(k.code, { scope: k.scope, detail: k.detail }));
   }
 
   /** Recall every bank in parallel; a bank that fails or times out is reported, the others are used. */
-  async function recallBanks(banks, query) {
+  async function recallBanks(banks, query, signal) {
     return Promise.all(banks.map(async ({ bank }) => {
-      try { return { bank, results: await hindsight.recall(bank, query, { timeoutMs: limits.recallTimeoutMs }) }; } catch (error) { return { bank, error }; }
+      try { return { bank, results: await hindsight.recall(bank, query, { signal }) }; } catch (error) { return { bank, error }; }
     }));
   }
 
@@ -272,12 +276,13 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
      * Never throws.
      */
     async recallForHook(sessionId, prompt) {
+      const signal = AbortSignal.timeout(limits.recallDeadlineMs);
       try {
         const list = loadScopes('recall', sessionId);
         if (!list.length) return NONE;
-        const resolved = await resolve('recall', sessionId);
+        const resolved = await resolve('recall', sessionId, signal);
         if (!resolved) return NONE;
-        const session = await placeWorkspace(list, resolved);
+        const session = await placeWorkspace(list, resolved, signal);
         const m = matchScopes(list, session);
         logSkipped('recall', session, m);
         if (!m.recall.length) return NONE;
@@ -286,7 +291,7 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
           fail('recall', session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks });
           return NONE;
         }
-        const perBank = await recallBanks(m.recall, prompt);
+        const perBank = await recallBanks(m.recall, prompt, signal);
         for (const b of perBank) if (b.error) fail('recall', session, sessionId, b.error, { banks: [b.bank] });
         const out = formatContext(perBank, injected.get(sessionId));
         activity.add({ event: 'recall', outcome: 'ok', sessionId, ...ctx(session), banks: perBank.filter((b) => b.results).map((b) => b.bank), count: out?.count ?? 0 });
@@ -327,14 +332,15 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
      */
     async recallForMcp(sessionId, query) {
       if (!sessionId) throw new AppError('NO_SESSION');
+      const signal = AbortSignal.timeout(limits.recallDeadlineMs);
       const list = loadScopes('mcp-recall', sessionId);
       if (!list.length) throw new AppError('NO_RECALL_SCOPE');
       let resolved;
-      try { resolved = await cc.resolveSession(sessionId); } catch (e) {
+      try { resolved = await cc.resolveSession(sessionId, { signal }); } catch (e) {
         activity.add({ event: 'mcp-recall', outcome: e.code === 'SESSION_NOT_LIVE' ? 'skipped' : 'error', sessionId, code: e.code, message: e.message });
         throw e;
       }
-      const session = await placeWorkspace(list, resolved);
+      const session = await placeWorkspace(list, resolved, signal);
       const m = matchScopes(list, session);
       logSkipped('mcp-recall', session, m);
       const undecided = m.skipped.find((k) => k.code === 'WORKSPACE_UNRESOLVED');
@@ -350,7 +356,7 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
         fail('mcp-recall', session, sessionId, e, { banks });
         throw e;
       }
-      const perBank = await recallBanks(m.recall, query);
+      const perBank = await recallBanks(m.recall, query, signal);
       for (const b of perBank) if (b.error) fail('mcp-recall', session, sessionId, b.error, { banks: [b.bank] });
       if (perBank.every((b) => b.error)) throw perBank[0].error;
       const out = formatContext(perBank, null);

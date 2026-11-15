@@ -4,10 +4,7 @@
 // or garbage input can only ever cost a turn its memory. Stop must print nothing (stdout or exit 2
 // on Stop would keep the session running).
 import { readTranscriptTail, stripInjectedMemory, trimTurnsToBytes } from './transcript.mjs';
-import { HOOK_TIMEOUTS, RECALL_QUERY_MAX_CHARS, RETAIN_TAIL_BYTES } from './limits.mjs';
-
-/** How long `retain` waits for the transcript to hold the final assistant message. */
-const TRANSCRIPT_WAIT_MS = 1000;
+import { HOOK_TIMEOUTS, RECALL_QUERY_MAX_CHARS, RETAIN_TAIL_BYTES, TRANSCRIPT_WAIT_MS, forceExitMs } from './limits.mjs';
 
 const env = process.env;
 const override = Number(env.CODE_HINDSIGHT_HOOK_TIMEOUT_MS);
@@ -76,7 +73,7 @@ async function run(event) {
 
 const event = process.argv[2];
 // Backstop: whatever hangs (stdin, a socket), the process is gone shortly after its deadline.
-setTimeout(() => process.exit(0), (deadline(event) ?? 1500) + TRANSCRIPT_WAIT_MS + 500).unref();
+setTimeout(() => process.exit(0), forceExitMs(deadline(event) ?? 1500)).unref();
 let out = null;
 try { out = await run(event); } catch { /* a hook failure is a memoryless turn, never an error */ }
 if (event === 'recall' && out) process.stdout.write(`${out}\n`, () => process.exit(0));
