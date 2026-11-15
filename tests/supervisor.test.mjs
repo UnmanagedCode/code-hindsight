@@ -769,6 +769,23 @@ test('LB11c: a reconcile that fails before the relay step keeps the tunnel, stat
   assert.ok(dockerState(r).containers[names.relay], 'the relay container stays');
 });
 
+// LB11d: an unlink whose relay removal fails still ends with no relay in status, and the removal error is what is reported.
+test('LB11d: a failing relay removal while unlinking leaves status.relay null and surfaces the original error', async (t) => {
+  const rows = { backends: [loopRow(), directRow] };
+  const { sup, relay, settingsStore, env } = make(t, { settings: linkTo('opencode'), fetchCcModels: async () => rows });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  const s = settingsStore.get();
+  s.llm = { ...s.llm, backendId: 'remote' };
+  settingsStore.save(s);
+  env.FAKE_DOCKER_MODE = 'fail-rm';
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'error');
+  assert.match(sup.status().error.message, /injected failure of rm/);
+  assert.deepEqual(relay.calls.at(-1), ['stop']);
+  assert.equal(sup.status().relay, null);
+});
+
 const stopArgs = (r) => dockerCalls(r).find((a) => a[0] === 'stop');
 
 // R2-C2: the shutdown's look at the relay is bounded, so a hung `docker inspect` cannot hold up the detached stop.

@@ -264,6 +264,7 @@ export function createSupervisor({
       relayStarted = true;
     } else {
       relay.stop();
+      relayLinked = false; // before the removal can throw: status must not show a relay that is no longer served
       await removeOwnedRelay();
     }
     relayLinked = relayTarget !== null;
