@@ -122,7 +122,7 @@ switch (cmd) {
     const opt = (flag) => { const i = rest.indexOf(flag); return i === -1 ? null : rest[i + 1]; };
     const name = opt('--name');
     // The image is the first positional after the options (a command may follow it).
-    const valued = new Set(['--name', '--network', '--network-alias', '--restart', '-p', '-v', '--label', '--env-file', '--security-opt', '--cap-drop', '--entrypoint']);
+    const valued = new Set(['--name', '--network', '--network-alias', '--restart', '-p', '-v', '--label', '--env-file', '--security-opt', '--cap-drop', '--entrypoint', '--shm-size']);
     let image;
     for (let i = 0; i < rest.length; i++) {
       if (!rest[i].startsWith('-')) { image = rest[i]; break; }
