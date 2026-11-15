@@ -16,7 +16,7 @@ const sum = (rows: BackfillSession[]) => rows.reduce((a, r) => ({ chunks: a.chun
 /** A price the user typed, or null while it is not a non-negative number. */
 const price = (v: string) => (v.trim() !== '' && Number.isFinite(Number(v)) && Number(v) >= 0 ? Number(v) : null);
 
-/** Banks in order of first appearance, each with its sessions. */
+/** Banks in order of first appearance, each with its sessions. The API lists sessions newest-modified first, so a bank sits where its newest session is. */
 function byBank(sessions: BackfillSession[]) {
   const groups = new Map<string, BackfillSession[]>();
   for (const s of sessions) groups.set(s.bank, [...(groups.get(s.bank) ?? []), s]);

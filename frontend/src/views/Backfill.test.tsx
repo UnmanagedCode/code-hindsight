@@ -8,7 +8,7 @@ import type { BackfillScan, BackfillSession } from '@/lib/types';
 
 const row = (key: string, over: Partial<BackfillSession> = {}): BackfillSession => ({
   key, handle: key.split(':')[0], backingId: key.split(':')[1], project: 'proj', worktree: 'main', kind: 'worker', stage: 'implement', title: `Session ${key}`,
-  firstAt: '2026-01-01T00:00:00.000Z', lastAt: '2026-01-02T00:00:00.000Z', turns: 10, documents: 1, chars: 3000, bank: 'cc-proj', scope: 'all',
+  modifiedAt: '2026-01-03T00:00:00.000Z', firstAt: '2026-01-01T00:00:00.000Z', lastAt: '2026-01-02T00:00:00.000Z', turns: 10, documents: 1, chars: 3000, bank: 'cc-proj', scope: 'all',
   status: 'ready', cutoffAt: null, untimed: 0, malformed: 0, oversized: 0, stored: 0, outdated: 0, orphans: 0, estimate: { chunks: 1, inputTokens: 1000, outputTokens: 500 }, ...over,
 });
 
@@ -57,6 +57,18 @@ describe('Backfill', () => {
     expect((screen.getByRole('button', { name: 'Scan transcripts' }) as HTMLButtonElement).disabled).toBe(true);
     await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
     await waitFor(() => expect(calls.some((c) => c.url === '-/api/jobs/j1/cancel' && c.init?.method === 'POST')).toBe(true));
+  });
+
+  it('banks and sessions render in scan order: a bank sits where its newest session is', async () => {
+    stub(scanOf([
+      row('h9:b9', { bank: 'cc-zed' }), row('h2:b2', { bank: 'cc-alpha' }), row('h8:b8', { bank: 'cc-zed' }), row('h1:b1', { bank: 'cc-alpha' }),
+    ]));
+    render(<Backfill status={status()} />);
+    await waitFor(() => { if (!document.querySelector('[data-bank]')) throw new Error('no group'); });
+    const attr = (root: ParentNode, sel: string, name: string) => [...root.querySelectorAll(sel)].map((e) => e.getAttribute(name));
+    expect(attr(document, '[data-bank]', 'data-bank')).toEqual(['cc-zed', 'cc-alpha']);
+    expect(attr(document.querySelector('[data-bank="cc-zed"]')!, '[data-session]', 'data-session')).toEqual(['h9:b9', 'h8:b8']);
+    expect(attr(document.querySelector('[data-bank="cc-alpha"]')!, '[data-session]', 'data-session')).toEqual(['h2:b2', 'h1:b1']);
   });
 
   // A4: the dry run's default selection is every ready session; imported ones cannot be picked.

@@ -75,12 +75,13 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 {scanId, scannedAt, scopesHash, hindsightChecked, llm: {mode, model|null}, basis: BACKFILL_ESTIMATE,
  totals: {files, ready, imported, skipped, cached, resolved, estimate: {chunks, inputTokens, outputTokens}},
  sessions: [{key: "<handle>:<backingId>", handle, backingId, project, worktree, kind, stage|null, title|null,
-             firstAt, lastAt, turns, documents, chars, bank, scope, status: ready|imported,
+             modifiedAt, firstAt, lastAt, turns, documents, chars, bank, scope, status: ready|imported,
              cutoffAt|null, untimed, malformed, oversized, stored, outdated, orphans,
              estimate: {chunks, inputTokens, outputTokens}}],
  skipped: [{key, handle|null, backingId, project?, worktree?, stage?, code, message}]}
 ```
 
+- `sessions` are ordered by `modifiedAt` (the transcript file's mtime), newest first; equal times keep transcript path order. `firstAt`/`lastAt` bound only the turns that would be imported (before `cutoffAt`), so they are not the order.
 - `scopesHash`: SHA-256 of the saved scopes' JSON at scan time; an import against another hash is `BACKFILL_STALE`.
 - `hindsightChecked: false`: Hindsight was not ready (or failed mid-scan), so live overlap and earlier imports were not checked for the rest. A transcript that cannot be read is skipped on its own (`TRANSCRIPT_UNREADABLE`) and leaves the checks on.
 - `status: imported`: every part is stored (below) and none is orphaned; otherwise `ready`, with `stored`, `outdated` and `orphans` counting the bank's parts.

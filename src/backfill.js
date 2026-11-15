@@ -367,7 +367,7 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
         if (status === 'imported') totals.imported++; else totals.ready++;
         sessions.push({
           key, handle, backingId: f.backingId, project: session.project, worktree: session.worktree, kind: session.kind, stage: session.stage,
-          title: entry.title ?? null, firstAt: summary.firstAt, lastAt: summary.lastAt, turns: summary.turns, documents: summary.parts.length, chars,
+          title: entry.title ?? null, modifiedAt: new Date(st.mtimeMs).toISOString(), firstAt: summary.firstAt, lastAt: summary.lastAt, turns: summary.turns, documents: summary.parts.length, chars,
           bank: aim.bank, scope: aim.scope, status, cutoffAt: cut === null ? null : new Date(cut).toISOString(), untimed: summary.untimed,
           malformed: summary.malformed, oversized: summary.oversized, stored: state.stored, outdated: state.outdated, orphans: state.orphanParts.length, estimate,
         });
@@ -383,6 +383,8 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
       placements.save();
     }
 
+    // Newest change first; the sort is stable, so equal times keep transcript path order.
+    sessions.sort((a, b) => Date.parse(b.modifiedAt) - Date.parse(a.modifiedAt));
     const ready = sessions.filter((r) => r.status === 'ready');
     const view = {
       scanId: crypto.randomBytes(8).toString('hex'),

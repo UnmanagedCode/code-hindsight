@@ -80,6 +80,24 @@ const retainedDocs = (hs) => hs.retains().flatMap((r) => r.body.items.map((i) =>
 // --- A2: placement through cc's record, never by guessing ---
 
 // A2 / invariant: a file name is a backing id; the handle cc names for it decides project, worktree and last stage.
+test('scan sessions are listed newest-modified first; equal modification times keep transcript path order', async (t) => {
+  const x = await setup(t);
+  const T = new Date('2026-02-01T00:00:00.000Z').getTime();
+  const at = (f, ms) => fs.utimesSync(f, new Date(ms), new Date(ms));
+  const H2 = 2 * 3600e3;
+  const f1 = x.place(1);
+  const f2 = x.place(2);
+  const f3 = x.place(3);
+  at(f1, T); at(f2, T + H2); at(f3, T);
+  ok(await x.scan());
+  assert.deepEqual(x.backfill.latestScan().sessions.map((s) => s.key), [KEY(2), KEY(1), KEY(3)]);
+  assert.equal(x.row(KEY(2)).modifiedAt, new Date(T + H2).toISOString());
+
+  at(f1, T + 3 * 3600e3);
+  ok(await x.scan());
+  assert.equal(x.backfill.latestScan().sessions[0].key, KEY(1), 'a changed file moves up on the next scan');
+});
+
 test('a transcript is placed through the handle cc names for its backing id, with that session\'s project, worktree and last stage', async (t) => {
   const x = await setup(t);
   x.place(1, { project: 'proj', worktree: 'feature', stage: 'review', title: 'Fix the parser' });
@@ -102,7 +120,7 @@ test('two segments of one handle are described by handle once per scan', async (
   x.place(1, { backing: 'b-1b', body: exchanges(1, { prefix: 'second-', fromSec: 100 }) });
   ok(await x.scan());
   assert.equal(x.cc.describedIds().filter((id) => id === H(1)).length, 1);
-  assert.deepEqual(x.backfill.latestScan().sessions.map((s) => s.key), [KEY(1, 'b-1a'), KEY(1, 'b-1b')]);
+  assert.deepEqual(x.backfill.latestScan().sessions.map((s) => s.key).sort(), [KEY(1, 'b-1a'), KEY(1, 'b-1b')]);
 });
 
 // A2 / invariant: what cc cannot place is reported with cc's reason and never sent anywhere.
@@ -338,7 +356,7 @@ test('a scan sends no retain and no operation request; it reports sessions, targ
   assert.deepEqual(x.hs.of('retain', 'operation', 'retry'), []);
   assert.ok(x.hs.of('document').length > 0 && x.hs.requests.every((r) => r.kind === 'document' && r.method === 'GET'));
   const scan = x.backfill.latestScan();
-  assert.deepEqual(scan.sessions.map((s) => [s.key, s.bank]), [[KEY(1), 'cc-proj'], [KEY(2), 'cc-other']]);
+  assert.deepEqual(scan.sessions.map((s) => [s.key, s.bank]).sort(), [[KEY(1), 'cc-proj'], [KEY(2), 'cc-other']]);
   const row = x.row(KEY(1));
   assert.deepEqual(row.estimate, estimateDocument(row.chars, 'manual'));
   assert.ok(row.estimate.inputTokens > 0 && row.estimate.outputTokens > 0);
@@ -485,12 +503,13 @@ test('a segment over documentMaxChars is split at turn boundaries into p1..pn wi
 // A6 / invariant: one summary entry per job (the ring keeps live entries), plus one per failed session.
 test('a scan and an import each add one activity entry; a failed session adds an error entry with its code', async (t) => {
   const x = await setup(t);
-  x.place(1);
-  x.place(2, { project: 'other', stage: 'plan' });
+  // Pinned mtimes: the activity entries follow scan order, which is newest-modified first.
+  fs.utimesSync(x.place(1), new Date(2e12), new Date(2e12));
+  fs.utimesSync(x.place(2, { project: 'other', stage: 'plan' }), new Date(1e12), new Date(1e12));
   ok(await x.scan());
   x.hs.retainStatus = 400;
   const result = ok(await x.import([KEY(1), KEY(2)]));
-  assert.deepEqual(result.failed.map((f) => [f.key, f.code]), [[KEY(1), 'RETAIN_FAILED'], [KEY(2), 'RETAIN_FAILED']]);
+  assert.deepEqual(result.failed.map((f) => [f.key, f.code]).sort(), [[KEY(1), 'RETAIN_FAILED'], [KEY(2), 'RETAIN_FAILED']]);
   const entries = x.activity.list().reverse();
   assert.deepEqual(entries.map((e) => [e.event, e.outcome]), [['backfill-scan', 'ok'], ['backfill-import', 'error'], ['backfill-import', 'error'], ['backfill-import', 'ok']]);
   assert.deepEqual([entries[0].count, entries[0].banks], [2, ['cc-proj', 'cc-other']]);

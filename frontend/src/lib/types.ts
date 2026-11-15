@@ -159,6 +159,8 @@ export interface BackfillSession {
   kind: 'conductor' | 'worker';
   stage: string | null;
   title: string | null;
+  /** The transcript file's modification time; the scan lists sessions newest first by it. */
+  modifiedAt: string;
   firstAt: string | null;
   lastAt: string | null;
   turns: number;
