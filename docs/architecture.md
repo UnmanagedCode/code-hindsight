@@ -46,7 +46,7 @@ The Claude Code side is a plugin root, `claude/` (declared by `claudePlugin` in 
 | `cpProxy.js` | the CP reverse proxy (base path, Location, cookies, re-sign-in, CSRF, not-ready page) |
 | `routes.js` | `/-/api/*` |
 | `scopes.js` | scope shape and validation, the glob matcher, bank-template rendering, `matchScopes`, `withWorkspace` (asks cc for the workspace only when a scope needs it), the `scopes.json` store |
-| `ccSession.js` | read-only cc client: `resolveSession` (`describe_session`), `placeTranscript` (a transcript's backing id → its handle's record), `fetchStages`, `workspaceOf` (`list_projects`, cached index), and the picker reads `listProjects` / `listWorkspaces` |
+| `ccSession.js` | read-only cc client: `resolveSession` (`describe_session`), `placeTranscript` (a transcript's backing id → its handle's record), `fetchStages`, `workspaceOf` (`list_projects`, cached index), and the scope editor's suggestion reads `listProjects` / `listWorkspaces` |
 | `hindsightClient.js` | recall and retain calls over `supervisor.connection()`; for backfill also document reads, operation status and retry |
 | `retainItem.js` | the retain item both live retain and backfill send (`buildRetainItem`, `renderTurn`, `RETAIN_CONTEXT`) |
 | `backfill.js` | the backfill importer: the `backfill-scan` and `backfill-import` job kinds, the overlap rule, parts, the estimate; owns `BACKFILL_LIMITS` and `BACKFILL_ESTIMATE` |
@@ -153,6 +153,7 @@ Memory tab ── POST /-/api/jobs/backfill-scan ──► jobs.js ──► bac
 | `npm test` | `test:server` (node:test, `tests/*.test.mjs`), `typecheck` (`tsc -p frontend`), `test:web` (Vitest, `frontend/src/**/*.test.tsx`). Needs no Docker |
 | `RUN_REAL_DOCKER=1 npm run test:real` | `tests/*.real.test.mjs` against the real daemon with the locally present pinned images (never pulls) |
 | + `CODE_HINDSIGHT_CHROMIUM=<chrome binary>` or `CODE_HINDSIGHT_CDP_URL=<CDP endpoint>` | also runs `tests/cp-basepath.real.test.mjs`, the CP under the base path in a real browser (with `frontend/dist` built, also inside a cc-style frame through the shell's nested frame) |
+| + `CODE_HINDSIGHT_CHROMIUM` or `CODE_HINDSIGHT_CDP_URL`, with `RUN_REAL_DOCKER=1` and `frontend/dist` built | `node --test tests/scope-editor.real.test.mjs` alone runs the scope editor in a real browser inside a cc-style frame, over the fake docker and a fake cc (no Hindsight, no Docker daemon): collapse, the suggestion list's position and width under its input (frame and 390 px viewport), keyboard |
 | `RUN_REAL_CLI=1 node --test tests/hooks-cli.real.test.mjs` | the hook path in a real `claude -p --input-format stream-json` session against a fake backend: the prompt hook fires, its context reaches the model, the async Stop posts the turns (needs the `claude` CLI and its login) |
 | + `CODE_HINDSIGHT_TEST_EMBEDDINGS_KEY` (optional `_MODEL`, `_BASE_URL`) | also runs the slim-image test with remote embeddings and the `rrf` reranker |
 

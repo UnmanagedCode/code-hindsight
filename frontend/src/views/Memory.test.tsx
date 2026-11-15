@@ -25,6 +25,12 @@ function stub({ scopes = [] as Scope[], stages = { stages: [{ name: 'plan', play
     return undefined;
   });
 }
+/** Open a saved scope's card (they load collapsed) and return its element. */
+async function expand(name: string): Promise<HTMLElement> {
+  const toggle = await screen.findByRole('button', { name: new RegExp(`^${name}`) });
+  if (toggle.getAttribute('aria-expanded') !== 'true') await userEvent.click(toggle);
+  return toggle.closest('[data-scope]') as HTMLElement;
+}
 const putBody = (calls: { url: string; init?: RequestInit }[]) => JSON.parse(String(calls.find((c) => c.init?.method === 'PUT')!.init!.body)) as { scopes: Scope[] };
 
 describe('Memory', () => {
@@ -54,7 +60,8 @@ describe('Memory', () => {
   it('sends an omitted match key for "any" and a list only for what was narrowed', async () => {
     const calls = stub({ scopes: [scope('a')] });
     render(<Memory status={status()} />);
-    await userEvent.type(await screen.findByLabelText(/Projects/), 'code-*{Enter}proj');
+    await expand('a');
+    await userEvent.type(await screen.findByLabelText(/Projects/), 'code-*{Enter}proj{Enter}');
     await userEvent.click(screen.getByLabelText('conductor'));
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
@@ -66,6 +73,7 @@ describe('Memory', () => {
     const calls = stub({ scopes: [scope('old')] });
     render(<Memory status={status()} />);
     await userEvent.click(await screen.findByRole('button', { name: 'Add scope' }));
+    expect(screen.getByRole('button', { name: /^scope 2/ }).getAttribute('aria-expanded')).toBe('true');
     await userEvent.click(screen.getByRole('button', { name: 'Delete old' }));
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
@@ -83,6 +91,7 @@ describe('Memory', () => {
     render(<Memory status={status()} />);
     await userEvent.click(await screen.findByRole('button', { name: 'Save' }));
     await waitFor(() => expect(document.querySelector('[data-field-error="scopes[1].bank"]')).not.toBeNull());
+    for (const n of ['a', 'b']) expect(screen.getByRole('button', { name: new RegExp(`^${n}`) }).getAttribute('aria-expanded')).toBe('true');
     expect(within(document.querySelector('[data-scope="1"]') as HTMLElement).getByText('unknown placeholder')).toBeTruthy();
     expect(within(document.querySelector('[data-scope="0"]') as HTMLElement).getByText('must be a non-empty list')).toBeTruthy();
   });
@@ -90,6 +99,7 @@ describe('Memory', () => {
   it('warns about a stage cc does not know but still saves it', async () => {
     const calls = stub({ scopes: [scope('a', { match: { stages: ['plan', 'bogus'] } })] });
     render(<Memory status={status()} />);
+    await expand('a');
     await screen.findByText('bogus');
     expect(document.querySelector('[data-stage="bogus"]')!.textContent).toMatch(/unknown to cc/);
     expect(document.querySelector('[data-stage="plan"]')!.textContent).not.toMatch(/unknown to cc/);
@@ -101,6 +111,7 @@ describe('Memory', () => {
   it('says when cc\'s stage names could not be read, and flags nothing as unknown', async () => {
     stub({ scopes: [scope('a', { match: { stages: ['whatever'] } })], stages: { stages: [], error: 'cc is down' } });
     render(<Memory status={status()} />);
+    await expand('a');
     expect(await screen.findByText(/stage names could not be read/)).toBeTruthy();
     expect(document.querySelector('[data-stage="whatever"]')!.textContent).not.toMatch(/unknown to cc/);
   });
@@ -118,6 +129,7 @@ describe('Memory', () => {
   it('never lets both session kinds be cleared, and says what the ticks mean', async () => {
     const calls = stub({ scopes: [scope('a')] });
     render(<Memory status={status()} />);
+    await expand('a');
     const conductor = (await screen.findByLabelText('conductor')) as HTMLInputElement;
     const worker = screen.getByLabelText('worker') as HTMLInputElement;
     expect(screen.getByText(/Both ticked: any session/)).toBeTruthy();
@@ -131,30 +143,113 @@ describe('Memory', () => {
     expect(putBody(calls).scopes[0].match.sessions).toEqual(['worker']);
   });
 
-  it('adds a picked cc project as its exact name on a new line, keeps typed globs, and never adds it twice', async () => {
+  // spec 2/3: one autocomplete list input serves Projects, Workspaces and Stages; the pickers are gone.
+  it('Projects, Workspaces and Stages each use the same combobox and Add button, with no "from cc" pickers', async () => {
+    stub({ scopes: [scope('a')] });
+    render(<Memory status={status()} />);
+    const card = within(await expand('a'));
+    for (const noun of ['project', 'workspace', 'stage']) expect(card.getByRole('button', { name: `Add ${noun}` })).toBeTruthy();
+    expect(card.getAllByRole('combobox')).toHaveLength(3);
+    expect(screen.queryByRole('button', { name: /from cc/ })).toBeNull();
+    expect(document.querySelector('textarea, datalist')).toBeNull();
+  });
+
+  // spec 2: a typed glob and a suggestion both land in the saved list.
+  it('saves a typed project glob together with a picked cc project, never twice', async () => {
     const calls = stub({ scopes: [scope('a')] });
     render(<Memory status={status()} />);
-    await userEvent.type(await screen.findByLabelText(/Projects/), 'code-*');
-    await userEvent.click(screen.getByRole('button', { name: 'Pick projects from cc' }));
-    await userEvent.type(screen.getByLabelText('Search cc projects'), 'hind');
-    expect(screen.queryByRole('button', { name: 'Add project code-wiki' })).toBeNull();
-    await userEvent.click(screen.getByRole('button', { name: 'Add project code-hindsight' }));
-    expect((screen.getByRole('button', { name: 'Add project code-hindsight' }) as HTMLButtonElement).disabled).toBe(true);
-    await userEvent.clear(screen.getByLabelText('Search cc projects'));
-    await userEvent.type(screen.getByLabelText('Search cc projects'), 'no workspace');
-    expect(screen.getByRole('button', { name: 'Add project notes' })).toBeTruthy();
+    await expand('a');
+    const projects = screen.getByLabelText(/Projects/);
+    await userEvent.type(projects, 'code-*{Enter}hind');
+    await userEvent.click(screen.getByRole('option', { name: /code-hindsight/ }));
+    await userEvent.type(projects, 'code-hind');
+    expect(screen.queryByRole('option', { name: /code-hindsight/ })).toBeNull();
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
-    expect(putBody(calls).scopes[0].match.projects).toEqual(['code-*', 'code-hindsight']);
+    expect(putBody(calls).scopes[0].match.projects).toEqual(['code-*', 'code-hindsight', 'code-hind']);
+  });
+
+  // spec 2, cost: suggestions come from the page's one mount-time read.
+  it('typing in several Projects inputs makes exactly one cc-projects request', async () => {
+    const calls = stub({ scopes: [scope('a'), scope('b')] });
+    render(<Memory status={status()} />);
+    for (const n of ['a', 'b']) {
+      const card = within(await expand(n));
+      await userEvent.type(card.getByLabelText(/Projects/), 'code');
+    }
+    expect(calls.filter((c) => c.url === '-/api/memory/cc-projects')).toHaveLength(1);
+  });
+
+  // compat: the stored format is unchanged.
+  it('round-trips saved match.projects unchanged', async () => {
+    const calls = stub({ scopes: [scope('a', { match: { projects: ['a', 'b*'] } })] });
+    render(<Memory status={status()} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    expect(putBody(calls).scopes[0].match.projects).toEqual(['a', 'b*']);
+  });
+
+  // spec 1
+  it('loads saved scopes collapsed with a summary of what they narrow, and expands on demand', async () => {
+    stub({ scopes: [scope('narrow', { match: { projects: ['a', 'b', 'c', 'd', 'e'], workspaces: ['CC-Dev'], sessions: ['worker'] } }), scope('open-ended')] });
+    render(<Memory status={status()} />);
+    const toggle = await screen.findByRole('button', { name: /^narrow/ });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.textContent).toMatch(/projects a, b \+3/);
+    expect(toggle.textContent).toMatch(/workspaces CC-Dev/);
+    expect(toggle.textContent).toMatch(/worker only/);
+    expect(toggle.textContent).not.toMatch(/stages/);
+    expect(screen.getByRole('button', { name: /^open-ended/ }).textContent).toMatch(/any session/);
+    expect(document.getElementById(toggle.getAttribute('aria-controls')!)!.hidden).toBe(true);
+    await userEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(document.getElementById(toggle.getAttribute('aria-controls')!)!.hidden).toBe(false);
+  });
+
+  // spec 1
+  it('moves and deletes a scope while it is collapsed', async () => {
+    const calls = stub({ scopes: [scope('alpha'), scope('beta')] });
+    render(<Memory status={status()} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Move beta up' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Delete alpha' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    expect(putBody(calls).scopes.map((x) => x.name)).toEqual(['beta']);
+  });
+
+  // spec 1: a hidden error is never silent.
+  it('opens the collapsed scope a refusal names, marks it invalid, and shows the error', async () => {
+    stub({
+      scopes: [scope('a'), scope('b')],
+      put: () => ({ status: 400, body: { code: 'SCOPES_INVALID', message: 'x', params: { fields: [{ field: 'scopes[1].bank', message: 'unknown placeholder' }] } } }),
+    });
+    render(<Memory status={status()} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Save' }));
+    const b = await screen.findByRole('button', { name: /^b/ });
+    expect(b.getAttribute('aria-expanded')).toBe('true');
+    expect(b.textContent).toMatch(/invalid/);
+    expect(screen.getByRole('button', { name: /^a/ }).getAttribute('aria-expanded')).toBe('false');
+    expect((await screen.findByText('unknown placeholder')).closest('[hidden]')).toBeNull();
+  });
+
+  // spec 1
+  it('keeps each card open or collapsed across Save', async () => {
+    stub({ scopes: [scope('a'), scope('b')] });
+    render(<Memory status={status()} />);
+    await expand('a');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await screen.findByRole('status');
+    expect(screen.getByRole('button', { name: /^a/ }).getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByRole('button', { name: /^b/ }).getAttribute('aria-expanded')).toBe('false');
   });
 
   it('saves a workspace picked from cc and a typed workspace glob; a scope with none sends no workspaces key', async () => {
     const calls = stub({ scopes: [scope('a'), scope('b')] });
     render(<Memory status={status()} />);
-    const first = within(await waitFor(() => { const el = document.querySelector('[data-scope="0"]'); if (!el) throw new Error('no scope'); return el as HTMLElement; }));
-    await userEvent.click(first.getByRole('button', { name: 'Pick workspaces from cc' }));
-    expect(first.getByRole('button', { name: 'Add workspace HOME' })).toBeTruthy();
-    await userEvent.click(first.getByRole('button', { name: 'Add workspace CC-Dev' }));
+    const first = within(await expand('a'));
+    await userEvent.click(first.getByLabelText(/Workspaces/));
+    expect(first.getByRole('option', { name: /HOME/ })).toBeTruthy();
+    await userEvent.click(first.getByRole('option', { name: /CC-Dev/ }));
     await userEvent.type(first.getByLabelText(/Workspaces/), 'TT*{Enter}');
     expect(document.querySelector('[data-workspace="TT*"]')!.textContent).not.toMatch(/unknown to cc/);
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
@@ -170,18 +265,21 @@ describe('Memory', () => {
       put: () => ({ status: 400, body: { code: 'SCOPES_INVALID', message: 'x', params: { fields: [{ field: 'scopes[0].match.workspaces', message: '"a/b" is not a glob' }] } } }),
     });
     render(<Memory status={status()} />);
+    await expand('a');
     await waitFor(() => expect(document.querySelector('[data-workspace="Gone"]')?.textContent).toMatch(/unknown to cc/));
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await expand('a');
     const alert = await waitFor(() => { const el = document.querySelector('[data-field-error="scopes[0].match.workspaces"]'); if (!el) throw new Error('no alert'); return el; });
     expect(alert.getAttribute('role')).toBe('alert');
   });
 
-  it('without cc\'s lists there are no pickers, typed projects and workspaces still save', async () => {
+  it('without cc\'s lists there are no suggestions, typed projects and workspaces still save', async () => {
     const calls = stub({ scopes: [scope('a')], ccProjects: null });
     render(<Memory status={status()} />);
+    await expand('a');
     expect(await screen.findByText(/project and workspace lists could not be read/)).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /from cc/ })).toBeNull();
-    await userEvent.type(screen.getByLabelText(/Projects/), 'proj');
+    await userEvent.type(screen.getByLabelText(/Projects/), 'proj{Enter}');
+    expect(screen.queryByRole('listbox')).toBeNull();
     await userEvent.type(screen.getByLabelText(/Workspaces/), 'CC-Dev{Enter}');
     expect(document.querySelector('[data-workspace="CC-Dev"]')!.textContent).not.toMatch(/unknown to cc/);
     await userEvent.click(screen.getByRole('button', { name: 'Save' }));
@@ -193,10 +291,11 @@ describe('Memory', () => {
     const hostile = '<img src=x onerror=alert(1)>';
     stub({ scopes: [scope('a')], ccProjects: { projects: [{ name: hostile, workspace: hostile }], workspaces: [{ name: hostile, projectCount: 1 }], error: null } });
     render(<Memory status={status()} />);
-    await userEvent.click(await screen.findByRole('button', { name: 'Pick projects from cc' }));
-    await userEvent.click(screen.getByRole('button', { name: 'Pick workspaces from cc' }));
-    expect(screen.getByRole('button', { name: `Add project ${hostile}` }).textContent).toContain(hostile);
-    expect(screen.getByRole('button', { name: `Add workspace ${hostile}` }).textContent).toContain(hostile);
+    const card = within(await expand('a'));
+    await userEvent.click(card.getByLabelText(/Projects/));
+    expect(card.getByRole('option').textContent).toBe(hostile + hostile);
+    await userEvent.click(card.getByLabelText(/Workspaces/));
+    expect(card.getByRole('option').textContent).toBe(hostile + '1 projects');
     expect(document.querySelector('img')).toBeNull();
   });
 });
