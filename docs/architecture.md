@@ -11,11 +11,11 @@ browser ── cc /plugins/code-hindsight/* ──► backend (node:http, 127.0.
                      supervisor.js ── docker.js ── docker | sudo -n docker ──► <bind>:<apiPort> API container ◄─┘
                                                                                └─ volume code-hindsight-data (.pg0)
 
-Ollama link (only while the LLM is linked to cc's Ollama backend):
-  API container ──http://ollama:11434/v1 (Bearer relayKey)──► relay container  <prefix>-relay  (API-side port not published)
+Relay link (only while the LLM is linked to cc's Ollama backend or a loopback cc backend; one target at a time):
+  API container ──http://<target alias>:<port> (relayKey)──► relay container  <prefix>-relay  (API-side port not published)
                                                                    ▲ pairs each API connection with one idle tunnel
   plugin: relayTunnel.js ──dials out──► <bind>:<relayPort> ─► relay :RELAY_TUNNEL_PORT
-          └─ on pairing: ollamaProxy.js (key check, allowlist) ──► ollamaUrl (cc's Ollama daemon, loopback in cc's container)
+          └─ on pairing: relayProxy.js (key check, allowlist, credential injection) ──► the target: cc's Ollama daemon, or a loopback cc backend (both loopback in cc's container)
 ```
 
 The Claude Code side is a plugin root, `claude/` (declared by `claudePlugin` in the manifest, so cc passes it to every session as `--plugin-dir`): `hooks/hooks.json`, `hooks/hook.mjs` (the one entry), `hooks/transcript.mjs` (also imported by the backend's backfill importer, so both read a transcript the same way), `hooks/limits.mjs`, `skills/memory/SKILL.md`. The recall tool is declared by the manifest's `mcp` and served at `/-/mcp`, so cc attributes the caller from its own per-session URL.
@@ -24,7 +24,7 @@ The Claude Code side is a plugin root, `claude/` (declared by `claudePlugin` in 
 
 | Module | Responsibility |
 |---|---|
-| `pins.js` | the single source of the Hindsight release, image refs and pinned image IDs, the build helper's digest, CP build inputs, base path, resource prefix, label keys |
+| `pins.js` | the single source of the Hindsight release, image refs and pinned image IDs, the build helper's digest, CP build inputs, base path, resource prefix, label keys, the relay's targets (`RELAY_TARGETS`: alias, API port, allowlist, key header) |
 | `trust.js` | which images may run: pinned-ID checks, the trusted CP image record (`trusted-cp.json`) |
 | `tarStream.js` | streaming tar: append the bundle manifest on export, read it on import |
 | `config.js` | env → `{port, dataDir, conductorUrl, ollamaUrl (from `OLLAMA_HOST`, default `http://127.0.0.1:11434`), pluginId, distDir, claudeProjectsDir}` |
@@ -34,11 +34,11 @@ The Claude Code side is a plugin root, `claude/` (declared by `claudePlugin` in 
 | `netDetect.js` | automatic bind address from `/.dockerenv` and `/proc/net/route` |
 | `errors.js` | the error catalog (`CATALOG`), `AppError` |
 | `docker.js` | the only module that runs docker: invocation resolution (direct → `sudo -n`), error classification, name and image guards, env files, detached stop, the socket-mounting helper run (pinned IDs only) |
-| `llmEnv.js` | LLM env for none / manual / cc-backend (Anthropic or Ollama via the relay); cc backend summary for the picker |
+| `llmEnv.js` | LLM env for none / manual / cc-backend (Anthropic direct, or Anthropic-loopback and Ollama via the relay, returned with the relay target); cc backend summary for the picker |
 | `containerSpec.js` | pure builders of the containers' run args, env, labels and spec hash (API, CP, relay); resource names; owner id |
 | `relay/relay.mjs` | the relay program (Node builtins only), run inside the API image: tunnel handshake, pairing, piping |
-| `relayTunnel.js` | the plugin's dial-out side: idle authenticated connections to the relay, handed to `ollamaProxy` on the go byte, reconnect with backoff |
-| `ollamaProxy.js` | serves tunnelled connections as HTTP to the Ollama daemon: key check, `OLLAMA_TARGET.allowed`, streaming, last-forward record, cached daemon probe |
+| `relayTunnel.js` | the plugin's dial-out side: idle authenticated connections to the relay, handed to `relayProxy` on the go byte, reconnect with backoff |
+| `relayProxy.js` | serves tunnelled connections as HTTP to the active target (`setTarget`): per-target key header, `RELAY_TARGETS[kind].allowed`, header rewrite and token injection, streaming, last-forward record, cached target probe; holds the row token in memory only |
 | `ollamaDaemon.js` | read-only daemon client: `/api/version`, `/api/tags` |
 | `supervisor.js` | Hindsight's state machine: start/adopt/recreate, health wait, watch, stop, restart, SIGTERM shutdown |
 | `jobs.js` | the user-initiated jobs, one at a time across all kinds, with logs: the Docker actions, plus kinds other modules register (`kinds`: validate, run with `{line, progress, signal}`, cancellable) |
@@ -68,7 +68,7 @@ The Claude Code side is a plugin root, `claude/` (declared by `claudePlugin` in 
   3. validate the saved settings (`SETTINGS_INVALID`, `SLIM_*`);
   4. check the API image's ID against the pins (`IMAGE_*`), the CP image's base-path/upstream labels (`CP_IMAGE_MISMATCH`) and its ID against `trusted-cp.json` (`CP_IMAGE_UNTRUSTED`) — never pull;
   5. network and volume: create with labels, or verify the owner (`NAME_TAKEN`) and the volume's embeddings fingerprint (`EMBEDDINGS_CHANGED`);
-  6. compose the LLM env (cc-backend reads cc now); with an Ollama link, run or adopt the relay container (verified API image ID) and start the tunnel at `<bind>:<relayPort>`, else stop the tunnel and remove an owned leftover relay;
+  6. compose the LLM env (cc-backend reads cc now); with a relay target (Ollama, or a loopback cc backend), run or adopt the relay container (verified API image ID, aliased for that target) and start the tunnel at `<bind>:<relayPort>` with the target, else stop the tunnel and remove an owned leftover relay;
   7. API then CP container, run by the verified image ID: missing → `run`; another owner → `NAME_TAKEN`; spec hash or image ID differs → stop, rm, `run` (volume kept); exited → `start`; running and matching → adopt;
   8. wait for API `/health` 200 (detecting an exited container → `CRASHED`, timeout → `UNHEALTHY` with a log tail), then CP `<base path>/api/health`, then sign in to the CP → `ready`.
 - **Boot = apply.** Every backend start reconciles to the saved settings, so containers never run a spec the Settings page does not show. `pendingRestart` flags saved-but-not-applied settings while ready.
@@ -156,7 +156,7 @@ Memory tab ── POST /-/api/jobs/backfill-scan ──► jobs.js ──► bac
 | `RUN_REAL_CLI=1 node --test tests/hooks-cli.real.test.mjs` | the hook path in a real `claude -p --input-format stream-json` session against a fake backend: the prompt hook fires, its context reaches the model, the async Stop posts the turns (needs the `claude` CLI and its login) |
 | + `CODE_HINDSIGHT_TEST_EMBEDDINGS_KEY` (optional `_MODEL`, `_BASE_URL`) | also runs the slim-image test with remote embeddings and the `rrf` reranker |
 
-- **Relay tests.** `tests/relay.test.mjs` runs the real `src/relay/relay.mjs` as a local child process on port 0, with the real tunnel and proxy, against `tests/support/fakeOllama.mjs` (records requests; `/api/version`, `/api/tags` with a cloud and a local row, canned streamed chat replies; `down` drops connections). `tests/relay.real.test.mjs` runs the API's own startup LLM check through the real relay container.
+- **Relay tests.** `tests/relay.test.mjs` runs the real `src/relay/relay.mjs` as a local child process on port 0, with the real tunnel and proxy, against `tests/support/fakeOllama.mjs` (records requests; `/api/version`, `/api/tags` with a cloud and a local row, canned streamed chat replies; `down` drops connections) and `tests/support/fakeAnthropic.mjs` (records requests; streamed `/v1/messages` replies; `down` and `notFound` switches). The hardening tests run over every entry of `RELAY_TARGETS`. `tests/relay.real.test.mjs` runs the API's own startup LLM check through the real relay container.
 - **Fakes.** `tests/fakes/fake-docker.mjs` implements the docker subcommands the plugin uses over a JSON state file (images found by ref or ID; `save`/`load` speak real tar holding a `fake-images.json`) and logs every call; `FAKE_DOCKER_MODE` injects `denied`, `daemon-down`, `port-clash`, `crash`, `fail-<subcommand>`. `tests/fakes/fake-sudo.mjs` honours only `-n` (`FAKE_SUDO_MODE=password` refuses). They are wired in through `CODE_HINDSIGHT_DOCKER_BIN` / `CODE_HINDSIGHT_SUDO_BIN`.
 - **Isolation.** `tests/helpers.mjs` `mkRoot` gives each test a temp projects root and data dir; `boot` runs `createApp` over the fakes on port 0 with an injected clock and probe. Tests never use the real data dir.
 - **No live cc.** `tests/support/ccFront.mjs` reproduces cc's plugin proxy (prefix strip, `X-Forwarded-*`, prefix re-added to every root-relative `Location`, `X-Frame-Options`) for the proxy and browser tests.

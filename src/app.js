@@ -15,7 +15,7 @@ import { createJobs } from './jobs.js';
 import { createCpSession } from './cpSession.js';
 import { createCpProxy } from './cpProxy.js';
 import { createOllamaDaemon } from './ollamaDaemon.js';
-import { createOllamaProxy } from './ollamaProxy.js';
+import { createRelayProxy } from './relayProxy.js';
 import { createRelayTunnel } from './relayTunnel.js';
 import { createRoutes } from './routes.js';
 import { createScopesStore } from './scopes.js';
@@ -60,12 +60,14 @@ export function createApp(config, overrides = {}) {
   });
   const ccModels = () => fetchCcModels(config.conductorUrl);
   const ollamaDaemon = createOllamaDaemon({ url: config.ollamaUrl });
-  const ollamaProxy = createOllamaProxy({ key: secrets.get().relayKey, ollamaUrl: config.ollamaUrl, daemon: ollamaDaemon });
-  const relayTunnel = createRelayTunnel({ key: secrets.get().relayKey, onSocket: ollamaProxy.handleSocket, log: (m) => console.error(`code-hindsight: ${m}`) });
+  const relayProxy = createRelayProxy({ key: secrets.get().relayKey, ollamaUrl: config.ollamaUrl, daemon: ollamaDaemon });
+  const relayTunnel = createRelayTunnel({ key: secrets.get().relayKey, onSocket: relayProxy.handleSocket, log: (m) => console.error(`code-hindsight: ${m}`) });
   const relay = {
-    start: relayTunnel.start,
-    stop: relayTunnel.stop,
-    status: () => ({ daemonUrl: config.ollamaUrl, tunnel: relayTunnel.status(), lastForward: ollamaProxy.lastForward() }),
+    /** `target` is composeLlmEnv's `relay`: it is set before the tunnel dials, so no request meets a tunnel without one. */
+    start: (addr, target) => { relayProxy.setTarget(target); relayTunnel.start(addr); },
+    /** The target (and any credential in it) leaves memory with the tunnel. */
+    stop: () => { relayTunnel.stop(); relayProxy.setTarget(null); },
+    status: () => ({ target: relayProxy.target(), tunnel: relayTunnel.status(), lastForward: relayProxy.lastForward() }),
   };
   let supervisor;
   const cpSession = createCpSession({ target: () => supervisor.cpAddress(), accessKey: () => secrets.get().cpAccessKey });
@@ -87,7 +89,7 @@ export function createApp(config, overrides = {}) {
   const api = createRoutes({
     supervisor, jobs, docker, settings, secrets, fetchCcModels: ccModels, scopes, activity, cc, backfill,
     fetchPluginRow: () => fetchPluginRow(config.conductorUrl, config.pluginId),
-    detectBind, containerNames: { api: names.api, cp: names.cp, relay: names.relay }, ollamaDaemon, ollamaProxy,
+    detectBind, containerNames: { api: names.api, cp: names.cp, relay: names.relay }, ollamaDaemon, relayProxy,
   });
 
   async function handle(req, res) {

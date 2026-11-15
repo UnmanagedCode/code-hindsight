@@ -1,5 +1,5 @@
-// The Ollama reverse path end to end without Docker: the real src/relay/relay.mjs as a local
-// child process (port 0), the real tunnel and proxy, and a fake Ollama daemon. All local
+// The reverse path (Ollama and loopback cc backends) end to end without Docker: the real src/relay/relay.mjs as a local
+// child process (port 0), the real tunnel and proxy, and fake upstreams (an Ollama daemon, an Anthropic-compatible endpoint). All local
 // sockets; waits are the short ones injected through env and tunnel options.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,9 +8,11 @@ import http from 'node:http';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createRelayTunnel } from '../src/relayTunnel.js';
-import { createOllamaProxy } from '../src/ollamaProxy.js';
+import { createRelayProxy } from '../src/relayProxy.js';
 import { createOllamaDaemon } from '../src/ollamaDaemon.js';
 import { startFakeOllama } from './support/fakeOllama.mjs';
+import { startFakeAnthropic } from './support/fakeAnthropic.mjs';
+import { RELAY_TARGETS } from '../src/pins.js';
 import { waitFor } from './helpers.mjs';
 
 const RELAY = fileURLToPath(new URL('../src/relay/relay.mjs', import.meta.url));
@@ -25,22 +27,35 @@ async function startRelay(t, { key = KEY, waitMs = 300, handshakeMs = 200, env =
   return { child, ...ports, log: () => out };
 }
 
-/** A relay with the plugin side attached: tunnel + proxy against the fake daemon. */
-async function stack(t, { ollama, relay, tunnelOptions = {} } = {}) {
+const ROW_TOKEN = 'row-token-sentinel';
+const ROW_AUTH = Object.freeze({ header: 'authorization', value: `Bearer ${ROW_TOKEN}` });
+
+/**
+ * A relay with the plugin side attached: tunnel + proxy against a fake upstream. `kind` picks
+ * the target: the Ollama daemon, or a loopback Anthropic-compatible endpoint (`rowPath`: the
+ * base path of the row's URL; `auth`: how the row's token is injected).
+ */
+async function stack(t, { kind = 'ollama', ollama, anthropic, relay, tunnelOptions = {}, rowPath = '', auth = ROW_AUTH } = {}) {
   const fake = ollama ?? await startFakeOllama(t);
+  const loop = anthropic ?? (kind === 'anthropic-loopback' ? await startFakeAnthropic(t) : null);
   const rl = relay ?? await startRelay(t);
-  const proxy = createOllamaProxy({ key: KEY, ollamaUrl: fake.url, daemon: createOllamaDaemon({ url: fake.url }) });
+  const proxy = createRelayProxy({ key: KEY, ollamaUrl: fake.url, daemon: createOllamaDaemon({ url: fake.url }) });
+  proxy.setTarget(kind === 'ollama' ? { kind } : { kind, url: `${loop.url}${rowPath}`, auth });
   const tunnel = createRelayTunnel({ key: KEY, onSocket: proxy.handleSocket, idleTarget: 2, retryMs: 20, maxRetryMs: 100, ...tunnelOptions });
   tunnel.start({ host: '127.0.0.1', port: rl.tunnelPort });
   t.after(() => tunnel.stop());
   await waitFor(() => tunnel.status().idle >= 1);
-  return { fake, rl, proxy, tunnel };
+  return { fake: kind === 'ollama' ? fake : loop, ollama: fake, anthropic: loop, rl, proxy, tunnel };
 }
 
+/** How the API's client presents the relay key for a target kind. */
+const keyHeaders = (kind, key) => (!key ? {} : kind === 'ollama' ? { authorization: `Bearer ${key}` } : { 'x-api-key': key });
+const defaultPath = (kind) => (kind === 'ollama' ? '/v1/chat/completions' : '/v1/messages');
+
 /** A request the way the API's client sends one: to the relay's API port, with the key. */
-function call(port, { path = '/v1/chat/completions', method = 'POST', key = KEY, body = '{"model":"m"}' } = {}) {
+function call(port, { kind = 'ollama', path = defaultPath(kind), method = 'POST', key = KEY, body = '{"model":"m"}', headers: extra = {} } = {}) {
   return new Promise((resolve, reject) => {
-    const headers = { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) };
+    const headers = { 'content-type': 'application/json', ...keyHeaders(kind, key), ...extra };
     const req = http.request({ host: '127.0.0.1', port, path, method, headers, agent: false }, (res) => {
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
@@ -128,15 +143,16 @@ test('OL8: a daemon outage is 502 and recorded as OLLAMA_UNREACHABLE', async (t)
 test('OL8: the proxy records the last forward and probes the daemon once per cache window', async (t) => {
   const fake = await startFakeOllama(t);
   let now = 1_000;
-  const proxy = createOllamaProxy({ key: KEY, ollamaUrl: fake.url, daemon: createOllamaDaemon({ url: fake.url }), clock: { now: () => now } });
+  const proxy = createRelayProxy({ key: KEY, ollamaUrl: fake.url, daemon: createOllamaDaemon({ url: fake.url }), clock: { now: () => now } });
+  proxy.setTarget({ kind: 'ollama' });
   assert.equal(proxy.lastForward(), null);
-  const first = await proxy.probeDaemon();
+  const first = await proxy.probeTarget();
   assert.deepEqual([first.ok, first.version], [true, '0.40.13']);
-  await proxy.probeDaemon();
+  await proxy.probeTarget();
   assert.equal(fake.requests.filter((r) => r.path === '/api/version').length, 1, 'cached');
   now += 60_000;
   fake.down = true;
-  const down = await proxy.probeDaemon();
+  const down = await proxy.probeTarget();
   assert.equal(down.ok, false);
   assert.ok(down.error);
 });
@@ -145,7 +161,8 @@ test('OL8: the proxy records the last forward and probes the daemon once per cac
 test('OL8: after a relay restart the tunnel reconnects', async (t) => {
   const fake = await startFakeOllama(t);
   const first = await startRelay(t);
-  const proxy = createOllamaProxy({ key: KEY, ollamaUrl: fake.url, daemon: createOllamaDaemon({ url: fake.url }) });
+  const proxy = createRelayProxy({ key: KEY, ollamaUrl: fake.url, daemon: createOllamaDaemon({ url: fake.url }) });
+  proxy.setTarget({ kind: 'ollama' });
   const tunnel = createRelayTunnel({ key: KEY, onSocket: proxy.handleSocket, idleTarget: 2, retryMs: 20, maxRetryMs: 100 });
   t.after(() => tunnel.stop());
   tunnel.start({ host: '127.0.0.1', port: first.tunnelPort });
@@ -180,10 +197,11 @@ test('OL8: stopping the tunnel closes its connections and reports stopped', asyn
 });
 
 /** A hand-written request to the relay's API port: `line` is the whole request line, sent as is. */
-function rawRequest(port, line, { key = KEY } = {}) {
+function rawRequest(port, line, { key = KEY, kind = 'ollama' } = {}) {
   return new Promise((resolve) => {
     const s = net.connect(port, '127.0.0.1', () => {
-      s.write(`${line}\r\nHost: x\r\n${key ? `Authorization: Bearer ${key}\r\n` : ''}Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`);
+      const keyLine = !key ? '' : kind === 'ollama' ? `Authorization: Bearer ${key}\r\n` : `X-Api-Key: ${key}\r\n`;
+      s.write(`${line}\r\nHost: x\r\n${keyLine}Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`);
     });
     let text = '';
     s.on('data', (d) => { text += d; });
@@ -193,38 +211,43 @@ function rawRequest(port, line, { key = KEY } = {}) {
 }
 const tunnelReady = (tunnel) => waitFor(() => tunnel.status().idle >= 1);
 
-// OL8 (S-F1): a malformed request target can never throw out of the proxy: no key is 401, a key
-// is 400, nothing is forwarded, and the same process serves the next request.
-test('OL8 S-F1: a malformed absolute-form target is 401 without the key and 400 with it, and the proxy keeps serving', async (t) => {
-  const { fake, rl, tunnel } = await stack(t);
-  for (const target of ['http://', 'http://[::1/', 'http://x:99999999/', 'http://x/v1/chat/completions']) {
+// LB-H (S-F1): a malformed request target can never throw out of the proxy: no key is 401, a key
+// is 400, nothing is forwarded, and the same process serves the next request: on both targets.
+for (const kind of Object.keys(RELAY_TARGETS)) {
+  test(`LB-H S-F1 (${kind}): a malformed absolute-form target is 401 without the key and 400 with it, and the proxy keeps serving`, async (t) => {
+    const { fake, rl, tunnel } = await stack(t, { kind });
+    const path = defaultPath(kind);
+    for (const target of ['http://', 'http://[::1/', 'http://x:99999999/', `http://x${path}`]) {
+      await tunnelReady(tunnel);
+      assert.equal((await rawRequest(rl.apiPort, `POST ${target} HTTP/1.1`, { key: null, kind })).status, 401, `${target} without a key`);
+      await tunnelReady(tunnel);
+      assert.equal((await rawRequest(rl.apiPort, `POST ${target} HTTP/1.1`, { kind })).status, 400, `${target} with a key`);
+    }
+    assert.equal(fake.requests.length, 0);
     await tunnelReady(tunnel);
-    assert.equal((await rawRequest(rl.apiPort, `POST ${target} HTTP/1.1`, { key: null })).status, 401, `${target} without a key`);
-    await tunnelReady(tunnel);
-    assert.equal((await rawRequest(rl.apiPort, `POST ${target} HTTP/1.1`)).status, 400, `${target} with a key`);
-  }
-  assert.equal(fake.requests.length, 0);
-  await tunnelReady(tunnel);
-  assert.equal((await call(rl.apiPort)).status, 200, 'the next request is served');
-});
+    assert.equal((await call(rl.apiPort, { kind })).status, 200, 'the next request is served');
+  });
 
-// OL8 (S-F3): what is allowlisted is exactly what is forwarded: only a normalised origin-form target passes.
-test('OL8 S-F3: fragment, dot-segment and backslash targets to a non-allowlisted path are 400 and never forwarded', async (t) => {
-  const { fake, rl, tunnel } = await stack(t);
-  for (const target of ['/v1/chat/completions#/../../api/pull', '/v1/chat/../../api/pull', '/v1/chat/completions\\..\\..\\api\\pull', '//evil/v1/chat/completions']) {
-    await tunnelReady(tunnel);
-    assert.equal((await rawRequest(rl.apiPort, `POST ${target} HTTP/1.1`)).status, 400, target);
-  }
-  assert.equal(fake.requests.length, 0);
-});
+  // LB-H (S-F3): what is allowlisted is exactly what is forwarded: only a normalised origin-form target passes.
+  test(`LB-H S-F3 (${kind}): fragment, dot-segment and backslash targets are 400 and never forwarded`, async (t) => {
+    const { fake, rl, tunnel } = await stack(t, { kind });
+    const path = defaultPath(kind);
+    for (const target of [`${path}#/../../api/pull`, `${path.slice(0, 4)}/../../api/pull`, `${path}\\..\\..\\api\\pull`, `//evil${path}`]) {
+      await tunnelReady(tunnel);
+      assert.equal((await rawRequest(rl.apiPort, `POST ${target} HTTP/1.1`, { kind })).status, 400, target);
+    }
+    assert.equal(fake.requests.length, 0);
+  });
 
-test('OL8 S-F3: the checked path and query are what is forwarded and what lastForward records', async (t) => {
-  const { fake, rl, proxy, tunnel } = await stack(t);
-  await tunnelReady(tunnel);
-  assert.equal((await rawRequest(rl.apiPort, 'POST /api/chat?stream=true HTTP/1.1')).status, 200);
-  assert.equal(fake.requests.at(-1).path, '/api/chat?stream=true');
-  assert.equal(proxy.lastForward().path, '/api/chat?stream=true');
-});
+  test(`LB-H S-F3 (${kind}): the checked path and query are what is forwarded and what lastForward records`, async (t) => {
+    const { fake, rl, proxy, tunnel } = await stack(t, { kind });
+    await tunnelReady(tunnel);
+    const target = `${kind === 'ollama' ? '/api/chat' : '/v1/messages'}?stream=true`;
+    assert.equal((await rawRequest(rl.apiPort, `POST ${target} HTTP/1.1`, { kind })).status, 200);
+    assert.equal(fake.requests.at(-1).path, target);
+    assert.equal(proxy.lastForward().path, target);
+  });
+}
 
 // OL8 (R2-S1): at the handshake cap the OLDEST silent socket is closed, so a valid connect always gets in.
 test('OL8 R2-S1: at RELAY_MAX_HANDSHAKING the oldest silent socket is closed and a valid tunnel still authenticates', async (t) => {
@@ -269,7 +292,7 @@ test('OL8 R2-C1: 128 parallel requests are each served (waiting cap sized to sup
   const { relaySpec } = await import('../src/containerSpec.js');
   const { resourceNames } = await import('../src/containerSpec.js');
   const { LLM_MAX_CONCURRENT_MAX } = await import('../src/settings.js');
-  const spec = relaySpec({ names: resourceNames('p'), image: { id: 'sha256:x' }, bind: '127.0.0.1', port: 1, key: KEY, owner: 'o' });
+  const spec = relaySpec({ names: resourceNames('p'), image: { id: 'sha256:x' }, bind: '127.0.0.1', port: 1, key: KEY, owner: 'o', target: RELAY_TARGETS.ollama });
   assert.equal(spec.env.RELAY_MAX_WAITING, String(LLM_MAX_CONCURRENT_MAX));
   const rl = await startRelay(t, { waitMs: 15_000, env: { RELAY_MAX_WAITING: spec.env.RELAY_MAX_WAITING } });
   const { fake } = await stack(t, { relay: rl });
@@ -313,4 +336,99 @@ test('OL8 N1: RELAY_MAX_WAITING=0 and RELAY_MAX_HANDSHAKING=0 are clamped and th
   assert.equal((await call(rl.apiPort)).status, 200);
   assert.equal(fake.requests.length, 1);
   assert.equal(rl.child.exitCode, null, 'the relay is still running');
+});
+
+// LB4: on the anthropic target the relay key is checked on x-api-key; a Bearer key, a missing or a wrong key is 401.
+test('LB4: on the anthropic-loopback target only an x-api-key relay key passes', async (t) => {
+  const { fake, rl } = await stack(t, { kind: 'anthropic-loopback' });
+  assert.equal((await call(rl.apiPort, { kind: 'anthropic-loopback' })).status, 200);
+  const before = fake.requests.length;
+  assert.equal((await call(rl.apiPort, { kind: 'ollama' })).status, 401, 'a Bearer relay key is not accepted here');
+  for (const key of [null, 'wrong', `${KEY}x`]) assert.equal((await call(rl.apiPort, { kind: 'anthropic-loopback', key })).status, 401, String(key));
+  assert.equal(fake.requests.length, before, 'nothing forwarded');
+});
+
+// LB5: the relay key never leaves; the row token is injected in the row's form; body, SDK headers and the base path survive.
+test('LB5: the forwarded request carries the row token and not the relay key, with body, anthropic-version, base path and a streamed reply', async (t) => {
+  const { fake, rl } = await stack(t, { kind: 'anthropic-loopback', rowPath: '/api/' });
+  const body = JSON.stringify({ model: 'glm-5', max_tokens: 5, messages: [{ role: 'user', content: 'hi' }] });
+  const res = await call(rl.apiPort, { kind: 'anthropic-loopback', body, headers: { 'anthropic-version': '2023-06-01', 'x-stainless-lang': 'python', authorization: 'Bearer client-sent' } });
+  assert.equal(res.status, 200);
+  assert.match(res.text, /message_start[\s\S]*message_stop/);
+  const seen = fake.requests.at(-1);
+  assert.equal(seen.path, '/api/v1/messages', 'the row base path prefixes the checked path');
+  assert.equal(seen.headers.authorization, `Bearer ${ROW_TOKEN}`);
+  assert.equal(seen.headers['x-api-key'], undefined, 'the relay key is in no header');
+  assert.equal(seen.headers['anthropic-version'], '2023-06-01');
+  assert.equal(seen.headers['x-stainless-lang'], 'python');
+  assert.equal(seen.body, body);
+  assert.ok(!JSON.stringify(seen.headers).includes(KEY));
+});
+
+// LB1b/LB5: an ANTHROPIC_API_KEY row is injected as x-api-key.
+test('LB5: an x-api-key row token replaces the relay key in x-api-key and no Authorization is sent', async (t) => {
+  const { fake, rl } = await stack(t, { kind: 'anthropic-loopback', auth: { header: 'x-api-key', value: ROW_TOKEN } });
+  assert.equal((await call(rl.apiPort, { kind: 'anthropic-loopback' })).status, 200);
+  const seen = fake.requests.at(-1);
+  assert.equal(seen.headers['x-api-key'], ROW_TOKEN);
+  assert.equal(seen.headers.authorization, undefined);
+});
+
+// LB6: only POST /v1/messages passes on the anthropic target.
+test('LB6: count_tokens, model listing and a GET on /v1/messages are 403 and never forwarded', async (t) => {
+  const { fake, rl } = await stack(t, { kind: 'anthropic-loopback' });
+  for (const [method, path] of [['POST', '/v1/messages/count_tokens'], ['GET', '/v1/models'], ['GET', '/v1/messages'], ['POST', '/v1/messages/batches'], ['POST', '/v1/chat/completions']]) {
+    assert.equal((await call(rl.apiPort, { kind: 'anthropic-loopback', method, path })).status, 403, `${method} ${path}`);
+  }
+  assert.equal(fake.requests.length, 0);
+});
+
+// LB7: a switch over a live tunnel redirects the next request; no target is 503.
+test('LB7: setTarget switches ollama to anthropic-loopback over the same tunnel, and with no target requests are 503', async (t) => {
+  const { ollama, rl, proxy, tunnel } = await stack(t);
+  assert.equal((await call(rl.apiPort)).status, 200);
+  const loop = await startFakeAnthropic(t);
+  proxy.setTarget({ kind: 'anthropic-loopback', url: loop.url, auth: ROW_AUTH });
+  await tunnelReady(tunnel);
+  assert.equal((await call(rl.apiPort, { kind: 'anthropic-loopback' })).status, 200);
+  assert.equal(loop.requests.length, 1);
+  assert.equal(ollama.requests.filter((r) => r.method === 'POST').length, 1, 'the daemon saw only the first request');
+  await tunnelReady(tunnel);
+  assert.equal((await call(rl.apiPort, { kind: 'ollama' })).status, 401, 'the Ollama Bearer form is no longer the key');
+  proxy.setTarget(null);
+  await tunnelReady(tunnel);
+  assert.equal((await call(rl.apiPort, { kind: 'anthropic-loopback' })).status, 503);
+  assert.equal(loop.requests.length, 1, 'nothing forwarded without a target');
+});
+
+// LB8: an upstream outage is a 502 recorded as CC_BACKEND_UNREACHABLE; the probe treats any HTTP answer as up; neither holds the token.
+test('LB8: an upstream outage is 502 recorded as CC_BACKEND_UNREACHABLE, and probeTarget counts a 404 as answering, caches and resets on setTarget', async (t) => {
+  const { fake, rl, proxy } = await stack(t, { kind: 'anthropic-loopback' });
+  fake.down = true;
+  const res = await call(rl.apiPort, { kind: 'anthropic-loopback' });
+  assert.equal(res.status, 502);
+  assert.equal(proxy.lastForward().error, 'CC_BACKEND_UNREACHABLE');
+  assert.ok(!res.text.includes(ROW_TOKEN) && !JSON.stringify(proxy.lastForward()).includes(ROW_TOKEN));
+  fake.down = false;
+  fake.notFound = true;
+  let now = 1_000;
+  const probing = createRelayProxy({ key: KEY, ollamaUrl: 'http://127.0.0.1:1', daemon: { version: async () => null }, clock: { now: () => now } });
+  assert.equal(await probing.probeTarget(), null, 'no target, no probe');
+  probing.setTarget({ kind: 'anthropic-loopback', url: fake.url, auth: ROW_AUTH });
+  const first = await probing.probeTarget();
+  assert.deepEqual([first.ok, first.version, first.error], [true, null, null]);
+  const count = () => fake.requests.length;
+  const n = count();
+  await probing.probeTarget();
+  assert.equal(count(), n, 'cached within the window');
+  assert.equal(fake.requests.at(-1).headers.authorization, undefined, 'the probe sends no credentials');
+  probing.setTarget({ kind: 'anthropic-loopback', url: fake.url, auth: ROW_AUTH });
+  await probing.probeTarget();
+  assert.equal(count(), n + 1, 'reset by setTarget');
+  fake.down = true;
+  now += 60_000;
+  const down = await probing.probeTarget();
+  assert.equal(down.ok, false);
+  assert.ok(down.error);
+  assert.ok(!JSON.stringify([first, down, probing.target()]).includes(ROW_TOKEN));
 });

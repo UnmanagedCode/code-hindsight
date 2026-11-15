@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { apiSpec, cpSpec, relaySpec, embeddingsEnv, resourceNames, ownerId } from '../src/containerSpec.js';
 import { DEFAULT_SETTINGS } from '../src/settings.js';
-import { API_IMAGES, LABELS } from '../src/pins.js';
+import { API_IMAGES, LABELS, RELAY_TARGETS } from '../src/pins.js';
 import { defaultBindAddress, defaultGateway } from '../src/netDetect.js';
 
 const names = resourceNames('code-hindsight');
@@ -85,7 +85,7 @@ test('bind auto-detect: default gateway in a container, else loopback', () => {
 // OL7: the relay container: prefixed, aliased `ollama`, only the tunnel port published, run by
 // the verified API image ID, its key in env only, its hash following the script and the port.
 test('OL7: relay spec is prefixed, read-only, publishes only the tunnel port and runs the verified image', () => {
-  const o = { names, image: { id: API_IMAGES.full.ids[0] }, bind: '172.20.0.1', port: 18434, key: 'rk'.repeat(32), owner: 'o1' };
+  const o = { names, image: { id: API_IMAGES.full.ids[0] }, bind: '172.20.0.1', port: 18434, key: 'rk'.repeat(32), owner: 'o1', target: RELAY_TARGETS.ollama };
   const s = relaySpec(o);
   assert.equal(s.name, 'code-hindsight-relay');
   const arg = (flag) => s.args[s.args.indexOf(flag) + 1];
@@ -105,4 +105,18 @@ test('OL7: relay spec is prefixed, read-only, publishes only the tunnel port and
   assert.notEqual(relaySpec({ ...o, port: 18435 }).hash, s.hash);
   assert.notEqual(relaySpec({ ...o, image: { id: API_IMAGES.full.ids[1] } }).hash, s.hash);
   assert.equal(relaySpec(o).hash, s.hash, 'deterministic');
+});
+
+// LB9: the relay's alias and API port follow the target, the hash tells the targets apart, and no row token is in the spec.
+test('LB9: relaySpec alias and RELAY_API_PORT follow the target; the spec hash differs between targets; the env has only the relay key', () => {
+  const o = { names, image: { id: API_IMAGES.full.ids[0] }, bind: '172.20.0.1', port: 18434, key: 'rk'.repeat(32), owner: 'o1' };
+  const ollama = relaySpec({ ...o, target: RELAY_TARGETS.ollama });
+  const loop = relaySpec({ ...o, target: RELAY_TARGETS['anthropic-loopback'] });
+  const arg = (s, flag) => s.args[s.args.indexOf(flag) + 1];
+  assert.equal(arg(ollama, '--network-alias'), RELAY_TARGETS.ollama.alias);
+  assert.equal(arg(loop, '--network-alias'), RELAY_TARGETS['anthropic-loopback'].alias);
+  assert.equal(ollama.env.RELAY_API_PORT, String(RELAY_TARGETS.ollama.apiPort));
+  assert.equal(loop.env.RELAY_API_PORT, String(RELAY_TARGETS['anthropic-loopback'].apiPort));
+  assert.notEqual(ollama.hash, loop.hash);
+  assert.deepEqual(Object.keys(loop.env).sort(), ['RELAY_API_PORT', 'RELAY_KEY', 'RELAY_MAX_WAITING', 'RELAY_TUNNEL_PORT']);
 });

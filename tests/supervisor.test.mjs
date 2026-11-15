@@ -17,10 +17,16 @@ import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, setDockerState, 
 const PREFIX = 'code-hindsight';
 const names = resourceNames(PREFIX);
 
-/** A recording stand-in for the Ollama tunnel the supervisor starts and stops. */
+/** A recording stand-in for the relay (tunnel + proxy target) the supervisor starts and stops. */
 function fakeRelay() {
   const calls = [];
-  return { calls, start: (target) => calls.push(['start', target]), stop: () => calls.push(['stop']), status: () => ({ daemonUrl: 'http://127.0.0.1:11434', tunnel: { state: 'connected', idle: 1, error: null, address: '127.0.0.1:18434' }, lastForward: null }) };
+  let target = null;
+  return {
+    calls,
+    start: (addr, t) => { target = t; calls.push(['start', addr, t]); },
+    stop: () => { target = null; calls.push(['stop']); },
+    status: () => ({ target: target && { kind: target.kind, url: target.url }, tunnel: { state: 'connected', idle: 1, error: null, address: '127.0.0.1:18434' }, lastForward: null }),
+  };
 }
 
 function make(t, { mode = '', sudoMode, seed, settings, allowSudo, fetchCcModels, clock = fakeClock(), health, trusted = true, watch = false, env: envOverride } = {}) {
@@ -525,21 +531,21 @@ test('OL9: an Ollama link creates the relay before the API and starts the tunnel
   assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
   const runs = dockerCalls(r).filter((a) => a[0] === 'run').map((a) => a[a.indexOf('--name') + 1]);
   assert.deepEqual(runs, [names.relay, names.api, names.cp]);
-  assert.deepEqual(relay.calls, [['start', { host: '127.0.0.1', port: 18434 }]]);
+  assert.deepEqual(relay.calls, [['start', { host: '127.0.0.1', port: 18434 }, { kind: 'ollama' }]]);
   const st = dockerState(r);
   assert.ok(st.containers[names.relay].Config.Env.includes(`RELAY_KEY=${secrets.get().relayKey}`));
   const apiEnv = st.containers[names.api].Config.Env;
   assert.ok(apiEnv.includes('HINDSIGHT_API_LLM_PROVIDER=ollama'));
   assert.ok(apiEnv.includes('HINDSIGHT_API_LLM_BASE_URL=http://ollama:11434/v1'));
   assert.equal(sup.status().containers.relay.state, 'running');
-  assert.equal(sup.status().ollama.tunnel.state, 'connected');
+  assert.equal(sup.status().relay.tunnel.state, 'connected');
 });
 
 test('OL9: without an Ollama link there is no relay and no ollama status', async (t) => {
   const { r, sup, relay } = make(t);
   await sup.ensureRunning();
   assert.ok(!dockerCalls(r).some((a) => a[0] === 'run' && a.includes(names.relay)));
-  assert.equal(sup.status().ollama, null);
+  assert.equal(sup.status().relay, null);
   assert.deepEqual(relay.calls, [['stop']]);
 });
 
@@ -553,7 +559,7 @@ test('OL9: unlinking removes the relay container and stops the tunnel', async (t
   await sup.ensureRunning();
   assert.equal(dockerState(r).containers[names.relay], undefined);
   assert.deepEqual(relay.calls.at(-1), ['stop']);
-  assert.equal(sup.status().ollama, null);
+  assert.equal(sup.status().relay, null);
 });
 
 test('OL9: stop and shutdown include the relay and stop the tunnel', async (t) => {
@@ -652,8 +658,85 @@ test('C-2: a start cancelled by stop() ends with the tunnel stopped, never start
   assert.equal(sup.status().state, 'stopped');
   assert.equal(relay.calls.some((c) => c[0] === 'start'), false, JSON.stringify(relay.calls));
   assert.deepEqual(relay.calls.at(-1), ['stop']);
-  assert.equal(sup.status().ollama, null);
+  assert.equal(sup.status().relay, null);
   assert.ok(!dockerCalls(r).some((a) => a[0] === 'run' && a.includes(names.relay)), 'no relay container was created either');
+});
+
+// LB10..LB12: a loopback cc backend row is linked through the relay.
+const SENTINEL = 'row-token-SENTINEL-77';
+const loopRow = (token = SENTINEL, port = 18765) => ({ id: 'opencode', label: 'OpenCode', template: 'claude', env: [{ key: 'ANTHROPIC_BASE_URL', value: `http://127.0.0.1:${port}` }, { key: 'ANTHROPIC_AUTH_TOKEN', value: token }] });
+const directRow = { id: 'remote', label: 'Remote', template: 'anthropic', env: [{ key: 'ANTHROPIC_BASE_URL', value: 'https://llm.example.com/a' }, { key: 'ANTHROPIC_AUTH_TOKEN', value: 'public-token' }] };
+const linkTo = (backendId, model = 'glm-5') => ({ llm: { mode: 'cc-backend', provider: null, model, baseUrl: null, backendId, maxConcurrent: null } });
+const relayRuns = (r) => dockerCalls(r).filter((a) => a[0] === 'run' && a.includes(names.relay));
+
+test('LB10: a loopback link runs the relay with the cc-backend alias, starts the tunnel with the target, and status has no token', async (t) => {
+  const rows = { backends: [loopRow()] };
+  const { r, sup, relay } = make(t, { settings: linkTo('opencode'), fetchCcModels: async () => rows });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  const [run] = relayRuns(r);
+  assert.equal(run[run.indexOf('--network-alias') + 1], 'cc-backend');
+  assert.deepEqual(relay.calls, [['start', { host: '127.0.0.1', port: 18434 }, { kind: 'anthropic-loopback', url: 'http://127.0.0.1:18765', auth: { header: 'authorization', value: `Bearer ${SENTINEL}` } }]]);
+  const apiEnv = dockerState(r).containers[names.api].Config.Env;
+  assert.ok(apiEnv.includes('HINDSIGHT_API_LLM_BASE_URL=http://cc-backend:8080'));
+  assert.deepEqual(sup.status().relay.target, { kind: 'anthropic-loopback', url: 'http://127.0.0.1:18765' });
+  assert.equal(JSON.stringify(sup.status()).includes(SENTINEL), false);
+});
+
+test('LB10b: switching from a loopback row to an Ollama row recreates the relay and keeps the tunnel address', async (t) => {
+  const rows = { backends: [loopRow(), ...OLLAMA_CC.backends] };
+  const { r, sup, relay, settingsStore } = make(t, { settings: linkTo('opencode'), fetchCcModels: async () => rows });
+  await sup.ensureRunning();
+  const first = dockerState(r).containers[names.relay].Config.Labels['io.code-hindsight.spec'];
+  const s = settingsStore.get();
+  s.llm = { ...s.llm, backendId: 'ollama', model: 'qwen3:4b' };
+  settingsStore.save(s);
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  assert.equal(relayRuns(r).length, 2, 'the relay was created again');
+  assert.notEqual(dockerState(r).containers[names.relay].Config.Labels['io.code-hindsight.spec'], first);
+  const starts = relay.calls.filter((c) => c[0] === 'start');
+  assert.deepEqual(starts.map((c) => c[1]), [{ host: '127.0.0.1', port: 18434 }, { host: '127.0.0.1', port: 18434 }]);
+  assert.deepEqual(starts.at(-1)[2], { kind: 'ollama' });
+});
+
+test('LB10c: switching from a loopback row to a direct row stops the tunnel and removes the relay', async (t) => {
+  const rows = { backends: [loopRow(), directRow] };
+  const { r, sup, relay, settingsStore } = make(t, { settings: linkTo('opencode'), fetchCcModels: async () => rows });
+  await sup.ensureRunning();
+  assert.ok(dockerState(r).containers[names.relay]);
+  const s = settingsStore.get();
+  s.llm = { ...s.llm, backendId: 'remote' };
+  settingsStore.save(s);
+  await sup.ensureRunning();
+  assert.equal(dockerState(r).containers[names.relay], undefined);
+  assert.deepEqual(relay.calls.at(-1), ['stop']);
+  assert.equal(sup.status().relay, null);
+});
+
+test('LB11: a token changed in cc is used at the next start, raises no pendingRestart and does not recreate the API', async (t) => {
+  const rows = { backends: [loopRow('old-token')] };
+  const { r, sup, relay } = make(t, { settings: linkTo('opencode'), fetchCcModels: async () => rows });
+  await sup.ensureRunning();
+  const apiRuns = () => dockerCalls(r).filter((a) => a[0] === 'run' && a.includes(names.api)).length;
+  assert.equal(apiRuns(), 1);
+  rows.backends = [loopRow('new-token', 18999)];
+  assert.equal(sup.status().pendingRestart, false);
+  assert.deepEqual(relay.calls.filter((c) => c[0] === 'start').map((c) => c[2].auth.value), ['Bearer old-token'], 'not read earlier');
+  await sup.restart();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  assert.deepEqual(relay.calls.filter((c) => c[0] === 'start').map((c) => c[2].auth.value), ['Bearer old-token', 'Bearer new-token']);
+  assert.equal(relay.calls.filter((c) => c[0] === 'start').at(-1)[2].url, 'http://127.0.0.1:18999');
+  assert.equal(apiRuns(), 1, 'the API env names only the relay, so it is adopted');
+  assert.equal(sup.status().pendingRestart, false);
+});
+
+test('LB12: the row token appears in no docker call and no container env', async (t) => {
+  const rows = { backends: [loopRow()] };
+  const { r, sup } = make(t, { settings: linkTo('opencode'), fetchCcModels: async () => rows });
+  await sup.ensureRunning();
+  assert.equal(JSON.stringify(dockerCalls(r)).includes(SENTINEL), false);
+  assert.equal(JSON.stringify(dockerState(r).containers).includes(SENTINEL), false);
 });
 
 const stopArgs = (r) => dockerCalls(r).find((a) => a[0] === 'stop');

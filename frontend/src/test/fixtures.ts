@@ -17,7 +17,7 @@ export const status = (over: Partial<Status> = {}): Status => ({
   volume: 'code-hindsight-data',
   lastShutdownFailure: null,
   llmMode: 'none',
-  ollama: null,
+  relay: null,
   job: null,
   bundles: [],
   bundleNames: { full: 'code-hindsight-1.2.1-full.tar', slim: 'code-hindsight-1.2.1-slim.tar' },

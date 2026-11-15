@@ -3,7 +3,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import { LLM_MAX_CONCURRENT_MAX } from './settings.js';
-import { API_CONTAINER_PORT, API_DATA_PATH, CP_CONTAINER_PORT, LABELS, OLLAMA_TARGET, RELAY_TUNNEL_PORT } from './pins.js';
+import { API_CONTAINER_PORT, API_DATA_PATH, CP_CONTAINER_PORT, LABELS, RELAY_TUNNEL_PORT } from './pins.js';
 
 /** The relay program, run inside the API image; part of the relay's spec hash. */
 const RELAY_SCRIPT = fs.readFileSync(new URL('./relay/relay.mjs', import.meta.url), 'utf8');
@@ -106,8 +106,8 @@ export function cpSpec({ names, image, bind, port, apiKey, accessKey, owner }) {
 
 /**
  * The relay: runs from the verified API image (which carries Node), reachable by the
- * API as `ollama` on the private network. Only the tunnel port is published; the API-facing
- * port is not.
+ * API under the target's alias on the private network. Only the tunnel port is published; the
+ * API-facing port is not.
  * @param {object} o
  * @param {ReturnType<typeof resourceNames>} o.names
  * @param {{id: string}} o.image the verified API image
@@ -115,12 +115,13 @@ export function cpSpec({ names, image, bind, port, apiKey, accessKey, owner }) {
  * @param {number} o.port host port the tunnel is published on
  * @param {string} o.key the relay key
  * @param {string} o.owner
+ * @param {{alias: string, apiPort: number}} o.target an entry of RELAY_TARGETS
  */
-export function relaySpec({ names, image, bind, port, key, owner }) {
-  const env = { RELAY_KEY: key, RELAY_API_PORT: String(OLLAMA_TARGET.apiPort), RELAY_TUNNEL_PORT: String(RELAY_TUNNEL_PORT), RELAY_MAX_WAITING: String(LLM_MAX_CONCURRENT_MAX) };
+export function relaySpec({ names, image, bind, port, key, owner, target }) {
+  const env = { RELAY_KEY: key, RELAY_API_PORT: String(target.apiPort), RELAY_TUNNEL_PORT: String(RELAY_TUNNEL_PORT), RELAY_MAX_WAITING: String(LLM_MAX_CONCURRENT_MAX) };
   const base = [
     '-d', '--name', names.relay,
-    '--network', names.network, '--network-alias', OLLAMA_TARGET.alias,
+    '--network', names.network, '--network-alias', target.alias,
     '--restart', 'on-failure:3',
     '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges',
     '-p', `${bind}:${port}:${RELAY_TUNNEL_PORT}`,

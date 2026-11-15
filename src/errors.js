@@ -120,9 +120,14 @@ export const CATALOG = Object.freeze({
     action: ACTIONS.settings, status: 409,
   },
   CC_BACKEND_LOOPBACK: {
-    title: 'The linked cc backend points at loopback',
-    message: (p) => `cc backend "${s(p.backendId)}" talks to ${s(p.host)}, which is cc's own loopback and unreachable from a container. Pick another one, or set the LLM manually.`,
+    title: 'The linked cc backend uses TLS on loopback',
+    message: (p) => `cc backend "${s(p.backendId)}" talks https to ${s(p.host)}, cc's own loopback. The relay forwards plain HTTP only, so it cannot be linked. Pick another one, or set the LLM manually.`,
     action: ACTIONS.settings, status: 409,
+  },
+  CC_BACKEND_UNREACHABLE: {
+    title: 'The linked cc backend did not answer',
+    message: (p) => `The linked cc backend's endpoint at ${s(p.url)} did not answer (${s(p.detail)}). It runs in cc's container: start it there.`,
+    status: 502,
   },
   OLLAMA_UNREACHABLE: {
     title: 'The Ollama daemon did not answer',
