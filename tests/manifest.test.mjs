@@ -47,6 +47,12 @@ test('the hooks: recall, an async retain and a clear|compact reset, each timeout
   assert.ok(DESCRIBE_TIMEOUT_MS + WORKSPACES_TIMEOUT_MS < HOOK_TIMEOUTS.retain, 'resolving a Stop fits inside the retain hook deadline');
 });
 
+test('the recall tool\'s backend budget fits inside cc\'s mcp.timeoutMs', async () => {
+  const { DESCRIBE_TIMEOUT_MS, WORKSPACES_TIMEOUT_MS } = await import('../src/ccSession.js');
+  const { MEMORY_LIMITS } = await import('../src/memory.js');
+  assert.ok(DESCRIBE_TIMEOUT_MS + WORKSPACES_TIMEOUT_MS + MEMORY_LIMITS.recallTimeoutMs < manifest.mcp.timeoutMs, 'cc must not abort the recall tool before the backend\'s own deadlines answer');
+});
+
 test('the manifest mcp.tools are exactly the tools the backend serves, at the endpoint it serves', async (t) => {
   assert.deepEqual(manifest.mcp.tools.map((x) => x.name), ['recall']);
   const { url } = await boot(t, { start: false });

@@ -4,7 +4,8 @@
 // all go through documented cc routes.
 import { AppError } from './errors.js';
 
-export const DESCRIBE_TIMEOUT_MS = 1000;
+/** Deadline of `describe_session` on the hook and recall-tool paths; with the other deadlines it must fit the hook's. */
+export const DESCRIBE_TIMEOUT_MS = 3000;
 export const STAGES_TTL_MS = 60_000;
 const STAGES_TIMEOUT_MS = 5000;
 /** How long the project → workspace index serves before it is read again (the membership lag). */
