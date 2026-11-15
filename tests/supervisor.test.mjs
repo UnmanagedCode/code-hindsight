@@ -384,16 +384,16 @@ test('a daemon that cannot be reached at shutdown is recorded, not waited on', a
 });
 
 /** A second supervisor over an existing test root (a backend restart). */
-function makeOver(t, r) {
+function makeOver(t, r, { mode = '', timeouts } = {}) {
   const settingsStore = createSettingsStore(r.dataDir);
   const secrets = createSecretsStore(r.dataDir);
-  const docker = createDocker({ env: fakeEnv(r), allowSudo: () => true, prefix: PREFIX, images: [API_IMAGES.full.ref], runDir: path.join(r.dataDir, 'run') });
+  const docker = createDocker({ env: fakeEnv(r, { mode }), allowSudo: () => true, prefix: PREFIX, images: [API_IMAGES.full.ref], runDir: path.join(r.dataDir, 'run') });
   const sup = createSupervisor({
     docker, settings: settingsStore, secrets, cpTrust: createCpTrust(r.dataDir), names, owner: ownerId(r.dataDir), dataDir: r.dataDir,
     detectBind: () => '127.0.0.1', fetchCcModels: async () => ({}), cpSession: { token: async () => 't', clear() {} }, relay: fakeRelay(),
-    probe: async () => 200, clock: fakeClock(), watch: false, log: () => {},
+    probe: async () => 200, clock: fakeClock(), watch: false, log: () => {}, timeouts,
   });
-  return { sup };
+  return { sup, docker };
 }
 
 // Lifecycle (Restart race): a new backend waits for the previous one's detached stop to finish.
@@ -654,4 +654,46 @@ test('C-2: a start cancelled by stop() ends with the tunnel stopped, never start
   assert.deepEqual(relay.calls.at(-1), ['stop']);
   assert.equal(sup.status().ollama, null);
   assert.ok(!dockerCalls(r).some((a) => a[0] === 'run' && a.includes(names.relay)), 'no relay container was created either');
+});
+
+const stopArgs = (r) => dockerCalls(r).find((a) => a[0] === 'stop');
+
+// R2-C2: the shutdown's look at the relay is bounded, so a hung `docker inspect` cannot hold up the detached stop.
+test('R2-C2: a hung relay inspect still lets the detached stop run promptly, and it includes the relay', async (t) => {
+  const first = makeLinked(t);
+  await first.sup.ensureRunning();
+  setDockerState(first.r, (st) => { st.hangRelayInspect = true; });
+  const { sup, docker } = makeOver(t, first.r, { timeouts: { shutdownProbeMs: 200 } });
+  await docker.resolve();
+  fs.writeFileSync(first.r.logPath, '');
+  const started = Date.now();
+  const pid = await sup.shutdown();
+  assert.ok(Number.isInteger(pid));
+  assert.ok(Date.now() - started < 5_000, 'bounded by shutdownProbeMs, not docker inspect\'s own timeout');
+  await waitFor(() => stopArgs(first.r));
+  assert.deepEqual(stopArgs(first.r), ['stop', '-t', '30', names.cp, names.api, names.relay]);
+});
+
+// R2-C3 (the declared C-1 limit): with docker not resolved, only this process's own link counts.
+test('R2-C3: with docker unresolved, a relay left running by an earlier process is not named in the stop', async (t) => {
+  const first = makeLinked(t);
+  await first.sup.ensureRunning();
+  const { sup, docker } = makeOver(t, first.r);
+  assert.equal(docker.info().mode, null);
+  fs.writeFileSync(first.r.logPath, '');
+  await sup.shutdown();
+  await waitFor(() => stopArgs(first.r));
+  assert.deepEqual(stopArgs(first.r), ['stop', '-t', '30', names.cp, names.api]);
+});
+
+// R2-C3: an inspect that fails for any reason but "no such container" counts as may-run.
+test('R2-C3: a failing relay inspect counts as may-run: the relay is named in the stop', async (t) => {
+  const first = makeLinked(t);
+  await first.sup.ensureRunning();
+  const { sup, docker } = makeOver(t, first.r, { mode: 'fail-inspect-container' });
+  await docker.resolve();
+  fs.writeFileSync(first.r.logPath, '');
+  await sup.shutdown();
+  await waitFor(() => stopArgs(first.r));
+  assert.deepEqual(stopArgs(first.r), ['stop', '-t', '30', names.cp, names.api, names.relay]);
 });

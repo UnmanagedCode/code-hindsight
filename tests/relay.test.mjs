@@ -226,22 +226,32 @@ test('OL8 S-F3: the checked path and query are what is forwarded and what lastFo
   assert.equal(proxy.lastForward().path, '/api/chat?stream=true');
 });
 
-// OL8 (S-F4): unauthenticated sockets are capped, and extras are closed at once.
-test('OL8 S-F4: tunnel sockets still in the handshake are capped', async (t) => {
+// OL8 (R2-S1): at the handshake cap the OLDEST silent socket is closed, so a valid connect always gets in.
+test('OL8 R2-S1: at RELAY_MAX_HANDSHAKING the oldest silent socket is closed and a valid tunnel still authenticates', async (t) => {
   const rl = await startRelay(t, { handshakeMs: 5_000, env: { RELAY_MAX_HANDSHAKING: '2' } });
-  const open = () => new Promise((resolve) => {
+  const silent = () => new Promise((resolve) => {
     const s = net.connect(rl.tunnelPort, '127.0.0.1');
     s.on('error', () => {});
-    s.on('connect', () => resolve({ s, closed: () => s.destroyed }));
+    s.on('connect', () => resolve(s));
   });
-  const [a, b, c] = [await open(), await open(), await open()];
-  t.after(() => [a, b, c].forEach((x) => x.s.destroy()));
-  await waitFor(() => c.closed());
-  assert.equal(a.closed() || b.closed(), false, 'the first two keep their handshake window');
+  const [a, b] = [await silent(), await silent()];
+  const valid = net.connect(rl.tunnelPort, '127.0.0.1', () => valid.write(`HSR1 ${KEY}\n`));
+  let go = null;
+  valid.on('error', () => {});
+  valid.on('data', (d) => { go = d; });
+  t.after(() => [a, b, valid].forEach((x) => x.destroy()));
+  await waitFor(() => a.destroyed);
+  assert.equal(b.destroyed, false, 'only the oldest is closed');
+  await new Promise((r) => setTimeout(r, 50));
+  const api = net.connect(rl.apiPort, '127.0.0.1');
+  api.on('error', () => {});
+  t.after(() => api.destroy());
+  await waitFor(() => go !== null);
+  assert.deepEqual([...go], [1], 'the valid tunnel landed in idle and was paired');
 });
 
-// OL8 (S-F4): API connections waiting for a tunnel are capped.
-test('OL8 S-F4: API connections waiting for a tunnel are capped', async (t) => {
+// OL8 (R2-C1): at the waiting cap the OLDEST waiting API connection is closed and the newest is kept.
+test('OL8 R2-C1: at RELAY_MAX_WAITING the oldest waiting API connection is closed', async (t) => {
   const rl = await startRelay(t, { waitMs: 3_000, env: { RELAY_MAX_WAITING: '1' } });
   const open = () => new Promise((resolve) => {
     const s = net.connect(rl.apiPort, '127.0.0.1');
@@ -250,8 +260,22 @@ test('OL8 S-F4: API connections waiting for a tunnel are capped', async (t) => {
   });
   const [first, second] = [await open(), await open()];
   t.after(() => { first.destroy(); second.destroy(); });
-  await waitFor(() => second.destroyed);
-  assert.equal(first.destroyed, false);
+  await waitFor(() => first.destroyed);
+  assert.equal(second.destroyed, false);
+});
+
+// OL8 (R2-C1): parallel requests well above the old ceiling are each served; the plugin gives the relay a cap of LLM_MAX_CONCURRENT_MAX.
+test('OL8 R2-C1: 128 parallel requests are each served (waiting cap sized to supported concurrency)', async (t) => {
+  const { relaySpec } = await import('../src/containerSpec.js');
+  const { resourceNames } = await import('../src/containerSpec.js');
+  const { LLM_MAX_CONCURRENT_MAX } = await import('../src/settings.js');
+  const spec = relaySpec({ names: resourceNames('p'), image: { id: 'sha256:x' }, bind: '127.0.0.1', port: 1, key: KEY, owner: 'o' });
+  assert.equal(spec.env.RELAY_MAX_WAITING, String(LLM_MAX_CONCURRENT_MAX));
+  const rl = await startRelay(t, { waitMs: 15_000, env: { RELAY_MAX_WAITING: spec.env.RELAY_MAX_WAITING } });
+  const { fake } = await stack(t, { relay: rl });
+  const results = await Promise.all(Array.from({ length: 128 }, (_, i) => call(rl.apiPort, { body: JSON.stringify({ n: i }) })));
+  assert.deepEqual([...new Set(results.map((r) => r.status))], [200]);
+  assert.equal(fake.requests.length, 128);
 });
 
 // OL8 (S-F4): a flood of failed handshakes is one log line, not one per failure.

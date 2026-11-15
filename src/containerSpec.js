@@ -2,6 +2,7 @@
 // the spec hash an adopted container must match.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import { LLM_MAX_CONCURRENT_MAX } from './settings.js';
 import { API_CONTAINER_PORT, API_DATA_PATH, CP_CONTAINER_PORT, LABELS, OLLAMA_TARGET, RELAY_TUNNEL_PORT } from './pins.js';
 
 /** The relay program, run inside the API image; part of the relay's spec hash. */
@@ -116,7 +117,7 @@ export function cpSpec({ names, image, bind, port, apiKey, accessKey, owner }) {
  * @param {string} o.owner
  */
 export function relaySpec({ names, image, bind, port, key, owner }) {
-  const env = { RELAY_KEY: key, RELAY_API_PORT: String(OLLAMA_TARGET.apiPort), RELAY_TUNNEL_PORT: String(RELAY_TUNNEL_PORT) };
+  const env = { RELAY_KEY: key, RELAY_API_PORT: String(OLLAMA_TARGET.apiPort), RELAY_TUNNEL_PORT: String(RELAY_TUNNEL_PORT), RELAY_MAX_WAITING: String(LLM_MAX_CONCURRENT_MAX) };
   const base = [
     '-d', '--name', names.relay,
     '--network', names.network, '--network-alias', OLLAMA_TARGET.alias,

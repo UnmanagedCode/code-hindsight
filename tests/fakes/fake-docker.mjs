@@ -8,6 +8,7 @@
 //   FAKE_DOCKER_MODE   comma list: denied (refused unless via sudo), daemon-down, port-clash,
 //                      crash (a run/start container exits 1), fail-<subcommand>
 //   FAKE_DOCKER_VIA_SUDO  set by fake-sudo
+//   state.hangRelayInspect  (in the state file) inspecting a container named *-relay never answers
 import fs from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -79,6 +80,8 @@ switch (cmd) {
     break;
   }
   case 'inspect-container': {
+    // Test switch: state.hangRelayInspect makes inspecting the relay container never answer.
+    if (s.hangRelayInspect && rest[0].endsWith('-relay')) await new Promise(() => setTimeout(() => {}, 60_000));
     const c = s.containers[rest[0]];
     if (!c) fail(`Error response from daemon: No such container: ${rest[0]}`);
     out(JSON.stringify([c]));

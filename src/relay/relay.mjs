@@ -10,7 +10,9 @@
 // Env: RELAY_KEY, RELAY_API_PORT, RELAY_TUNNEL_PORT, RELAY_WAIT_MS (how long an API connection
 // waits for an idle tunnel), RELAY_HANDSHAKE_MS, RELAY_ACK_MS (how long a paired tunnel may take to
 // ack), RELAY_MAX_HANDSHAKING and RELAY_MAX_WAITING (caps on unauthenticated tunnel sockets and on
-// API connections waiting for a tunnel; extras are closed). It prints one JSON line when listening.
+// API connections waiting for a tunnel; at a cap the OLDEST is closed and the new one admitted, so a
+// fresh valid connect always gets in). The plugin sets RELAY_MAX_WAITING to LLM_MAX_CONCURRENT_MAX
+// (src/settings.js): no more calls can be in flight than the API is allowed to make. It prints one JSON line when listening.
 import net from 'node:net';
 import crypto from 'node:crypto';
 
@@ -21,7 +23,7 @@ const WAIT_MS = Number(process.env.RELAY_WAIT_MS ?? 10_000);
 const HANDSHAKE_MS = Number(process.env.RELAY_HANDSHAKE_MS ?? 5_000);
 const ACK_MS = Number(process.env.RELAY_ACK_MS ?? 5_000);
 const MAX_HANDSHAKING = Number(process.env.RELAY_MAX_HANDSHAKING ?? 32);
-const MAX_WAITING = Number(process.env.RELAY_MAX_WAITING ?? 64);
+const MAX_WAITING = Number(process.env.RELAY_MAX_WAITING ?? 256); // fallback; the plugin passes the real value
 const LOG_EVERY_MS = 10_000;
 const MAX_HANDSHAKE_BYTES = 256;
 const MAX_IDLE = 16;
@@ -74,13 +76,19 @@ function offer(tunnel) {
   tunnel.on('close', () => { const i = idle.indexOf(tunnel); if (i !== -1) idle.splice(i, 1); });
 }
 
-let handshaking = 0;
+/** Sockets still in their handshake, oldest first. */
+const handshaking = new Set();
 const tunnelServer = net.createServer((socket) => {
   socket.on('error', noop);
-  if (handshaking >= MAX_HANDSHAKING) { logLimited('handshake-cap', 'relay: too many tunnel handshakes in progress; closed one'); socket.destroy(); return; }
-  handshaking++;
-  let counted = true;
-  const done = () => { if (counted) { counted = false; handshaking--; } };
+  if (handshaking.size >= MAX_HANDSHAKING) {
+    // Never refuse the newcomer: silent sockets must not be able to lock the plugin out.
+    const oldest = handshaking.values().next().value;
+    handshaking.delete(oldest);
+    logLimited('handshake-cap', 'relay: too many tunnel handshakes in progress; closed the oldest');
+    oldest.destroy();
+  }
+  handshaking.add(socket);
+  const done = () => { handshaking.delete(socket); };
   socket.on('close', done);
   socket.setKeepAlive(true, 15_000);
   let buf = Buffer.alloc(0);
@@ -101,6 +109,7 @@ const tunnelServer = net.createServer((socket) => {
       socket.destroy();
       return;
     }
+    logLimited('authed', `relay: tunnel authenticated from ${socket.remoteAddress}`);
     offer(socket);
   };
   socket.on('data', onData);
@@ -113,7 +122,12 @@ const apiServer = net.createServer((api) => {
   while ((tunnel = idle.shift())) {
     if (!tunnel.destroyed) { pair(tunnel, api); return; }
   }
-  if (waiting.length >= MAX_WAITING) { logLimited('wait-cap', 'relay: too many API connections waiting for a tunnel; closed one'); api.destroy(); return; }
+  if (waiting.length >= MAX_WAITING) {
+    const oldest = waiting.shift();
+    clearTimeout(oldest.timer);
+    logLimited('wait-cap', 'relay: too many API connections waiting for a tunnel; closed the oldest');
+    oldest.api.destroy();
+  }
   api.pause();
   const w = { api, timer: setTimeout(() => {
     const i = waiting.indexOf(w);

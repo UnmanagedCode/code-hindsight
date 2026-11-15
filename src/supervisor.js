@@ -27,6 +27,8 @@ export const DEFAULT_TIMEOUTS = Object.freeze({
   /** How long a new backend waits for the previous one's detached `docker stop`. */
   pendingStopMs: 90_000,
   stopSeconds: 30,
+  /** The shutdown's look at the relay container: bounded, because cc's kill grace is short. */
+  shutdownProbeMs: 1_500,
 });
 
 const realClock = {
@@ -339,14 +341,18 @@ export function createSupervisor({
   /**
    * Whether the relay container may be running: this process linked it, or it is ours and
    * running, whichever process started it. Inspecting needs a resolved docker (a shutdown
-   * must not wait on a resolve), so an unresolved docker counts only this process's own link;
-   * a failed inspect counts as running (`docker stop` of a missing name only errors for it).
+   * must not wait on a resolve), so an unresolved docker counts only this process's own link.
+   * The inspect is bounded (`shutdownProbeMs`): a clean "missing", "not ours" or "not running"
+   * answer is no; anything else (a timeout, a docker error, unreadable output) is yes, since
+   * `docker stop` of a missing name only errors for that name.
    */
   async function relayMayRun() {
     if (ollamaLinked) return true;
     if (!docker.info().mode) return false;
     try {
-      const c = await docker.inspectContainer(names.relay);
+      const r = await docker.exec(['container', 'inspect', names.relay], { check: false, timeoutMs: T.shutdownProbeMs });
+      if (r.code !== 0) return !/No such|not found/i.test(r.stderr);
+      const c = JSON.parse(r.stdout)[0];
       return !!c && c.Config?.Labels?.[LABELS.owner] === owner && !!(c.State?.Running || c.State?.Restarting);
     } catch { return true; }
   }

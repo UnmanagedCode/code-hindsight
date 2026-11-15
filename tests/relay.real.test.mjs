@@ -36,6 +36,12 @@ test('OL11: real stack: the API\'s LLM check reaches the fake Ollama through the
   const apiLog = await (await fetch(`${url}/-/api/logs/api`)).text();
   assert.equal(apiLog.includes(app.secrets.get().relayKey), false, 'the relay key is not in the API log');
 
+  // The address the relay sees for the plugin (decides whether a per-source cap could throttle the plugin itself).
+  const relayLog = await (await fetch(`${url}/-/api/logs/relay`)).text();
+  const seen = /tunnel authenticated from ([0-9a-f.:]+)/.exec(relayLog)?.[1];
+  assert.ok(seen, `the relay logged the tunnel's source: ${relayLog.slice(-200)}`);
+  console.log(`relay saw the plugin's tunnel from ${seen} (the plugin's bind address: ${app.supervisor.status().bindAddress})`);
+
   // Only the tunnel port is published, on the bind address; the API-facing port is not.
   const name = `${prefix}-relay`;
   const bindings = JSON.parse(hostDocker(['inspect', '-f', '{{json .HostConfig.PortBindings}}', name]).stdout);
