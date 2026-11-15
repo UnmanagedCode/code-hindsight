@@ -98,6 +98,7 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
   };
 
   const backend = backends?.find((b) => b.id === form.llm.backendId);
+  const chosen = backend?.models.find((m) => m.model === form.llm.model);
   return (
     <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); void save(true); }}>
       <Card>
@@ -121,9 +122,9 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
       <Card>
         <CardHeader>
           <CardTitle>Network</CardTitle>
-          <CardDescription>Both ports are published on one host address and both need a key.</CardDescription>
+          <CardDescription>The API and control-plane ports are published on one host address and both need a key.</CardDescription>
         </CardHeader>
-        <CardContent className="grid gap-3 sm:grid-cols-3">
+        <CardContent className="grid gap-3 sm:grid-cols-4">
           <Field id="network.bindAddress" label="Bind address" error={err('network.bindAddress')} hint={`Empty = automatic (${view.detectedBindAddress})`}>
             <Input id="network.bindAddress" value={form.network.bindAddress ?? ''} placeholder={view.detectedBindAddress} onChange={(e) => set('network', { bindAddress: nul(e.target.value) })} />
           </Field>
@@ -132,6 +133,9 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
           </Field>
           <Field id="network.cpPort" label="Control-plane port" error={err('network.cpPort')}>
             <Input id="network.cpPort" type="number" value={form.network.cpPort} onChange={(e) => set('network', { cpPort: Number(e.target.value) })} />
+          </Field>
+          <Field id="network.relayPort" label="Relay port" error={err('network.relayPort')} hint="Used only with an Ollama backend">
+            <Input id="network.relayPort" type="number" value={form.network.relayPort} onChange={(e) => set('network', { relayPort: Number(e.target.value) })} />
           </Field>
         </CardContent>
       </Card>
@@ -172,7 +176,7 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
                     <option value="">Choose…</option>
                     {backends.map((b) => (
                       <option key={b.id} value={b.id} disabled={!b.usable}>
-                        {b.label}{b.host ? ` (${b.host})` : ''}{b.usable ? '' : b.refusal === 'CC_BACKEND_LOOPBACK' ? ' — loopback, unreachable from a container' : ' — no Anthropic URL and token'}
+                        {b.label}{b.kind === 'ollama' ? ' (cc\'s Ollama daemon, via relay)' : b.host ? ` (${b.host})` : ''}{b.usable ? '' : b.refusal === 'CC_BACKEND_LOOPBACK' ? ' — loopback, unreachable from a container' : ' — no Anthropic URL and token'}
                       </option>
                     ))}
                   </NativeSelect>
@@ -182,13 +186,41 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
                 {backend && backend.models.length > 0 ? (
                   <NativeSelect id="llm.model" value={form.llm.model ?? ''} onChange={(e) => set('llm', { model: nul(e.target.value) })}>
                     <option value="">Choose…</option>
-                    {backend.models.map((m) => <option key={m.model} value={m.model}>{m.label}</option>)}
+                    {backend.kind === 'ollama' ? (
+                      (['cc', 'daemon'] as const).map((source) => {
+                        const group = backend.models.filter((m) => m.source === source);
+                        return group.length > 0 && (
+                          <optgroup key={source} label={source === 'cc' ? 'Configured in cc' : 'Other models on the daemon'}>
+                            {group.map((m) => <option key={m.model} value={m.model}>{m.label}{m.label === m.model ? '' : ` — ${m.model}`} ({m.cloud ? 'cloud' : 'local'})</option>)}
+                          </optgroup>
+                        );
+                      })
+                    ) : backend.models.map((m) => <option key={m.model} value={m.model}>{m.label}</option>)}
                   </NativeSelect>
                 ) : (
                   <Input id="llm.model" value={form.llm.model ?? ''} onChange={(e) => set('llm', { model: nul(e.target.value) })} />
                 )}
               </Field>
+              {backend?.kind === 'ollama' && (
+                <div className="space-y-1 text-xs sm:col-span-2" data-hint="ollama">
+                  {backend.daemon && !backend.daemon.reachable && (
+                    <p className="text-destructive" data-hint="ollama-unreachable">The Ollama daemon did not answer ({backend.daemon.error}). It runs in cc's container; models are listed from cc only, and all count as cloud.</p>
+                  )}
+                  {chosen?.cloud && (
+                    <p className="text-destructive" role="alert" data-hint="ollama-cloud">Retained, imported and recall text is sent through cc's Ollama daemon to ollama.com under its signed-in account.</p>
+                  )}
+                  {chosen && !chosen.cloud && (
+                    <p className="text-muted-foreground" data-hint="ollama-local">A local model: Hindsight recommends Max parallel LLM requests = 1 for Ollama.</p>
+                  )}
+                </div>
+              )}
             </div>
+          )}
+          {form.llm.mode !== 'none' && (
+            <Field id="llm.maxConcurrent" label="Max parallel LLM requests" error={err('llm.maxConcurrent')} hint={`Empty = Hindsight's default (32); 1 to ${view.choices.llmMaxConcurrentMax}`}>
+              <Input id="llm.maxConcurrent" type="number" min={1} max={view.choices.llmMaxConcurrentMax} value={form.llm.maxConcurrent ?? ''}
+                onChange={(e) => set('llm', { maxConcurrent: e.target.value.trim() === '' ? null : Number(e.target.value) })} />
+            </Field>
           )}
         </CardContent>
       </Card>

@@ -17,6 +17,12 @@ import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, setDockerState, 
 const PREFIX = 'code-hindsight';
 const names = resourceNames(PREFIX);
 
+/** A recording stand-in for the Ollama tunnel the supervisor starts and stops. */
+function fakeRelay() {
+  const calls = [];
+  return { calls, start: (target) => calls.push(['start', target]), stop: () => calls.push(['stop']), status: () => ({ daemonUrl: 'http://127.0.0.1:11434', tunnel: { state: 'connected', idle: 1, error: null, address: '127.0.0.1:18434' }, lastForward: null }) };
+}
+
 function make(t, { mode = '', sudoMode, seed, settings, allowSudo, fetchCcModels, clock = fakeClock(), health, trusted = true, watch = false, env: envOverride } = {}) {
   const r = mkRoot(t);
   seedDocker(r, seed);
@@ -37,12 +43,13 @@ function make(t, { mode = '', sudoMode, seed, settings, allowSudo, fetchCcModels
   let logins = 0;
   const cpSession = { token: async () => { logins++; return 't'; }, clear() {} };
   const owner = ownerId(r.dataDir);
+  const relay = fakeRelay();
   const sup = createSupervisor({
     docker, settings: settingsStore, secrets, cpTrust: createCpTrust(r.dataDir), names, owner, dataDir: r.dataDir, detectBind: () => '127.0.0.1',
-    fetchCcModels: fetchCcModels ?? (async () => { throw new Error('cc not expected'); }), cpSession, probe, clock, watch,
+    fetchCcModels: fetchCcModels ?? (async () => { throw new Error('cc not expected'); }), cpSession, probe, clock, watch, relay,
     log: () => {},
   });
-  return { r, env, sup, settingsStore, secrets, docker, health: h, probes, owner, logins: () => logins };
+  return { r, env, sup, relay, settingsStore, secrets, docker, health: h, probes, owner, logins: () => logins };
 }
 
 const cmds = (r) => dockerCalls(r).map((a) => a[0] === 'network' || a[0] === 'volume' || a[0] === 'image' || a[0] === 'container' ? `${a[0]} ${a[1]}` : a[0]);
@@ -54,7 +61,7 @@ test('starts from nothing: network, volume, API, CP, health, ready', async (t) =
   await sup.ensureRunning();
   const st = sup.status();
   assert.equal(st.state, 'ready', JSON.stringify(st.error));
-  assert.deepEqual(st.ports, { api: 18888, cp: 19999 });
+  assert.deepEqual(st.ports, { api: 18888, cp: 19999, relay: 18434 });
   assert.equal(st.bindAddress, '127.0.0.1');
   assert.equal(st.containers.api.state, 'running');
   assert.equal(st.images.api.ok, true);
@@ -90,7 +97,7 @@ test('a second backend adopts the running containers: no run, stop or rm', async
   fs.writeFileSync(first.r.logPath, '');
   const again = createSupervisor({
     docker: first.docker, settings: first.settingsStore, secrets: first.secrets, cpTrust: createCpTrust(first.r.dataDir), names, owner: first.owner, dataDir: first.r.dataDir,
-    detectBind: () => '127.0.0.1', fetchCcModels: async () => { throw new Error('x'); }, cpSession: { token: async () => 't', clear() {} },
+    detectBind: () => '127.0.0.1', fetchCcModels: async () => { throw new Error('x'); }, cpSession: { token: async () => 't', clear() {} }, relay: fakeRelay(),
     probe: async () => 200, clock: fakeClock(), watch: false, log: () => {},
   });
   await again.ensureRunning();
@@ -383,7 +390,7 @@ function makeOver(t, r) {
   const docker = createDocker({ env: fakeEnv(r), allowSudo: () => true, prefix: PREFIX, images: [API_IMAGES.full.ref], runDir: path.join(r.dataDir, 'run') });
   const sup = createSupervisor({
     docker, settings: settingsStore, secrets, cpTrust: createCpTrust(r.dataDir), names, owner: ownerId(r.dataDir), dataDir: r.dataDir,
-    detectBind: () => '127.0.0.1', fetchCcModels: async () => ({}), cpSession: { token: async () => 't', clear() {} },
+    detectBind: () => '127.0.0.1', fetchCcModels: async () => ({}), cpSession: { token: async () => 't', clear() {} }, relay: fakeRelay(),
     probe: async () => 200, clock: fakeClock(), watch: false, log: () => {},
   });
   return { sup };
@@ -504,4 +511,106 @@ test('after N restarts exactly one watch loop runs, and UNHEALTHY needs consecut
   await clock.tick();
   assert.equal(clock.pending(), 0, 'the stopped loop ends at its next wake');
   assert.equal(watchProbes(), before, 'without probing');
+});
+
+
+const OLLAMA_CC = { backends: [{ id: 'ollama', label: 'Ollama', template: 'ollama launch claude --model {model} --yes --', env: [] }] };
+const ollamaLink = { llm: { mode: 'cc-backend', provider: null, model: 'qwen3:4b', baseUrl: null, backendId: 'ollama', maxConcurrent: null } };
+const makeLinked = (t, o = {}) => make(t, { settings: ollamaLink, fetchCcModels: async () => OLLAMA_CC, ...o });
+
+// OL9: with an Ollama link the relay is created before the API, and the tunnel dials the published port.
+test('OL9: an Ollama link creates the relay before the API and starts the tunnel at bind:relayPort', async (t) => {
+  const { r, sup, relay, secrets } = makeLinked(t);
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  const runs = dockerCalls(r).filter((a) => a[0] === 'run').map((a) => a[a.indexOf('--name') + 1]);
+  assert.deepEqual(runs, [names.relay, names.api, names.cp]);
+  assert.deepEqual(relay.calls, [['start', { host: '127.0.0.1', port: 18434 }]]);
+  const st = dockerState(r);
+  assert.ok(st.containers[names.relay].Config.Env.includes(`RELAY_KEY=${secrets.get().relayKey}`));
+  const apiEnv = st.containers[names.api].Config.Env;
+  assert.ok(apiEnv.includes('HINDSIGHT_API_LLM_PROVIDER=ollama'));
+  assert.ok(apiEnv.includes('HINDSIGHT_API_LLM_BASE_URL=http://ollama:11434/v1'));
+  assert.equal(sup.status().containers.relay.state, 'running');
+  assert.equal(sup.status().ollama.tunnel.state, 'connected');
+});
+
+test('OL9: without an Ollama link there is no relay and no ollama status', async (t) => {
+  const { r, sup, relay } = make(t);
+  await sup.ensureRunning();
+  assert.ok(!dockerCalls(r).some((a) => a[0] === 'run' && a.includes(names.relay)));
+  assert.equal(sup.status().ollama, null);
+  assert.deepEqual(relay.calls, [['stop']]);
+});
+
+test('OL9: unlinking removes the relay container and stops the tunnel', async (t) => {
+  const { r, sup, relay, settingsStore } = makeLinked(t);
+  await sup.ensureRunning();
+  assert.ok(dockerState(r).containers[names.relay]);
+  const s = settingsStore.get();
+  s.llm = { mode: 'none', provider: null, model: null, baseUrl: null, backendId: null, maxConcurrent: null };
+  settingsStore.save(s);
+  await sup.ensureRunning();
+  assert.equal(dockerState(r).containers[names.relay], undefined);
+  assert.deepEqual(relay.calls.at(-1), ['stop']);
+  assert.equal(sup.status().ollama, null);
+});
+
+test('OL9: stop and shutdown include the relay and stop the tunnel', async (t) => {
+  const { r, sup, relay } = makeLinked(t);
+  await sup.ensureRunning();
+  await sup.stop();
+  assert.equal(dockerState(r).containers[names.relay].State.Running, false);
+  assert.deepEqual(relay.calls.at(-1), ['stop']);
+  await sup.ensureRunning();
+  fs.writeFileSync(r.logPath, '');
+  await sup.shutdown();
+  await waitFor(() => dockerCalls(r).some((a) => a[0] === 'stop'));
+  assert.deepEqual(dockerCalls(r).find((a) => a[0] === 'stop'), ['stop', '-t', '30', names.cp, names.api, names.relay]);
+  assert.deepEqual(relay.calls.at(-1), ['stop']);
+});
+
+test('OL9: a relay that exited while the API is fine is CRASHED for the relay role', async (t) => {
+  const { r, sup } = makeLinked(t);
+  await sup.ensureRunning();
+  setDockerState(r, (s) => { s.containers[names.relay].State = { Status: 'exited', Running: false, Restarting: false, ExitCode: 1 }; });
+  await sup.checkHealth();
+  assert.equal(errCode(sup), 'CRASHED');
+  assert.equal(sup.status().error.params.role, 'relay');
+});
+
+test('OL9: a clash on the relay port is PORT_IN_USE naming network.relayPort', async (t) => {
+  const { sup } = makeLinked(t, { mode: 'port-clash' });
+  await sup.ensureRunning();
+  const e = sup.status().error;
+  assert.equal(e.code, 'PORT_IN_USE');
+  assert.deepEqual([e.params.port, e.params.setting], [18434, 'network.relayPort']);
+});
+
+test('OL9: with an Ollama link every docker call stays on prefixed resources and none connects a network', async (t) => {
+  const { r, sup } = makeLinked(t);
+  await sup.ensureRunning();
+  await sup.restart();
+  await sup.stop();
+  for (const a of dockerCalls(r)) {
+    assert.ok(!(a[0] === 'network' && a[1] === 'connect'), a.join(' '));
+    if (a[0] === 'run') {
+      assert.ok(a[a.indexOf('--name') + 1].startsWith(`${PREFIX}-`));
+      assert.ok(a[a.indexOf('--network') + 1].startsWith(`${PREFIX}-`));
+    }
+  }
+});
+
+// OL5: a changed cap or relay port on a running stack is a pending restart.
+test('OL5: changing maxConcurrent or relayPort on a ready stack flags pendingRestart', async (t) => {
+  const { sup, settingsStore } = make(t);
+  await sup.ensureRunning();
+  for (const change of [(s) => { s.llm.maxConcurrent = 2; }, (s) => { s.network.relayPort = 20000; }]) {
+    const s = settingsStore.get();
+    change(s);
+    settingsStore.save(s);
+    assert.equal(sup.status().pendingRestart, true);
+    await sup.ensureRunning();
+    assert.equal(sup.status().pendingRestart, false);
+  }
 });

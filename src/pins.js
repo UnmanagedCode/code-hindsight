@@ -73,6 +73,21 @@ export const LABELS = Object.freeze({
 /** Ports the upstream images listen on inside their containers. */
 export const API_CONTAINER_PORT = 8888;
 export const CP_CONTAINER_PORT = 9999;
+/**
+ * The relay: a container on the plugin network that a client in the API container calls, and the
+ * one port the plugin dials out to (the tunnel). What the API calls is the relay's target.
+ */
+export const RELAY_TUNNEL_PORT = 7070;
+/**
+ * The relay's one target: cc's Ollama daemon. `alias` and `apiPort` are where the API's Ollama
+ * client finds the relay (`http://ollama:11434`); `allowed` is every `METHOD path` the plugin
+ * forwards to the daemon (model management is never among them).
+ */
+export const OLLAMA_TARGET = Object.freeze({
+  alias: 'ollama',
+  apiPort: 11434,
+  allowed: Object.freeze(['POST /v1/chat/completions', 'POST /api/chat']),
+});
 /** Where the API image keeps its embedded Postgres data. */
 export const API_DATA_PATH = '/home/hindsight/.pg0';
 /** The CP session cookie (`ACCESS_KEY_COOKIE` upstream). */

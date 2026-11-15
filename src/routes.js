@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { AppError, describeError } from './errors.js';
 import { sendJson, readJson, securityHeaders } from './http.js';
 import { isCrossSite } from './cpProxy.js';
-import { validateSettings, keyEndpoints, LLM_MODES, EMBEDDINGS_PROVIDERS, RERANKER_PROVIDERS, SLIM_REFUSED, DEFAULT_SETTINGS } from './settings.js';
+import { validateSettings, keyEndpoints, LLM_MAX_CONCURRENT_MAX, LLM_MODES, EMBEDDINGS_PROVIDERS, RERANKER_PROVIDERS, SLIM_REFUSED, DEFAULT_SETTINGS } from './settings.js';
 import { USER_SECRETS } from './secrets.js';
 import { summarizeCcBackends } from './llmEnv.js';
 import { VARIANTS, API_IMAGES, CP_IMAGE, HINDSIGHT_VERSION } from './pins.js';
@@ -30,9 +30,11 @@ const isJson = (req) => /^application\/json\b/i.test(String(req.headers['content
  * @param {{latestScan(): object|null}} o.backfill
  * @param {() => Promise<{autoStart?: boolean} | null>} o.fetchPluginRow cc's row for this plugin
  * @param {() => string} o.detectBind
- * @param {{api: string, cp: string}} o.containerNames
+ * @param {{api: string, cp: string, relay: string}} o.containerNames
+ * @param {{tags(): Promise<{model: string, cloud: boolean}[]>, version(): Promise<string|null>}} o.ollamaDaemon
+ * @param {{probeDaemon(): Promise<{ok: boolean, version: string|null, error: string|null, at: string}>}} o.ollamaProxy
  */
-export function createRoutes({ supervisor, jobs, docker, settings: settingsStore, secrets, fetchCcModels, fetchPluginRow, detectBind, containerNames, scopes, activity, cc, backfill, now = () => Date.now() }) {
+export function createRoutes({ supervisor, jobs, docker, settings: settingsStore, secrets, fetchCcModels, fetchPluginRow, detectBind, containerNames, ollamaDaemon, ollamaProxy, scopes, activity, cc, backfill, now = () => Date.now() }) {
   let autoStart = { at: 0, value: undefined };
 
   async function readAutoStart() {
@@ -49,15 +51,35 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
       secrets: secrets.has(),
       defaults: DEFAULT_SETTINGS,
       detectedBindAddress: detectBind(),
-      choices: { variants: VARIANTS, llmModes: LLM_MODES, embeddingsProviders: EMBEDDINGS_PROVIDERS, rerankerProviders: RERANKER_PROVIDERS, slimRefused: SLIM_REFUSED },
+      choices: { variants: VARIANTS, llmModes: LLM_MODES, embeddingsProviders: EMBEDDINGS_PROVIDERS, rerankerProviders: RERANKER_PROVIDERS, slimRefused: SLIM_REFUSED, llmMaxConcurrentMax: LLM_MAX_CONCURRENT_MAX },
       images: { api: API_IMAGES, cp: CP_IMAGE, version: HINDSIGHT_VERSION },
     };
+  }
+
+  /** The link's status plus the daemon's answer and the problems to show (a down daemon, a relay the plugin cannot reach). */
+  async function withDaemon(ollama) {
+    const daemon = await ollamaProxy.probeDaemon();
+    const problems = [];
+    if (!daemon.ok) problems.push(describeError('OLLAMA_UNREACHABLE', { url: ollama.daemonUrl, detail: daemon.error }));
+    if (ollama.tunnel.state === 'connecting') problems.push(describeError('RELAY_DISCONNECTED', { address: ollama.tunnel.address, detail: ollama.tunnel.error ?? 'connecting' }));
+    return { ...ollama, daemon, problems };
+  }
+
+  /** The daemon's state and models for the picker (a failure is a state, not an error). */
+  async function daemonView() {
+    try {
+      const [version, tags] = await Promise.all([ollamaDaemon.version(), ollamaDaemon.tags()]);
+      return { reachable: true, version, error: null, tags };
+    } catch (e) {
+      return { reachable: false, version: null, error: e?.params?.detail ?? e?.message ?? String(e), tags: [] };
+    }
   }
 
   async function status(refresh) {
     if (refresh) await supervisor.refresh();
     const s = supervisor.status();
     const a = await readAutoStart();
+    if (s.ollama) s.ollama = await withDaemon(s.ollama);
     return { ...s, ...(a === undefined ? {} : { autoStart: a }), job: jobs.current(), bundles: jobs.bundles(), bundleNames: Object.fromEntries(VARIANTS.map((v) => [v, bundleName(v)])) };
   }
 
@@ -122,7 +144,11 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
         error: failed ? (failed.reason?.message ?? String(failed.reason)) : null,
       };
     }],
-    ['GET', '/-/api/cc-backends', async () => ({ backends: summarizeCcBackends(await fetchCcModels()) })],
+    ['GET', '/-/api/cc-backends', async () => {
+      const data = await fetchCcModels();
+      const daemon = summarizeCcBackends(data).some((b) => b.kind === 'ollama') ? await daemonView() : null;
+      return { backends: summarizeCcBackends(data, daemon) };
+    }],
     ['POST', '/-/api/start', async () => { supervisor.ensureRunning(); return status(false); }],
     ['POST', '/-/api/restart', async () => { supervisor.restart(); return status(false); }],
     ['POST', '/-/api/stop', async () => { await supervisor.stop(); return status(true); }],
@@ -146,7 +172,7 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
       return job;
     }],
     ['GET', '/-/api/logs/:role', async (_req, _res, p) => {
-      if (!(p.role in containerNames)) throw new AppError('NOT_FOUND', { detail: 'role must be api or cp' });
+      if (!(p.role in containerNames)) throw new AppError('NOT_FOUND', { detail: 'role must be api, cp or relay' });
       await docker.resolve();
       return { role: p.role, log: await docker.logs(containerNames[p.role], 200) };
     }],

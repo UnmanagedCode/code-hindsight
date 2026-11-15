@@ -14,6 +14,9 @@ import { createSupervisor } from './supervisor.js';
 import { createJobs } from './jobs.js';
 import { createCpSession } from './cpSession.js';
 import { createCpProxy } from './cpProxy.js';
+import { createOllamaDaemon } from './ollamaDaemon.js';
+import { createOllamaProxy } from './ollamaProxy.js';
+import { createRelayTunnel } from './relayTunnel.js';
 import { createRoutes } from './routes.js';
 import { createScopesStore } from './scopes.js';
 import { createCcClient } from './ccSession.js';
@@ -56,9 +59,17 @@ export function createApp(config, overrides = {}) {
     runDir,
   });
   const ccModels = () => fetchCcModels(config.conductorUrl);
+  const ollamaDaemon = createOllamaDaemon({ url: config.ollamaUrl });
+  const ollamaProxy = createOllamaProxy({ key: secrets.get().relayKey, ollamaUrl: config.ollamaUrl, daemon: ollamaDaemon });
+  const relayTunnel = createRelayTunnel({ key: secrets.get().relayKey, onSocket: ollamaProxy.handleSocket, log: (m) => console.error(`code-hindsight: ${m}`) });
+  const relay = {
+    start: relayTunnel.start,
+    stop: relayTunnel.stop,
+    status: () => ({ daemonUrl: config.ollamaUrl, tunnel: relayTunnel.status(), lastForward: ollamaProxy.lastForward() }),
+  };
   let supervisor;
   const cpSession = createCpSession({ target: () => supervisor.cpAddress(), accessKey: () => secrets.get().cpAccessKey });
-  supervisor = createSupervisor({ docker, settings, secrets, cpTrust, names, owner, dataDir: config.dataDir, detectBind, fetchCcModels: ccModels, cpSession, ...supervisorOptions });
+  supervisor = createSupervisor({ docker, settings, secrets, cpTrust, names, owner, dataDir: config.dataDir, detectBind, fetchCcModels: ccModels, cpSession, relay, ...supervisorOptions });
   const scopes = createScopesStore(config.dataDir);
   const cc = createCcClient({ conductorUrl: config.conductorUrl });
   const activity = createActivityLog({ dataDir: config.dataDir });
@@ -76,7 +87,7 @@ export function createApp(config, overrides = {}) {
   const api = createRoutes({
     supervisor, jobs, docker, settings, secrets, fetchCcModels: ccModels, scopes, activity, cc, backfill,
     fetchPluginRow: () => fetchPluginRow(config.conductorUrl, config.pluginId),
-    detectBind, containerNames: { api: names.api, cp: names.cp },
+    detectBind, containerNames: { api: names.api, cp: names.cp, relay: names.relay }, ollamaDaemon, ollamaProxy,
   });
 
   async function handle(req, res) {

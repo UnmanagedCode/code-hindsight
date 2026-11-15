@@ -24,7 +24,7 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 | Method | Path | Body → answer |
 |---|---|---|
 | GET | `/-/api/health` | `{ok: true}` — always 200, whatever Hindsight's state (the manifest's `healthPath`) |
-| GET | `/-/api/status[?refresh=1]` | `{state, error, docker: {mode, serverVersion}, variant, bindAddress, bindAuto, ports: {api, cp}, images: {api: {ref, present, id, version, ok}, cp: {ref, present, id, basePath, upstream, built, trusted, ok}} \| null, containers: {api, cp} \| null, startedAt, pendingRestart, volume, lastShutdownFailure: {at, error} \| null, llmMode, autoStart?, job, bundles: [{name, size}], bundleNames: {full, slim}}`. `refresh=1` re-inspects images and containers first. `autoStart` is cc's flag for this plugin, omitted when cc cannot be asked |
+| GET | `/-/api/status[?refresh=1]` | `{state, error, docker: {mode, serverVersion}, variant, bindAddress, bindAuto, ports: {api, cp, relay}, images: {api: {ref, present, id, version, ok}, cp: {ref, present, id, basePath, upstream, built, trusted, ok}} \| null, containers: {api, cp, relay} \| null, startedAt, pendingRestart, volume, lastShutdownFailure: {at, error} \| null, llmMode, ollama: {daemonUrl, tunnel: {state: connected\|connecting\|stopped, idle, error, address}, lastForward: {at, path, status, error} \| null, daemon: {ok, version, error, at}, problems: [catalog error]} \| null, autoStart?, job, bundles: [{name, size}], bundleNames: {full, slim}}`. `refresh=1` re-inspects images and containers first. `autoStart` is cc's flag for this plugin, omitted when cc cannot be asked |
 | GET | `/-/api/settings` | `{settings, secrets: {llmApiKey: bool, embeddingsApiKey: bool}, defaults, detectedBindAddress, choices, images}` |
 | PUT | `/-/api/settings` | `{settings, secrets?: {llmApiKey?, embeddingsApiKey?}}` — the whole settings object; a secret string sets, `null`/`""` clears, absent keeps — except that an absent key whose endpoint changed is cleared (`keyEndpoints` in `src/settings.js`: LLM mode/provider/base URL; embeddings provider/base URL). `400 SETTINGS_INVALID` with `params.fields: [{field, code?, message}]` changes nothing. Answers the settings view plus `cleared: [key names]` and `status` |
 | GET | `/-/api/scopes` | `{scopes, choices: {actions, kinds, placeholders, limits}}` |
@@ -34,7 +34,7 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 | GET | `/-/api/memory/backfill` | `{scan: <the latest backfill scan> \| null}` — held in memory, so `null` after a backend restart ([Backfill](#backfill)) |
 | GET | `/-/api/memory/stages` | `{stages: [{name, playbooks: [id]}], error}` — stage names across cc's playbooks; `error` is a string when cc could not be read |
 | GET | `/-/api/memory/cc-projects` | `{projects: [{name, workspace: string\|null}], workspaces: [{name, projectCount}], error}` — cc's projects (with the workspace each is in) and workspaces, both by name, for the scope pickers. Always 200: a list that could not be read is `[]` and `error` is the first failure's message (else `null`) |
-| GET | `/-/api/cc-backends` | `{backends: [{id, label, host, usable, refusal, models: [{model, label}]}]}` — never a token |
+| GET | `/-/api/cc-backends` | `{backends: [{id, label, kind: anthropic\|ollama\|null, host, usable, refusal, daemon?: {reachable, version, error}, models: [{model, label, cloud?, source?: cc\|daemon}]}]}` — never a token. `daemon`, `cloud` and `source` are on Ollama rows only; the route asks the daemon only when such a row exists, and a daemon failure is `daemon.reachable: false`, not an error |
 | POST | `/-/api/start` | start / reconcile to the saved settings; answers status at once |
 | POST | `/-/api/restart` | stop, then start; answers status at once |
 | POST | `/-/api/stop` | stop the containers (kept); answers status when stopped |
@@ -43,7 +43,7 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 | POST | `/-/api/jobs/import` (`application/octet-stream`) | the body is streamed into `docker load`; answers the finished job |
 | GET | `/-/api/jobs` | `{jobs: [...]}` (most recent first, no tails) |
 | GET | `/-/api/jobs/<id>` | `{id, kind, state: running\|done\|failed\|cancelled, startedAt, endedAt, result, error, progress: {done, total, unit} \| null, cancellable, tail}` — `progress` and `cancellable` are set by the backfill jobs; Docker jobs report `null` and `false` |
-| GET | `/-/api/logs/<api\|cp>` | `{role, log}` — last 200 lines of the container's log |
+| GET | `/-/api/logs/<api\|cp\|relay>` | `{role, log}` — last 200 lines of the container's log |
 | GET | `/-/api/bundles/<name>` | the bundle file (`application/x-tar`, attachment); only names the plugin wrote into its bundle dir |
 
 **Errors** answer the catalog entry `{code, title, message, action, params}` with the entry's HTTP status (`CATALOG` in `src/errors.js`). The same shape is `status.error` and `job.error`.
@@ -160,7 +160,7 @@ Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP f
 | File | Content |
 |---|---|
 | `settings.json` (0600) | the settings; never a key |
-| `secrets.json` (0600) | `apiKey`, `cpAccessKey` (generated once), `llmApiKey`, `embeddingsApiKey` |
+| `secrets.json` (0600) | `apiKey`, `cpAccessKey`, `relayKey` (generated once), `llmApiKey`, `embeddingsApiKey` |
 | `stopping.json` (0600) | `{pid, at}` of the detached `docker stop` a SIGTERM left running; the next backend waits for that pid |
 | `shutdown-failed.json` (0600) | `{at, error}` when a SIGTERM could not start that stop; shown as `status.lastShutdownFailure` and removed when Hindsight is next ready |
 | `scopes.json` (0600) | `{scopes}`: the memory scopes; absent = memory off |
@@ -174,7 +174,7 @@ Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP f
 
 ## Docker resources
 
-All names derive from `RESOURCE_PREFIX` (`src/pins.js`) through `resourceNames` (`src/containerSpec.js`): `<prefix>-api`, `<prefix>-cp`, `<prefix>-net`, `<prefix>-data`, `<prefix>-build` (the CP build helper). The plugin never touches a container, volume or network outside the prefix, and never connects anything to a network.
+All names derive from `RESOURCE_PREFIX` (`src/pins.js`) through `resourceNames` (`src/containerSpec.js`): `<prefix>-api`, `<prefix>-cp`, `<prefix>-net`, `<prefix>-data`, `<prefix>-build` (the CP build helper), `<prefix>-relay` (the relay; only while an Ollama backend is linked). The plugin never touches a container, volume or network outside the prefix, and never connects anything to a network.
 
 Labels (`LABELS` in `src/pins.js`):
 
@@ -182,7 +182,7 @@ Labels (`LABELS` in `src/pins.js`):
 |---|---|---|
 | `io.code-hindsight.managed` | containers, network, volume | `1` |
 | `io.code-hindsight.owner` | containers, network, volume | `ownerId(dataDir)`: a resource with our name and another owner is refused `NAME_TAKEN` |
-| `io.code-hindsight.role` | containers | `api` / `cp` |
+| `io.code-hindsight.role` | containers | `api` / `cp` / `relay` |
 | `io.code-hindsight.spec` | containers | hash of image ID, run arguments and env; a mismatch recreates the container |
 | `io.code-hindsight.embeddings` | volume | `local` or `<provider>:<model>`; a mismatch with the settings is `EMBEDDINGS_CHANGED` |
 | `io.code-hindsight.basePath`, `io.code-hindsight.upstream` | CP image | the base path and upstream commit it was built with; checked before start (`CP_IMAGE_MISMATCH`), but trust comes from the ID |
@@ -193,7 +193,17 @@ Labels (`LABELS` in `src/pins.js`):
 - **API** (`<prefix>-api`, alias `api` on `<prefix>-net`, `-p <bind>:<apiPort>:8888`, volume at `/home/hindsight/.pg0`, `--restart on-failure:3`): `HINDSIGHT_ENABLE_CP=false`, `HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension`, `HINDSIGHT_API_TENANT_API_KEY`; full image: `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`; LLM: `HINDSIGHT_API_LLM_PROVIDER` (`none` by default), `_MODEL`, `_BASE_URL`, `_API_KEY`; `HINDSIGHT_API_EMBEDDINGS_PROVIDER` (+ `_OPENAI_MODEL`, `_OPENAI_BASE_URL`, `_OPENAI_API_KEY`), `HINDSIGHT_API_RERANKER_PROVIDER`.
 - **CP** (`<prefix>-cp`, on `<prefix>-net`, `-p <bind>:<cpPort>:9999`, `--restart on-failure:3`): `HINDSIGHT_CP_DATAPLANE_API_URL=http://api:8888`, `HINDSIGHT_CP_DATAPLANE_API_KEY`, `HINDSIGHT_CP_ACCESS_KEY`.
 - Env reaches `docker run` through a 0600 `--env-file`, never the command line.
+- **Relay** (`relaySpec`; `<prefix>-relay`, alias and API-side port from `OLLAMA_TARGET` in `src/pins.js`, `-p <bind>:<relayPort>:<RELAY_TUNNEL_PORT>`, only the tunnel port published, `--read-only --cap-drop ALL --security-opt no-new-privileges`, `--restart on-failure:3`): runs the verified API image ID with `--entrypoint node --input-type=module -e <src/relay/relay.mjs>`, so its spec hash follows the script. Env: `RELAY_KEY`, `RELAY_API_PORT`, `RELAY_TUNNEL_PORT`; optional `RELAY_WAIT_MS` (how long an API connection waits for an idle tunnel) and `RELAY_HANDSHAKE_MS`. Created before the API while linked; removed when unlinked.
+- **Ollama mapping** (cc backend whose launch command starts with `ollama`): `HINDSIGHT_API_LLM_PROVIDER=ollama`, `_MODEL=` the chosen model, `_BASE_URL=http://ollama:11434/v1` (`OLLAMA_TARGET`), `_API_KEY=` the relay key (the provider sends it as a Bearer token).
+- **`HINDSIGHT_API_LLM_MAX_CONCURRENT`** is set from `llm.maxConcurrent` in every non-`none` mode when it is not null.
 - **Cc-backend mapping:** `HINDSIGHT_API_LLM_PROVIDER=anthropic`, `_BASE_URL=` the row's `ANTHROPIC_BASE_URL`, `_API_KEY=` its `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`, `_MODEL=` the chosen model. The token is sent as Anthropic's `x-api-key`.
+
+### Relay tunnel (`src/relayTunnel.js`, `src/relay/relay.mjs`, `src/ollamaProxy.js`)
+
+- The plugin keeps idle TCP connections to `<bind>:<relayPort>`; each sends `HSR1 <relayKey>\n` (at most 256 bytes, within `RELAY_HANDSHAKE_MS`, else closed).
+- For each API connection the relay writes the go byte `0x01` to an idle tunnel. The plugin takes the socket over and answers one ack byte; only then does the relay pipe the API's bytes. The API connection is closed if no tunnel is idle within `RELAY_WAIT_MS`.
+- The plugin serves each tunnelled connection as HTTP: `Authorization: Bearer <relayKey>` else `401`; a `METHOD path` outside `OLLAMA_TARGET.allowed` is `403`; otherwise the request is streamed to the daemon (`OLLAMA_HOST`) without `Authorization` and the answer streamed back. A daemon connect failure is `502` and recorded as `OLLAMA_UNREACHABLE` in `status.ollama.lastForward`.
+- The daemon is also read through `GET /api/version` (Status, cached for `OLLAMA_STATUS_CACHE_MS`) and `GET /api/tags` (the picker; a model with `remote_host` is cloud).
 
 ### Unauthenticated paths
 
@@ -216,7 +226,7 @@ Both published ports need a key except: API `/health*`, `/version`, `/metrics`, 
 
 | Route | Used for | On failure |
 |---|---|---|
-| `GET $CONDUCTOR_URL/api/settings/models` (`backends[].{id,label,env:[{key,value}]}`, `backendModels`) | the cc-backend link and its picker; a row whose `ANTHROPIC_BASE_URL` host is loopback (`isLoopbackHost` in `src/llmEnv.js`, over the WHATWG-normalized host; best-effort, literal addresses and `localhost`) is refused `CC_BACKEND_LOOPBACK` | `CC_UNREACHABLE` / `CC_ROUTE_CHANGED` |
+| `GET $CONDUCTOR_URL/api/settings/models` (`backends[].{id,label,template,env:[{key,value}]}`, `backendModels`) | the cc-backend link and its picker (`template` decides an Ollama row); a row whose `ANTHROPIC_BASE_URL` host is loopback (`isLoopbackHost` in `src/llmEnv.js`, over the WHATWG-normalized host; best-effort, literal addresses and `localhost`) is refused `CC_BACKEND_LOOPBACK` | `CC_UNREACHABLE` / `CC_ROUTE_CHANGED` |
 | `GET $CONDUCTOR_URL/api/plugins/code-hindsight/status` (`autoStart`) | the Auto-start hint | hint omitted |
 | `POST $CONDUCTOR_URL/mcp/tools/describe_session` `{sessionId}` (`live.{project, worktree.worktreeName, playbook, stage}`) | placing a session for scope matching, on every hook or tool call (`DESCRIBE_TIMEOUT_MS`); kind is `conductor` iff `live.project` is `.conduct` | `SESSION_UNRESOLVED`; no `live` arm or `SESSION_UNKNOWN` → `SESSION_NOT_LIVE` |
 | the same, with a transcript's backing id, then its handle (`SESSION_NOT_A_HANDLE.handle`; a retired row's `project`, `worktree`, `retired.{stage, playbook, title}`) | placing a saved transcript for the backfill scan ([Backfill](#backfill)); deadline `BACKFILL_LIMITS.describeTimeoutMs`, one call at a time | `SESSION_UNLOCATABLE` / `SESSION_UNKNOWN` → `BACKFILL_UNPLACEABLE`; no answer → the same, uncached; repeated → `BACKFILL_CC_UNAVAILABLE` |

@@ -17,7 +17,7 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 ## Key defaults
 
 - Image variant **full** (local embeddings and reranker, works offline); **slim** needs remote embeddings and the `rrf` reranker.
-- LLM **none**: memories are stored as chunks; reflect and observations need an LLM (manual, or linked to one of cc's Anthropic-compatible backends).
+- LLM **none**: memories are stored as chunks; reflect and observations need an LLM (manual, or linked to one of cc's backends: Anthropic-compatible, or cc's Ollama daemon through a relay container).
 - Ports: fixed, configurable (`DEFAULT_SETTINGS` in `src/settings.js`); bind address automatic: the default gateway when cc runs in a container, else `127.0.0.1`.
 - `sudo -n docker` is used when docker is refused, unless switched off in Settings.
 - Nothing is pulled, built, imported or deleted without a button press.
@@ -30,7 +30,8 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 - **The control plane runs same-origin with cc** and renders memories that agents wrote. A script injected into it would have cc's full (unauthenticated) API.
 - **Both published ports need a key** (the API key; the CP access key, used server-side). Other containers on the Docker host can reach the bind address. Hindsight leaves `/health*`, `/version`, `/metrics`, `/docs`, `/openapi.json` (API) and its login/health/version routes (CP) open; none returns memory data.
 - **Session identity for memory is advisory, and scopes are not an isolation boundary.** The backend trusts the session id a hook or the recall tool claims (it must be a live cc session) and an agent can claim another live session's id. Every session also runs as the same OS user as the backend, so an agent with a shell can read `secrets.json` and query Hindsight directly. Scopes keep cooperating agents' memory in its lane; they do not contain an adversarial one.
-- **Retained content is not redacted.** Prompts, replies and tool-call targets (a command line, a path) that contain secrets reach Hindsight and, with an LLM configured, its provider.
+- **The relay.** The API container cannot reach cc's container, and cc's Ollama daemon listens only on that container's loopback. A relay container on the plugin network (`<prefix>-relay`, alias `ollama`) takes the API's Ollama calls; the plugin dials out to the relay's one published port (the bind address and `network.relayPort`) and answers each call itself. The API-facing port is not published, but containers on the plugin network and host processes can reach it, so every call must carry the generated relay key (`relayKey` in `secrets.json`; the API sends it as its LLM API key) and only the chat paths are forwarded (`OLLAMA_TARGET` in `src/pins.js`): model management is unreachable. The tunnel port needs the same key; a holder of it could pose as the plugin and receive the API's LLM requests. The key is in both containers' env, visible to `docker inspect` (root), like the API key.
+- **Retained content is not redacted.** Prompts, replies and tool-call targets (a command line, a path) that contain secrets reach Hindsight and, with an LLM configured, its provider. With a cc Ollama **cloud** model, that text goes through cc's Ollama daemon to ollama.com under its signed-in account.
 - **Recalled memory is other sessions' text.** It is wrapped and labelled as data, but a memory that tries to instruct the agent remains a risk.
 - **Every prompt is also sent to Hindsight (and, with an LLM configured, its provider) as a recall query** whenever a recall scope matches the session, whether or not the turn is retained.
 - **The hook and tool routes** (`/-/hook/*`, `/-/mcp`) refuse requests that look like a browser's, so a web page cannot read memories or inject retains through them.
@@ -50,6 +51,7 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 - If Hindsight stays unavailable long enough that a session's backlog of unsent turns overflows, or the turns leave the transcript tail the hook sends, they are dropped (logged as `RETAIN_DROPPED`), never sent to another bank.
 - Inside the control plane, attachment links and images, the logo in the memory constellation and the favicon 404 (upstream builds those URLs without the base path).
 - The control plane is only usable through cc's mount (`/plugins/code-hindsight/`); its port alone has no UI session.
+- The Ollama link needs the daemon reachable from the plugin backend at `OLLAMA_HOST` (default `http://127.0.0.1:11434`). A daemon outage fails the API's LLM calls, not the start; Status shows it. The relay does not restrict which model a request names.
 - Hindsight runs only while the plugin backend runs (see Auto-start). A backend killed with SIGKILL alone leaves the containers running until the next start adopts them.
 - The cc-backend LLM link reads cc's internal `GET /api/settings/models`; a change to that route is reported as `CC_ROUTE_CHANGED`. Linked tokens are sent as Anthropic `x-api-key`; endpoints that accept only a bearer token refuse them. Loopback backends cannot be linked (best-effort: literal addresses and `localhost`; host names are not resolved).
 - The control plane needs a browser that sends fetch metadata (current Chrome, Edge, Firefox, Safari ≥ 16.4); requests without it are refused.

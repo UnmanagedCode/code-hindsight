@@ -7,6 +7,8 @@ import { VARIANTS } from './pins.js';
 import { readJsonFile, writePrivateFileAtomic } from './fsPrivate.js';
 
 export const LLM_MODES = Object.freeze(['none', 'manual', 'cc-backend']);
+/** Upper bound for `llm.maxConcurrent` (Hindsight's own default is lower). */
+export const LLM_MAX_CONCURRENT_MAX = 256;
 export const EMBEDDINGS_PROVIDERS = Object.freeze(['local', 'openai']);
 export const RERANKER_PROVIDERS = Object.freeze(['local', 'rrf']);
 /** Providers the slim image cannot run: it ships no local models (measured: the API exits at start). */
@@ -15,8 +17,8 @@ export const SLIM_REFUSED = Object.freeze({ embeddings: Object.freeze(['local'])
 export const DEFAULT_SETTINGS = Object.freeze({
   variant: 'full',
   docker: { allowSudo: true },
-  network: { bindAddress: null, apiPort: 18888, cpPort: 19999 },
-  llm: { mode: 'none', provider: null, model: null, baseUrl: null, backendId: null },
+  network: { bindAddress: null, apiPort: 18888, cpPort: 19999, relayPort: 18434 },
+  llm: { mode: 'none', provider: null, model: null, baseUrl: null, backendId: null, maxConcurrent: null },
   embeddings: { provider: 'local', model: null, baseUrl: null },
   reranker: { provider: 'local' },
 });
@@ -24,8 +26,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
 const SHAPE = {
   variant: null,
   docker: ['allowSudo'],
-  network: ['bindAddress', 'apiPort', 'cpPort'],
-  llm: ['mode', 'provider', 'model', 'baseUrl', 'backendId'],
+  network: ['bindAddress', 'apiPort', 'cpPort', 'relayPort'],
+  llm: ['mode', 'provider', 'model', 'baseUrl', 'backendId', 'maxConcurrent'],
   embeddings: ['provider', 'model', 'baseUrl'],
   reranker: ['provider'],
 };
@@ -69,13 +71,17 @@ export function validateSettings(input, has = {}) {
   const n = settings.network;
   if (n.bindAddress !== null && !(typeof n.bindAddress === 'string' && IPV4.test(n.bindAddress))) err('network.bindAddress', 'must be an IPv4 address, or empty for automatic');
   else if (n.bindAddress !== null && !isUnicastHost(n.bindAddress)) err('network.bindAddress', 'must be one host address: not unspecified (0.x), multicast, reserved or broadcast');
-  for (const f of ['apiPort', 'cpPort']) {
+  for (const f of ['apiPort', 'cpPort', 'relayPort']) {
     if (!Number.isInteger(n[f]) || n[f] < 1024 || n[f] > 65535) err(`network.${f}`, 'must be a port from 1024 to 65535');
   }
   if (n.apiPort === n.cpPort) err('network.cpPort', 'must differ from the API port');
+  if (n.relayPort === n.apiPort || n.relayPort === n.cpPort) err('network.relayPort', 'must differ from the API and control plane ports');
 
   const l = settings.llm;
   if (!LLM_MODES.includes(l.mode)) err('llm.mode', `must be one of ${LLM_MODES.join(', ')}`);
+  if (l.maxConcurrent !== null && !(Number.isInteger(l.maxConcurrent) && l.maxConcurrent >= 1 && l.maxConcurrent <= LLM_MAX_CONCURRENT_MAX)) {
+    err('llm.maxConcurrent', `must be a whole number from 1 to ${LLM_MAX_CONCURRENT_MAX}, or empty for Hindsight's default`);
+  }
   if (l.mode === 'manual') {
     if (!(typeof l.provider === 'string' && /^[a-z][a-z0-9_-]{0,40}$/.test(l.provider))) err('llm.provider', 'is required (a Hindsight provider name such as openai, anthropic or ollama)');
     if (!nonEmpty(l.model)) err('llm.model', 'is required');

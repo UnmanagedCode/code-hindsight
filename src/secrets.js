@@ -1,4 +1,4 @@
-// Keys (secrets.json, 0600): the API key and CP access key this plugin generates once, and the
+// Keys (secrets.json, 0600): the API key, CP access key and relay key this plugin generates once, and the
 // LLM / embeddings keys the user enters. No route returns a value; the UI sees only whether
 // each write-only key is set.
 import path from 'node:path';
@@ -7,7 +7,7 @@ import { readJsonFile, writePrivateFileAtomic } from './fsPrivate.js';
 
 /** Keys the user sets through Settings (write-only). */
 export const USER_SECRETS = Object.freeze(['llmApiKey', 'embeddingsApiKey']);
-const GENERATED = Object.freeze(['apiKey', 'cpAccessKey']);
+const GENERATED = Object.freeze(['apiKey', 'cpAccessKey', 'relayKey']);
 
 export function createSecretsStore(dataDir) {
   const file = path.join(dataDir, 'secrets.json');

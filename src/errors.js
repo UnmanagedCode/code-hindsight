@@ -116,13 +116,23 @@ export const CATALOG = Object.freeze({
   },
   CC_BACKEND_UNSUPPORTED: {
     title: 'The linked cc backend cannot be used',
-    message: (p) => `cc backend "${s(p.backendId)}" has no ANTHROPIC_BASE_URL with ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY. Pick another one, or set the LLM manually.`,
+    message: (p) => `cc backend "${s(p.backendId)}" has no ANTHROPIC_BASE_URL with ANTHROPIC_AUTH_TOKEN or ANTHROPIC_API_KEY, and does not launch \`ollama\`. Pick another one, or set the LLM manually.`,
     action: ACTIONS.settings, status: 409,
   },
   CC_BACKEND_LOOPBACK: {
     title: 'The linked cc backend points at loopback',
     message: (p) => `cc backend "${s(p.backendId)}" talks to ${s(p.host)}, which is cc's own loopback and unreachable from a container. Pick another one, or set the LLM manually.`,
     action: ACTIONS.settings, status: 409,
+  },
+  OLLAMA_UNREACHABLE: {
+    title: 'The Ollama daemon did not answer',
+    message: (p) => `Ollama at ${s(p.url)} did not answer (${s(p.detail)}). It runs in cc's container: start \`ollama serve\` there.`,
+    status: 502,
+  },
+  RELAY_DISCONNECTED: {
+    title: 'The relay is not connected',
+    message: (p) => `The plugin cannot reach the relay at ${s(p.address)} (${s(p.detail)}).`,
+    action: ACTIONS.restart, status: 502,
   },
   SLIM_NEEDS_REMOTE_EMBEDDINGS: {
     title: 'The slim image needs remote embeddings',

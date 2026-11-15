@@ -25,7 +25,7 @@ function imageText(i: { present: boolean; ok: boolean } | undefined) {
 export function Status({ status, onAction, busy }: { status: StatusT; onAction: (a: ErrorAction) => void; busy: boolean }) {
   const [log, setLog] = useState<{ role: string; text: string } | null>(null);
   const running = status.state === 'ready' || status.state === 'starting' || status.state === 'checking';
-  const showLog = async (role: 'api' | 'cp') => {
+  const showLog = async (role: 'api' | 'cp' | 'relay') => {
     try {
       const r = await api<{ log: string }>(`-/api/logs/${role}`);
       setLog({ role, text: r.log });
@@ -33,6 +33,7 @@ export function Status({ status, onAction, busy }: { status: StatusT; onAction: 
       setLog({ role, text: e instanceof Error ? e.message : String(e) });
     }
   };
+  const relayPresent = !!status.containers && status.containers.relay.state !== 'missing';
   return (
     <div className="space-y-4">
       {status.error && <ErrorCard error={status.error} onAction={onAction} busy={busy} />}
@@ -65,14 +66,27 @@ export function Status({ status, onAction, busy }: { status: StatusT; onAction: 
           </AlertDescription>
         </Alert>
       )}
+      {status.ollama?.problems.map((p) => (
+        <Alert key={p.code} variant="warning" data-hint={p.code}>
+          <InfoIcon />
+          <AlertTitle>{p.title}</AlertTitle>
+          <AlertDescription>{p.message}</AlertDescription>
+        </Alert>
+      ))}
       <Card>
         <CardHeader><CardTitle>Hindsight</CardTitle></CardHeader>
         <CardContent>
           <Row label="State"><span data-state={status.state}>{status.state}</span></Row>
           <Row label="Docker">{status.docker.mode ? `${status.docker.mode === 'sudo' ? 'sudo -n docker' : 'docker'} (daemon ${status.docker.serverVersion ?? '?'})` : 'not resolved'}</Row>
           <Row label="Image">{status.variant}</Row>
-          <Row label="Published on">{status.bindAddress}{status.bindAuto ? ' (automatic)' : ''} — API {status.ports.api}, control plane {status.ports.cp}</Row>
+          <Row label="Published on">{status.bindAddress}{status.bindAuto ? ' (automatic)' : ''} — API {status.ports.api}, control plane {status.ports.cp}{status.ollama ? `, relay ${status.ports.relay}` : ''}</Row>
           <Row label="LLM">{status.llmMode === 'none' ? 'none (memories are stored as chunks; reflect is unavailable)' : status.llmMode}</Row>
+          {status.ollama && (
+            <Row label="Ollama">
+              daemon {status.ollama.daemon.ok ? `${status.ollama.daemon.version ?? '?'} at ${status.ollama.daemonUrl}` : `not answering at ${status.ollama.daemonUrl}`}; relay {status.ollama.tunnel.state}
+              {status.ollama.tunnel.state === 'connected' ? ` (${status.ollama.tunnel.idle} idle)` : ''}
+            </Row>
+          )}
           {status.startedAt && <Row label="Ready since">{status.startedAt}</Row>}
           <div className="flex flex-wrap gap-2 pt-3">
             {!running && <Button size="sm" disabled={busy} onClick={() => onAction('start')}>Start Hindsight</Button>}
@@ -88,9 +102,11 @@ export function Status({ status, onAction, busy }: { status: StatusT; onAction: 
           <Row label="Control-plane image">{status.images?.cp.ref ?? '—'} <Badge variant={status.images?.cp.ok ? 'success' : 'outline'}>{imageText(status.images?.cp)}</Badge></Row>
           <Row label="API container">{status.containers?.api.state ?? '—'}</Row>
           <Row label="CP container">{status.containers?.cp.state ?? '—'}</Row>
+          {relayPresent && <Row label="Relay container">{status.containers?.relay.state}</Row>}
           <div className="flex gap-2 pt-3">
             <Button size="sm" variant="outline" onClick={() => void showLog('api')}>API log</Button>
             <Button size="sm" variant="outline" onClick={() => void showLog('cp')}>CP log</Button>
+            {relayPresent && <Button size="sm" variant="outline" onClick={() => void showLog('relay')}>Relay log</Button>}
           </div>
           {log && <pre aria-label={`${log.role} log`} className="mt-3 max-h-80 overflow-auto rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap break-words">{log.text}</pre>}
         </CardContent>

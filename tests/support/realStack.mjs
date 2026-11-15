@@ -30,16 +30,16 @@ export function realSkipReason(variant = 'full') {
 
 /**
  * @param {import('node:test').TestContext} t
- * @param {{settings?: object, secrets?: object, distDir?: string, conductorUrl?: string|null}} [o]
+ * @param {{settings?: object, secrets?: object, distDir?: string, conductorUrl?: string|null, ollamaUrl?: string}} [o]
  */
-export async function bootRealStack(t, { settings = {}, secrets = null, distDir, conductorUrl = null } = {}) {
+export async function bootRealStack(t, { settings = {}, secrets = null, distDir, conductorUrl = null, ollamaUrl = 'http://127.0.0.1:1' } = {}) {
   const prefix = `code-hindsight-test-${crypto.randomBytes(3).toString('hex')}`;
   const r = mkRoot(t);
   const port = () => 30000 + crypto.randomInt(0, 9999);
   const s = { ...JSON.parse(JSON.stringify(DEFAULT_SETTINGS)), ...settings };
-  s.network = { bindAddress: null, apiPort: port(), cpPort: port() };
+  s.network = { bindAddress: null, apiPort: port(), cpPort: port(), relayPort: port() };
   writeSettings(r, s);
-  const config = { port: 0, dataDir: r.dataDir, conductorUrl, pluginId: 'code-hindsight', distDir: distDir ?? `${r.root}/no-dist` };
+  const config = { port: 0, dataDir: r.dataDir, conductorUrl, ollamaUrl, pluginId: 'code-hindsight', distDir: distDir ?? `${r.root}/no-dist` };
   const apps = [];
   const servers = [];
   const make = async () => {
@@ -52,7 +52,7 @@ export async function bootRealStack(t, { settings = {}, secrets = null, distDir,
   };
   t.after(() => {
     for (const s2 of servers) { s2.closeAllConnections(); s2.close(); }
-    for (const role of ['cp', 'api']) hostDocker(['rm', '-f', `${prefix}-${role}`]);
+    for (const name of ['cp', 'api', 'relay']) hostDocker(['rm', '-f', `${prefix}-${name}`]);
     hostDocker(['network', 'rm', `${prefix}-net`]);
     hostDocker(['volume', 'rm', `${prefix}-data`]);
   });
