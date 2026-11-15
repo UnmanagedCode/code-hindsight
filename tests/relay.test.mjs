@@ -433,30 +433,36 @@ test('LB8: an upstream outage is 502 recorded as CC_BACKEND_UNREACHABLE, and pro
   assert.ok(!JSON.stringify([first, down, probing.target()]).includes(ROW_TOKEN));
 });
 
-// LB7b: a request keeps the target it began with, even when setTarget runs while it is in flight.
-test('LB7b: an in-flight request completes against its original upstream and token; the next request goes to the new target', async (t) => {
-  let release;
-  const held = new Promise((r) => { release = r; });
+// LB7b: the target is chosen when a request arrives, not when its body ends: a switch mid-body does not move it.
+test('LB7b: a request whose body is still arriving when setTarget runs completes against its original upstream and token; the next request goes to the new target', async (t) => {
   const seenA = [];
+  const bodiesA = [];
   const slow = http.createServer((req, res) => {
     seenA.push(req.headers.authorization);
-    req.resume();
-    req.on('end', () => held.then(() => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"from":"A"}'); }));
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => { bodiesA.push(Buffer.concat(chunks).toString()); res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"from":"A"}'); });
   });
   await new Promise((r) => slow.listen(0, '127.0.0.1', r));
-  t.after(() => { release(); slow.closeAllConnections(); slow.close(); });
+  t.after(() => { slow.closeAllConnections(); slow.close(); });
   const { rl, proxy, tunnel } = await stack(t, { kind: 'anthropic-loopback', anthropic: { url: `http://127.0.0.1:${slow.address().port}` }, auth: { header: 'authorization', value: 'Bearer token-A' } });
-  const inflight = call(rl.apiPort, { kind: 'anthropic-loopback' });
+  const full = '{"model":"m","note":"0123456789"}';
+  const req = http.request({ host: '127.0.0.1', port: rl.apiPort, path: '/v1/messages', method: 'POST', agent: false, headers: { 'content-type': 'application/json', 'content-length': String(full.length), 'x-api-key': KEY } });
+  const answered = new Promise((resolve, reject) => {
+    req.on('response', (res) => { const c = []; res.on('data', (d) => c.push(d)); res.on('end', () => resolve({ status: res.statusCode, text: Buffer.concat(c).toString() })); });
+    req.on('error', reject);
+  });
+  req.write(full.slice(0, 10)); // headers and part of the body; the request is not ended
   await waitFor(() => seenA.length === 1);
   const b = await startFakeAnthropic(t);
   proxy.setTarget({ kind: 'anthropic-loopback', url: b.url, auth: { header: 'authorization', value: 'Bearer token-B' } });
-  assert.equal(b.requests.length, 0);
-  release();
-  const done = await inflight;
+  req.end(full.slice(10));
+  const done = await answered;
   assert.equal(done.status, 200);
   assert.match(done.text, /"from":"A"/);
   assert.deepEqual(seenA, ['Bearer token-A']);
-  assert.equal(b.requests.length, 0, 'the new target saw nothing of the in-flight request');
+  assert.deepEqual(bodiesA, [full], 'the original upstream received the whole body');
+  assert.equal(b.requests.length, 0, 'the new target saw nothing of that request');
   await tunnelReady(tunnel);
   assert.equal((await call(rl.apiPort, { kind: 'anthropic-loopback' })).status, 200);
   assert.equal(b.requests.length, 1);

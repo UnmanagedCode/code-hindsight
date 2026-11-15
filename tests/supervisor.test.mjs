@@ -739,15 +739,34 @@ test('LB12: the row token appears in no docker call and no container env', async
   assert.equal(JSON.stringify(dockerState(r).containers).includes(SENTINEL), false);
 });
 
-// LB11b: a start that fails after the relay began leaves no live target (the token leaves memory).
-test('LB11b: a failure after relay.start stops the relay, so no target stays active', async (t) => {
+// LB11b: a start that fails after the relay began undoes it: no target, no relay container, status agrees.
+test('LB11b: a failure after relay.start stops the relay and removes its container, so status.relay is null', async (t) => {
   const rows = { backends: [loopRow()] };
-  const { sup, relay } = make(t, { settings: linkTo('opencode'), fetchCcModels: async () => rows, health: { api: 0, cp: 200 } });
+  const { r, sup, relay } = make(t, { settings: linkTo('opencode'), fetchCcModels: async () => rows, health: { api: 0, cp: 200 } });
   await sup.ensureRunning();
   assert.equal(sup.status().state, 'error');
   assert.equal(relay.calls.filter((c) => c[0] === 'start').length, 1);
   assert.deepEqual(relay.calls.at(-1), ['stop']);
+  assert.equal(dockerState(r).containers[names.relay], undefined, 'the relay container is gone');
   assert.equal(sup.status().relay, null);
+});
+
+// LB11c: a start that fails before the relay step leaves the running loopback link as it was.
+test('LB11c: a reconcile that fails before the relay step keeps the tunnel, status.relay and the relay container', async (t) => {
+  const rows = { backends: [loopRow()] };
+  const { r, sup, relay, settingsStore } = make(t, { settings: linkTo('opencode'), fetchCcModels: async () => rows });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  const before = relay.calls.length;
+  rows.backends = []; // cc no longer has the row: composeLlmEnv fails before the relay step
+  const s = settingsStore.get();
+  s.llm.maxConcurrent = 2; // Apply & restart: a reconcile of the running stack
+  settingsStore.save(s);
+  await sup.ensureRunning();
+  assert.equal(sup.status().error.code, 'CC_BACKEND_MISSING');
+  assert.equal(relay.calls.slice(before).some((c) => c[0] === 'stop'), false, JSON.stringify(relay.calls.slice(before)));
+  assert.notEqual(sup.status().relay, null);
+  assert.ok(dockerState(r).containers[names.relay], 'the relay container stays');
 });
 
 const stopArgs = (r) => dockerCalls(r).find((a) => a[0] === 'stop');

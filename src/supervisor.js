@@ -261,6 +261,7 @@ export function createSupervisor({
       await adoptOrCreate(relaySpec({ names, image: { id: api.Id }, bind, port: ports.relay, key: secrets.relayKey, owner, target: RELAY_TARGETS[relayTarget.kind] }), api.Id, 'relayPort');
       checkCancelled(gen);
       relay.start({ host: bind, port: ports.relay }, relayTarget);
+      relayStarted = true;
     } else {
       relay.stop();
       await removeOwnedRelay();
@@ -286,8 +287,12 @@ export function createSupervisor({
     startWatch();
   }
 
+  /** Whether the current start attempt reached `relay.start`: only then is the relay this attempt's to undo. */
+  let relayStarted = false;
+
   async function runBringUp() {
     const gen = ++generation;
+    relayStarted = false;
     stopWatch();
     try {
       await bringUp(gen);
@@ -298,9 +303,13 @@ export function createSupervisor({
         relayLinked = false;
         return;
       }
-      // A failed start leaves no live tunnel, and so no credential in memory.
-      relay.stop();
-      relayLinked = false;
+      // A failure before the relay step touches nothing: the previous tunnel keeps serving the running API.
+      // A failure after it ends what this attempt began, so no tunnel, token or relay container outlives it.
+      if (relayStarted) {
+        relay.stop();
+        relayLinked = false;
+        try { await removeOwnedRelay(); } catch (re) { log(`removing the relay after a failed start: ${re?.message ?? re}`); }
+      }
       const err = toAppError(e, 'DOCKER_FAILED', { command: 'start' });
       if (!(e instanceof AppError)) log(`start failed: ${e?.stack ?? e}`);
       set('error', err.toJSON());
