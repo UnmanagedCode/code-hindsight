@@ -207,7 +207,7 @@ Labels (`LABELS` in `src/pins.js`):
 
 ### Unauthenticated paths
 
-Both published ports need a key except: API `/health*`, `/version`, `/metrics`, `/docs`, `/openapi.json`; CP `<base path>/login`, `/api/auth/*`, `/api/health`, `/api/version` and static assets. None returns memory data.
+The API and control-plane ports (and, while an Ollama backend is linked, the relay tunnel port) need a key except: API `/health*`, `/version`, `/metrics`, `/docs`, `/openapi.json`; CP `<base path>/login`, `/api/auth/*`, `/api/health`, `/api/version` and static assets. None returns memory data.
 
 ## CP proxy
 

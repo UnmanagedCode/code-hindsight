@@ -34,14 +34,32 @@ export function createOllamaProxy({ key, ollamaUrl, daemon, clock = { now: () =>
   };
   const record = (path, status, error = null) => { lastForward = { at: new Date(clock.now()).toISOString(), path, status, error }; };
 
-  const server = http.createServer((req, res) => {
-    const path = new URL(req.url, 'http://relay.local').pathname;
+  /**
+   * The request target as `/path[?query]`, or null unless it is origin-form with a path that is
+   * already normalised: what is allowlisted is exactly what is forwarded (no fragment, dot
+   * segments, backslashes or absolute-form).
+   */
+  function checkedTarget(raw) {
+    if (typeof raw !== 'string' || !raw.startsWith('/') || raw.startsWith('//') || raw.includes('\\') || raw.includes('#')) return null;
+    let url;
+    try { url = new URL(raw, 'http://relay.local'); } catch { return null; }
+    const rawPath = raw.split('?')[0];
+    if (url.origin !== 'http://relay.local' || url.pathname !== rawPath) return null;
+    return { path: url.pathname, forward: `${url.pathname}${url.search}` };
+  }
+
+  function handle(req, res) {
+    req.on('error', () => {});
+    res.on('error', () => {});
+    // The key first: an unauthenticated caller learns nothing about what is parsed or allowed.
     if (!authorized(req.headers.authorization)) { req.resume(); return reply(res, 401, { error: 'unauthorized' }); }
-    if (!OLLAMA_TARGET.allowed.includes(`${req.method} ${path}`)) { req.resume(); return reply(res, 403, { error: 'this path is not relayed' }); }
+    const t = checkedTarget(req.url);
+    if (!t) { req.resume(); return reply(res, 400, { error: 'the request target must be an origin-form path' }); }
+    if (!OLLAMA_TARGET.allowed.includes(`${req.method} ${t.path}`)) { req.resume(); return reply(res, 403, { error: 'this path is not relayed' }); }
     const headers = {};
     for (const [k, v] of Object.entries(req.headers)) if (k !== 'authorization' && !HOP_BY_HOP.has(k)) headers[k] = v;
-    const upstream = http.request({ hostname: target.hostname, port: target.port, method: req.method, path: req.url, headers, agent: false }, (ures) => {
-      record(path, ures.statusCode);
+    const upstream = http.request({ hostname: target.hostname, port: target.port, method: req.method, path: t.forward, headers, agent: false }, (ures) => {
+      record(t.forward, ures.statusCode);
       const out = {};
       for (const [k, v] of Object.entries(ures.headers)) if (!HOP_BY_HOP.has(k)) out[k] = v;
       res.writeHead(ures.statusCode, out);
@@ -50,11 +68,21 @@ export function createOllamaProxy({ key, ollamaUrl, daemon, clock = { now: () =>
     });
     upstream.on('error', (e) => {
       const err = new AppError('OLLAMA_UNREACHABLE', { url: ollamaUrl, detail: e.code ?? e.message });
-      record(path, res.headersSent ? null : 502, err.code);
+      record(t.forward, res.headersSent ? null : 502, err.code);
       if (res.headersSent) res.destroy(); else reply(res, 502, { error: err.message });
     });
     res.on('close', () => { if (!res.writableFinished) upstream.destroy(); });
     req.pipe(upstream);
+  }
+
+  // Nothing in a handler may throw out of the listener: that would end the plugin process.
+  const server = http.createServer((req, res) => {
+    try {
+      handle(req, res);
+    } catch (e) {
+      try { if (res.headersSent) res.destroy(); else { req.resume(); reply(res, 500, { error: 'internal error' }); } } catch { res.destroy(); }
+      console.error(`code-hindsight: ollama proxy: ${e?.message ?? e}`);
+    }
   });
   server.on('clientError', (_e, socket) => socket.destroy());
 

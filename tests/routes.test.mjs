@@ -326,3 +326,17 @@ test('OL10: a down daemon is a status problem, not an error state', async (t) =>
   assert.equal(st.ollama.daemon.ok, false);
   assert.ok(st.ollama.problems.some((p) => p.code === 'OLLAMA_UNREACHABLE'));
 });
+
+// C-3: RELAY_DISCONNECTED needs a real tunnel failure; no idle connection yet (a burst) is not one.
+test('C-3: a connecting tunnel without an error shows no relay warning; with an error it does', async (t) => {
+  const { fake, cc } = await ollamaWorld(t);
+  let tunnel = { state: 'connecting', idle: 0, error: null, address: '127.0.0.1:18434' };
+  const relay = { start() {}, stop() {}, status: () => ({ daemonUrl: fake.url, tunnel, lastForward: null }) };
+  const llm = { mode: 'cc-backend', provider: null, model: 'qwen3:4b', baseUrl: null, backendId: 'ollama', maxConcurrent: null };
+  const { url, app } = await boot(t, { cc, ollamaUrl: fake.url, settings: { llm }, probe: async () => 200, cpSession: { token: async () => 't', clear() {} }, relay });
+  t.after(() => app.supervisor.stop());
+  const problems = async () => (await (await fetch(`${url}/-/api/status`)).json()).ollama.problems.map((p) => p.code);
+  assert.deepEqual(await problems(), []);
+  tunnel = { ...tunnel, error: 'ECONNREFUSED' };
+  assert.deepEqual(await problems(), ['RELAY_DISCONNECTED']);
+});

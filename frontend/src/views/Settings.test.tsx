@@ -137,6 +137,22 @@ describe('Settings', () => {
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
+  // S-F5: a model the daemon does not list (typed, or no longer there) is treated as cloud.
+  it('warns about ollama.com for a model the daemon does not list', async () => {
+    linkedToOllama('some-unlisted:model');
+    render(<Settings onSaved={() => {}} onApply={() => {}} busy={false} />);
+    expect((await screen.findByRole('alert')).textContent).toMatch(/ollama\.com/);
+    expect(document.querySelector('[data-hint="ollama-local"]')).toBeNull();
+  });
+
+  it('shows no model warning while no model is chosen', async () => {
+    linkedToOllama(null);
+    render(<Settings onSaved={() => {}} onApply={() => {}} busy={false} />);
+    await screen.findByLabelText('cc backend');
+    await waitFor(() => expect(document.querySelector('[data-hint="ollama"]')).not.toBeNull());
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('says when the Ollama daemon did not answer', async () => {
     linkedToOllama('kimi-k2:cloud', false);
     render(<Settings onSaved={() => {}} onApply={() => {}} busy={false} />);

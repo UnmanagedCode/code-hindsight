@@ -16,8 +16,8 @@ import { waitFor } from './helpers.mjs';
 const RELAY = fileURLToPath(new URL('../src/relay/relay.mjs', import.meta.url));
 const KEY = 'k'.repeat(64);
 
-async function startRelay(t, { key = KEY, waitMs = 300, handshakeMs = 200 } = {}) {
-  const child = spawn(process.execPath, [RELAY], { env: { ...process.env, RELAY_KEY: key, RELAY_API_PORT: '0', RELAY_TUNNEL_PORT: '0', RELAY_WAIT_MS: String(waitMs), RELAY_HANDSHAKE_MS: String(handshakeMs) }, stdio: ['ignore', 'pipe', 'pipe'] });
+async function startRelay(t, { key = KEY, waitMs = 300, handshakeMs = 200, env = {} } = {}) {
+  const child = spawn(process.execPath, [RELAY], { env: { ...process.env, RELAY_KEY: key, RELAY_API_PORT: '0', RELAY_TUNNEL_PORT: '0', RELAY_WAIT_MS: String(waitMs), RELAY_HANDSHAKE_MS: String(handshakeMs), ...env }, stdio: ['ignore', 'pipe', 'pipe'] });
   t.after(() => child.kill('SIGKILL'));
   let out = '';
   child.stdout.on('data', (d) => { out += d; });
@@ -177,4 +177,107 @@ test('OL8: stopping the tunnel closes its connections and reports stopped', asyn
   assert.equal(tunnel.status().state, 'connected');
   tunnel.stop();
   assert.deepEqual(tunnel.status(), { state: 'stopped', idle: 0, error: null, address: null });
+});
+
+/** A hand-written request to the relay's API port: `line` is the whole request line, sent as is. */
+function rawRequest(port, line, { key = KEY } = {}) {
+  return new Promise((resolve) => {
+    const s = net.connect(port, '127.0.0.1', () => {
+      s.write(`${line}\r\nHost: x\r\n${key ? `Authorization: Bearer ${key}\r\n` : ''}Content-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}`);
+    });
+    let text = '';
+    s.on('data', (d) => { text += d; });
+    s.on('error', () => {});
+    s.on('close', () => resolve({ status: Number(/^HTTP\/1\.1 (\d+)/.exec(text)?.[1] ?? 0), text }));
+  });
+}
+const tunnelReady = (tunnel) => waitFor(() => tunnel.status().idle >= 1);
+
+// OL8 (S-F1): a malformed request target can never throw out of the proxy: no key is 401, a key
+// is 400, nothing is forwarded, and the same process serves the next request.
+test('OL8 S-F1: a malformed absolute-form target is 401 without the key and 400 with it, and the proxy keeps serving', async (t) => {
+  const { fake, rl, tunnel } = await stack(t);
+  for (const target of ['http://', 'http://[::1/', 'http://x:99999999/', 'http://x/v1/chat/completions']) {
+    await tunnelReady(tunnel);
+    assert.equal((await rawRequest(rl.apiPort, `POST ${target} HTTP/1.1`, { key: null })).status, 401, `${target} without a key`);
+    await tunnelReady(tunnel);
+    assert.equal((await rawRequest(rl.apiPort, `POST ${target} HTTP/1.1`)).status, 400, `${target} with a key`);
+  }
+  assert.equal(fake.requests.length, 0);
+  await tunnelReady(tunnel);
+  assert.equal((await call(rl.apiPort)).status, 200, 'the next request is served');
+});
+
+// OL8 (S-F3): what is allowlisted is exactly what is forwarded: only a normalised origin-form target passes.
+test('OL8 S-F3: fragment, dot-segment and backslash targets to a non-allowlisted path are 400 and never forwarded', async (t) => {
+  const { fake, rl, tunnel } = await stack(t);
+  for (const target of ['/v1/chat/completions#/../../api/pull', '/v1/chat/../../api/pull', '/v1/chat/completions\\..\\..\\api\\pull', '//evil/v1/chat/completions']) {
+    await tunnelReady(tunnel);
+    assert.equal((await rawRequest(rl.apiPort, `POST ${target} HTTP/1.1`)).status, 400, target);
+  }
+  assert.equal(fake.requests.length, 0);
+});
+
+test('OL8 S-F3: the checked path and query are what is forwarded and what lastForward records', async (t) => {
+  const { fake, rl, proxy, tunnel } = await stack(t);
+  await tunnelReady(tunnel);
+  assert.equal((await rawRequest(rl.apiPort, 'POST /api/chat?stream=true HTTP/1.1')).status, 200);
+  assert.equal(fake.requests.at(-1).path, '/api/chat?stream=true');
+  assert.equal(proxy.lastForward().path, '/api/chat?stream=true');
+});
+
+// OL8 (S-F4): unauthenticated sockets are capped, and extras are closed at once.
+test('OL8 S-F4: tunnel sockets still in the handshake are capped', async (t) => {
+  const rl = await startRelay(t, { handshakeMs: 5_000, env: { RELAY_MAX_HANDSHAKING: '2' } });
+  const open = () => new Promise((resolve) => {
+    const s = net.connect(rl.tunnelPort, '127.0.0.1');
+    s.on('error', () => {});
+    s.on('connect', () => resolve({ s, closed: () => s.destroyed }));
+  });
+  const [a, b, c] = [await open(), await open(), await open()];
+  t.after(() => [a, b, c].forEach((x) => x.s.destroy()));
+  await waitFor(() => c.closed());
+  assert.equal(a.closed() || b.closed(), false, 'the first two keep their handshake window');
+});
+
+// OL8 (S-F4): API connections waiting for a tunnel are capped.
+test('OL8 S-F4: API connections waiting for a tunnel are capped', async (t) => {
+  const rl = await startRelay(t, { waitMs: 3_000, env: { RELAY_MAX_WAITING: '1' } });
+  const open = () => new Promise((resolve) => {
+    const s = net.connect(rl.apiPort, '127.0.0.1');
+    s.on('error', () => {});
+    s.on('connect', () => resolve(s));
+  });
+  const [first, second] = [await open(), await open()];
+  t.after(() => { first.destroy(); second.destroy(); });
+  await waitFor(() => second.destroyed);
+  assert.equal(first.destroyed, false);
+});
+
+// OL8 (S-F4): a flood of failed handshakes is one log line, not one per failure.
+test('OL8 S-F4: repeated authentication failures collapse into one log line', async (t) => {
+  const rl = await startRelay(t, { env: { RELAY_MAX_HANDSHAKING: '100' } });
+  await Promise.all(Array.from({ length: 20 }, () => new Promise((resolve) => {
+    const s = net.connect(rl.tunnelPort, '127.0.0.1', () => s.write('HSR1 wrong\n'));
+    s.on('error', () => {});
+    s.on('close', resolve);
+  })));
+  assert.equal(rl.log().split('\n').filter((l) => /authentication failed/.test(l)).length, 1);
+});
+
+// OL8 (S-F8): a paired tunnel that never acks is dropped with its API connection, not held forever.
+test('OL8 S-F8: a tunnel that does not ack after the go byte is closed along with the API connection', async (t) => {
+  const rl = await startRelay(t, { env: { RELAY_ACK_MS: '150' } });
+  const tunnel = net.connect(rl.tunnelPort, '127.0.0.1', () => tunnel.write(`HSR1 ${KEY}\n`));
+  tunnel.on('error', () => {});
+  let go = null;
+  tunnel.once('data', (d) => { go = d; });
+  await new Promise((r) => setTimeout(r, 50));
+  const api = net.connect(rl.apiPort, '127.0.0.1');
+  api.on('error', () => {});
+  t.after(() => { tunnel.destroy(); api.destroy(); });
+  await waitFor(() => go !== null);
+  assert.deepEqual([...go], [1]);
+  await waitFor(() => tunnel.destroyed && api.destroyed);
+  assert.match(rl.log(), /did not ack/);
 });

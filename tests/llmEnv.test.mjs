@@ -151,3 +151,12 @@ test('OL6: an unreachable daemon gives reachable:false and every cc model counts
   assert.deepEqual(row.models.map((m) => m.cloud), [true, true, true]);
   assert.equal(summarizeCcBackends(OLLAMA_DATA)[0].daemon.reachable, false, 'no daemon info is unreachable');
 });
+
+// OL2: a row that has an Anthropic URL and token maps to anthropic even when its template launches ollama.
+test('OL2: an ANTHROPIC_BASE_URL with a token wins over an ollama template', async () => {
+  const data = { backends: [{ id: 'both', template: 'ollama launch claude --model {model} --yes --', env: [{ key: 'ANTHROPIC_BASE_URL', value: 'https://llm.example.com/anthropic' }, { key: 'ANTHROPIC_AUTH_TOKEN', value: 'tok' }] }] };
+  assert.equal(summarizeCcBackends(data)[0].kind, 'anthropic');
+  const { env, relay } = await composeLlmEnv(llm({ mode: 'cc-backend', backendId: 'both', model: 'm' }), { relayKey: 'rk' }, fromData(data));
+  assert.equal(relay, false);
+  assert.equal(env.HINDSIGHT_API_LLM_PROVIDER, 'anthropic');
+});

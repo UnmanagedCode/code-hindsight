@@ -614,3 +614,44 @@ test('OL5: changing maxConcurrent or relayPort on a ready stack flags pendingRes
     assert.equal(sup.status().pendingRestart, false);
   }
 });
+
+// C-1: a relay left running by an earlier process is stopped at shutdown even when this process's
+// start failed before it knew about any link (the decision comes from the container, not from memory).
+test('C-1: shutdown stops a relay a previous process left running although this start failed early', async (t) => {
+  const first = makeLinked(t);
+  await first.sup.ensureRunning();
+  assert.equal(dockerState(first.r).containers[names.relay].State.Running, true);
+  const { sup } = makeOver(t, first.r); // its fetchCcModels answers {}: the start fails with CC_ROUTE_CHANGED
+  await sup.ensureRunning();
+  assert.equal(sup.status().error.code, 'CC_ROUTE_CHANGED');
+  fs.writeFileSync(first.r.logPath, '');
+  await sup.shutdown();
+  await waitFor(() => dockerCalls(first.r).some((a) => a[0] === 'stop'));
+  assert.deepEqual(dockerCalls(first.r).find((a) => a[0] === 'stop'), ['stop', '-t', '30', names.cp, names.api, names.relay]);
+});
+
+test('C-1: shutdown leaves a relay out when none of ours is running', async (t) => {
+  const { r, sup } = make(t);
+  await sup.ensureRunning();
+  fs.writeFileSync(r.logPath, '');
+  await sup.shutdown();
+  await waitFor(() => dockerCalls(r).some((a) => a[0] === 'stop'));
+  assert.deepEqual(dockerCalls(r).find((a) => a[0] === 'stop'), ['stop', '-t', '30', names.cp, names.api]);
+});
+
+// C-2: a start that stop() cancels while the LLM env is being read never brings the tunnel up.
+test('C-2: a start cancelled by stop() ends with the tunnel stopped, never started', async (t) => {
+  let release;
+  const gate = new Promise((res) => { release = res; });
+  const { sup, relay, r } = makeLinked(t, { fetchCcModels: async () => { await gate; return OLLAMA_CC; } });
+  const starting = sup.ensureRunning();
+  await waitFor(() => dockerState(r).networks[names.network]); // the start has passed the network step
+  const stopping = sup.stop();
+  release();
+  await Promise.all([starting, stopping]);
+  assert.equal(sup.status().state, 'stopped');
+  assert.equal(relay.calls.some((c) => c[0] === 'start'), false, JSON.stringify(relay.calls));
+  assert.deepEqual(relay.calls.at(-1), ['stop']);
+  assert.equal(sup.status().ollama, null);
+  assert.ok(!dockerCalls(r).some((a) => a[0] === 'run' && a.includes(names.relay)), 'no relay container was created either');
+});

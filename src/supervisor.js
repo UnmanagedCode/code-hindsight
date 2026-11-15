@@ -252,9 +252,12 @@ export function createSupervisor({
     set('starting');
     const secrets = secretsStore.get();
     const { env: llmEnv, relay: needsRelay } = await composeLlmEnv(settings, secrets, { fetchCcModels });
+    // A start cancelled while the LLM env was read must not bring the tunnel up.
+    checkCancelled(gen);
     if (needsRelay) {
       // The relay first: the API's LLM client resolves `ollama` on the private network.
       await adoptOrCreate(relaySpec({ names, image: { id: api.Id }, bind, port: ports.relay, key: secrets.relayKey, owner }), api.Id, 'relayPort');
+      checkCancelled(gen);
       relay.start({ host: bind, port: ports.relay });
     } else {
       relay.stop();
@@ -287,7 +290,12 @@ export function createSupervisor({
     try {
       await bringUp(gen);
     } catch (e) {
-      if (e instanceof Cancelled) return;
+      if (e instanceof Cancelled) {
+        // stop()/restart() ended this start: whatever it began with the tunnel ends with it.
+        relay.stop();
+        ollamaLinked = false;
+        return;
+      }
       const err = toAppError(e, 'DOCKER_FAILED', { command: 'start' });
       if (!(e instanceof AppError)) log(`start failed: ${e?.stack ?? e}`);
       set('error', err.toJSON());
@@ -326,6 +334,21 @@ export function createSupervisor({
       stopWatch();
       set('error', new AppError('UNHEALTHY', { role: 'api', url: `http://${bind}:${ports.api}/health`, tail: await containerTail(names.api) }).toJSON());
     }
+  }
+
+  /**
+   * Whether the relay container may be running: this process linked it, or it is ours and
+   * running, whichever process started it. Inspecting needs a resolved docker (a shutdown
+   * must not wait on a resolve), so an unresolved docker counts only this process's own link;
+   * a failed inspect counts as running (`docker stop` of a missing name only errors for it).
+   */
+  async function relayMayRun() {
+    if (ollamaLinked) return true;
+    if (!docker.info().mode) return false;
+    try {
+      const c = await docker.inspectContainer(names.relay);
+      return !!c && c.Config?.Labels?.[LABELS.owner] === owner && !!(c.State?.Running || c.State?.Restarting);
+    } catch { return true; }
   }
 
   async function stopContainersNow() {
@@ -418,7 +441,7 @@ export function createSupervisor({
       relay.stop();
       let pid;
       try {
-        pid = await docker.stopDetached([names.cp, names.api, ...(ollamaLinked ? [names.relay] : [])], T.stopSeconds);
+        pid = await docker.stopDetached([names.cp, names.api, ...((await relayMayRun()) ? [names.relay] : [])], T.stopSeconds);
       } catch (e) {
         // No pid to wait for: record the failure instead of a stopping.json the next backend
         // would read as "a stop is under way".

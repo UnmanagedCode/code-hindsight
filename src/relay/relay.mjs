@@ -8,7 +8,9 @@
 // has then taken the socket over: bytes sent earlier could be lost), then pipes both ways.
 //
 // Env: RELAY_KEY, RELAY_API_PORT, RELAY_TUNNEL_PORT, RELAY_WAIT_MS (how long an API connection
-// waits for an idle tunnel), RELAY_HANDSHAKE_MS. It prints one JSON line when listening.
+// waits for an idle tunnel), RELAY_HANDSHAKE_MS, RELAY_ACK_MS (how long a paired tunnel may take to
+// ack), RELAY_MAX_HANDSHAKING and RELAY_MAX_WAITING (caps on unauthenticated tunnel sockets and on
+// API connections waiting for a tunnel; extras are closed). It prints one JSON line when listening.
 import net from 'node:net';
 import crypto from 'node:crypto';
 
@@ -17,6 +19,10 @@ const API_PORT = Number(process.env.RELAY_API_PORT ?? 11434);
 const TUNNEL_PORT = Number(process.env.RELAY_TUNNEL_PORT ?? 7070);
 const WAIT_MS = Number(process.env.RELAY_WAIT_MS ?? 10_000);
 const HANDSHAKE_MS = Number(process.env.RELAY_HANDSHAKE_MS ?? 5_000);
+const ACK_MS = Number(process.env.RELAY_ACK_MS ?? 5_000);
+const MAX_HANDSHAKING = Number(process.env.RELAY_MAX_HANDSHAKING ?? 32);
+const MAX_WAITING = Number(process.env.RELAY_MAX_WAITING ?? 64);
+const LOG_EVERY_MS = 10_000;
 const MAX_HANDSHAKE_BYTES = 256;
 const MAX_IDLE = 16;
 const GO = Buffer.from([1]);
@@ -30,6 +36,16 @@ const keyDigest = digest(KEY);
 const keyMatches = (candidate) => crypto.timingSafeEqual(digest(candidate), keyDigest);
 const noop = () => {};
 
+/** One line per kind per LOG_EVERY_MS, with how many more were suppressed: a flood cannot flood the log. */
+const lastLog = new Map();
+function logLimited(kind, line) {
+  const now = Date.now();
+  const e = lastLog.get(kind) ?? { at: -Infinity, skipped: 0 };
+  if (now - e.at < LOG_EVERY_MS) { e.skipped++; lastLog.set(kind, e); return; }
+  console.log(e.skipped ? `${line} (+${e.skipped} more since the last line)` : line);
+  lastLog.set(kind, { at: now, skipped: 0 });
+}
+
 /** Authenticated sockets waiting for an API connection, and API connections waiting for one. */
 const idle = [];
 const waiting = [];
@@ -38,11 +54,13 @@ function pair(tunnel, api) {
   tunnel.removeListener('data', noop);
   api.pause();
   tunnel.write(GO);
+  const ackTimer = setTimeout(() => { logLimited('ack', 'relay: a paired tunnel did not ack; closed both sides'); end(); }, ACK_MS);
   tunnel.once('data', () => {
+    clearTimeout(ackTimer);
     api.pipe(tunnel);
     tunnel.pipe(api);
   });
-  const end = () => { api.destroy(); tunnel.destroy(); };
+  const end = () => { clearTimeout(ackTimer); api.destroy(); tunnel.destroy(); };
   api.on('close', end);
   tunnel.on('close', end);
 }
@@ -56,23 +74,30 @@ function offer(tunnel) {
   tunnel.on('close', () => { const i = idle.indexOf(tunnel); if (i !== -1) idle.splice(i, 1); });
 }
 
+let handshaking = 0;
 const tunnelServer = net.createServer((socket) => {
-  socket.setKeepAlive(true, 15_000);
   socket.on('error', noop);
+  if (handshaking >= MAX_HANDSHAKING) { logLimited('handshake-cap', 'relay: too many tunnel handshakes in progress; closed one'); socket.destroy(); return; }
+  handshaking++;
+  let counted = true;
+  const done = () => { if (counted) { counted = false; handshaking--; } };
+  socket.on('close', done);
+  socket.setKeepAlive(true, 15_000);
   let buf = Buffer.alloc(0);
-  const timer = setTimeout(() => { console.log('relay: tunnel handshake timed out'); socket.destroy(); }, HANDSHAKE_MS);
+  const timer = setTimeout(() => { logLimited('handshake-timeout', 'relay: tunnel handshake timed out'); socket.destroy(); }, HANDSHAKE_MS);
   const onData = (chunk) => {
     buf = Buffer.concat([buf, chunk]);
     const nl = buf.indexOf(0x0a);
     if (nl === -1) {
-      if (buf.length > MAX_HANDSHAKE_BYTES) { clearTimeout(timer); console.log('relay: tunnel handshake too long'); socket.destroy(); }
+      if (buf.length > MAX_HANDSHAKE_BYTES) { clearTimeout(timer); logLimited('auth', 'relay: tunnel authentication failed'); socket.destroy(); }
       return;
     }
     clearTimeout(timer);
+    done();
     socket.removeListener('data', onData);
     const line = buf.subarray(0, nl).toString('latin1');
     if (nl > MAX_HANDSHAKE_BYTES || !line.startsWith('HSR1 ') || !keyMatches(line.slice(5))) {
-      console.log('relay: tunnel authentication failed');
+      logLimited('auth', 'relay: tunnel authentication failed');
       socket.destroy();
       return;
     }
@@ -88,11 +113,12 @@ const apiServer = net.createServer((api) => {
   while ((tunnel = idle.shift())) {
     if (!tunnel.destroyed) { pair(tunnel, api); return; }
   }
+  if (waiting.length >= MAX_WAITING) { logLimited('wait-cap', 'relay: too many API connections waiting for a tunnel; closed one'); api.destroy(); return; }
   api.pause();
   const w = { api, timer: setTimeout(() => {
     const i = waiting.indexOf(w);
     if (i !== -1) waiting.splice(i, 1);
-    console.log('relay: no tunnel from the plugin; closed an API connection');
+    logLimited('no-tunnel', 'relay: no tunnel from the plugin; closed an API connection');
     api.destroy();
   }, WAIT_MS) };
   waiting.push(w);

@@ -21,7 +21,7 @@ test('OL11: real stack: the API\'s LLM check reaches the fake Ollama through the
   t.after(() => cc.close());
 
   const llm = { mode: 'cc-backend', provider: null, model: 'qwen3:4b', baseUrl: null, backendId: 'ollama', maxConcurrent: 1 };
-  const { app, prefix } = await bootRealStack(t, { settings: { llm }, conductorUrl: `http://127.0.0.1:${cc.address().port}`, ollamaUrl: fake.url });
+  const { app, prefix, url } = await bootRealStack(t, { settings: { llm }, conductorUrl: `http://127.0.0.1:${cc.address().port}`, ollamaUrl: fake.url });
   await app.supervisor.ensureRunning();
   const st = app.supervisor.status();
   assert.equal(st.state, 'ready', JSON.stringify(st.error));
@@ -31,6 +31,10 @@ test('OL11: real stack: the API\'s LLM check reaches the fake Ollama through the
   const chat = await waitFor(() => fake.requests.find((r) => r.method === 'POST' && /^\/(v1\/chat\/completions|api\/chat)$/.test(r.path)), { timeoutMs: 120_000, stepMs: 500 });
   assert.match(chat.body, /qwen3:4b/);
   assert.equal(chat.headers.authorization, undefined);
+
+  // S-F6: the API's own log (shown on Status) never holds the relay key it sent as a Bearer token.
+  const apiLog = await (await fetch(`${url}/-/api/logs/api`)).text();
+  assert.equal(apiLog.includes(app.secrets.get().relayKey), false, 'the relay key is not in the API log');
 
   // Only the tunnel port is published, on the bind address; the API-facing port is not.
   const name = `${prefix}-relay`;

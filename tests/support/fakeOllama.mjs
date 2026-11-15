@@ -18,16 +18,17 @@ export async function startFakeOllama(t) {
       if (fake.down) { req.socket.destroy(); return; }
       const body = Buffer.concat(chunks).toString();
       fake.requests.push({ method: req.method, path: req.url, headers: req.headers, body });
+      const route = req.url.split('?')[0];
       const json = (o) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(o)); };
-      if (req.url === '/api/version') return json({ version: fake.version });
-      if (req.url === '/api/tags') return json({ models: TAGS });
-      if (req.url === '/api/chat') {
+      if (route === '/api/version') return json({ version: fake.version });
+      if (route === '/api/tags') return json({ models: TAGS });
+      if (route === '/api/chat') {
         res.writeHead(200, { 'content-type': 'application/x-ndjson' });
         res.write(`${JSON.stringify({ message: { content: 'hel' }, done: false })}\n`);
         setTimeout(() => res.end(`${JSON.stringify({ message: { content: 'lo' }, done: true })}\n`), 5);
         return undefined;
       }
-      if (req.url === '/v1/chat/completions') return json({ choices: [{ message: { role: 'assistant', content: 'ok' } }], echo: body });
+      if (route === '/v1/chat/completions') return json({ choices: [{ message: { role: 'assistant', content: 'ok' } }], echo: body });
       res.writeHead(404); res.end('not found');
       return undefined;
     });

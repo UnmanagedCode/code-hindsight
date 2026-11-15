@@ -61,7 +61,8 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
     const daemon = await ollamaProxy.probeDaemon();
     const problems = [];
     if (!daemon.ok) problems.push(describeError('OLLAMA_UNREACHABLE', { url: ollama.daemonUrl, detail: daemon.error }));
-    if (ollama.tunnel.state === 'connecting') problems.push(describeError('RELAY_DISCONNECTED', { address: ollama.tunnel.address, detail: ollama.tunnel.error ?? 'connecting' }));
+    // Only a real failure: no idle connection yet during a burst of requests is not a problem.
+    if (ollama.tunnel.state === 'connecting' && ollama.tunnel.error) problems.push(describeError('RELAY_DISCONNECTED', { address: ollama.tunnel.address, detail: ollama.tunnel.error }));
     return { ...ollama, daemon, problems };
   }
 

@@ -122,7 +122,7 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
       <Card>
         <CardHeader>
           <CardTitle>Network</CardTitle>
-          <CardDescription>The API and control-plane ports are published on one host address and both need a key.</CardDescription>
+          <CardDescription>The API and control-plane ports are published on one host address and both need a key. With an Ollama backend, the relay port is published there too and also needs a key.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 sm:grid-cols-4">
           <Field id="network.bindAddress" label="Bind address" error={err('network.bindAddress')} hint={`Empty = automatic (${view.detectedBindAddress})`}>
@@ -206,7 +206,7 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
                   {backend.daemon && !backend.daemon.reachable && (
                     <p className="text-destructive" data-hint="ollama-unreachable">The Ollama daemon did not answer ({backend.daemon.error}). It runs in cc's container; models are listed from cc only, and all count as cloud.</p>
                   )}
-                  {chosen?.cloud && (
+                  {form.llm.model && (!chosen || chosen.cloud) && (
                     <p className="text-destructive" role="alert" data-hint="ollama-cloud">Retained, imported and recall text is sent through cc's Ollama daemon to ollama.com under its signed-in account.</p>
                   )}
                   {chosen && !chosen.cloud && (
