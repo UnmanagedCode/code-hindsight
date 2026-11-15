@@ -10,8 +10,9 @@
 // Env: RELAY_KEY, RELAY_API_PORT, RELAY_TUNNEL_PORT, RELAY_WAIT_MS (how long an API connection
 // waits for an idle tunnel), RELAY_HANDSHAKE_MS, RELAY_ACK_MS (how long a paired tunnel may take to
 // ack), RELAY_MAX_HANDSHAKING and RELAY_MAX_WAITING (caps on unauthenticated tunnel sockets and on
-// API connections waiting for a tunnel; at a cap the OLDEST is closed and the new one admitted, so a
-// fresh valid connect always gets in). The plugin sets RELAY_MAX_WAITING to LLM_MAX_CONCURRENT_MAX
+// API connections waiting for a tunnel; at a cap the OLDEST is closed and the new one admitted: a fresh
+// connection is admitted, though a sustained high-rate connect flood can still evict it before its
+// handshake is read). The plugin sets RELAY_MAX_WAITING to LLM_MAX_CONCURRENT_MAX
 // (src/settings.js): no more calls can be in flight than the API is allowed to make. It prints one JSON line when listening.
 import net from 'node:net';
 import crypto from 'node:crypto';
@@ -22,8 +23,10 @@ const TUNNEL_PORT = Number(process.env.RELAY_TUNNEL_PORT ?? 7070);
 const WAIT_MS = Number(process.env.RELAY_WAIT_MS ?? 10_000);
 const HANDSHAKE_MS = Number(process.env.RELAY_HANDSHAKE_MS ?? 5_000);
 const ACK_MS = Number(process.env.RELAY_ACK_MS ?? 5_000);
-const MAX_HANDSHAKING = Number(process.env.RELAY_MAX_HANDSHAKING ?? 32);
-const MAX_WAITING = Number(process.env.RELAY_MAX_WAITING ?? 256); // fallback; the plugin passes the real value
+/** A positive whole number from env, else `fallback`: a cap below 1 (or nonsense) must not break the eviction below. */
+const cap = (value, fallback) => { const n = Math.floor(Number(value)); return Number.isFinite(n) ? Math.max(1, n) : fallback; };
+const MAX_HANDSHAKING = cap(process.env.RELAY_MAX_HANDSHAKING, 32);
+const MAX_WAITING = cap(process.env.RELAY_MAX_WAITING, 256); // fallback; the plugin passes the real value
 const LOG_EVERY_MS = 10_000;
 const MAX_HANDSHAKE_BYTES = 256;
 const MAX_IDLE = 16;
@@ -81,7 +84,7 @@ const handshaking = new Set();
 const tunnelServer = net.createServer((socket) => {
   socket.on('error', noop);
   if (handshaking.size >= MAX_HANDSHAKING) {
-    // Never refuse the newcomer: silent sockets must not be able to lock the plugin out.
+    // Admit the newcomer and drop the oldest: refusing it would let silent sockets hold the pool.
     const oldest = handshaking.values().next().value;
     handshaking.delete(oldest);
     logLimited('handshake-cap', 'relay: too many tunnel handshakes in progress; closed the oldest');

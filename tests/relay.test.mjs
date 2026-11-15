@@ -305,3 +305,12 @@ test('OL8 S-F8: a tunnel that does not ack after the go byte is closed along wit
   await waitFor(() => tunnel.destroyed && api.destroyed);
   assert.match(rl.log(), /did not ack/);
 });
+
+// N1: a cap below 1 is clamped, not a crash: the relay still pairs and serves a request.
+test('OL8 N1: RELAY_MAX_WAITING=0 and RELAY_MAX_HANDSHAKING=0 are clamped and the relay still serves', async (t) => {
+  const rl = await startRelay(t, { env: { RELAY_MAX_WAITING: '0', RELAY_MAX_HANDSHAKING: '0' } });
+  const { fake } = await stack(t, { relay: rl });
+  assert.equal((await call(rl.apiPort)).status, 200);
+  assert.equal(fake.requests.length, 1);
+  assert.equal(rl.child.exitCode, null, 'the relay is still running');
+});
