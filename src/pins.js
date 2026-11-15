@@ -79,14 +79,25 @@ export const CP_CONTAINER_PORT = 9999;
  */
 export const RELAY_TUNNEL_PORT = 7070;
 /**
- * The relay's one target: cc's Ollama daemon. `alias` and `apiPort` are where the API's Ollama
- * client finds the relay (`http://ollama:11434`); `allowed` is every `METHOD path` the plugin
- * forwards to the daemon (model management is never among them).
+ * The relay's targets, by kind. Only one is active at a time. `alias` and `apiPort` are where
+ * the API's LLM client finds the relay; `allowed` is every `METHOD path` the plugin forwards
+ * (model management is never among them); `keyHeader` is where that client puts the relay key
+ * (`authorization`: `Bearer <key>`; `x-api-key`: the raw value). These are facts about the
+ * pinned upstream's providers: re-check them when bumping Hindsight.
  */
-export const OLLAMA_TARGET = Object.freeze({
-  alias: 'ollama',
-  apiPort: 11434,
-  allowed: Object.freeze(['POST /v1/chat/completions', 'POST /api/chat']),
+export const RELAY_TARGETS = Object.freeze({
+  ollama: Object.freeze({
+    alias: 'ollama',
+    apiPort: 11434,
+    allowed: Object.freeze(['POST /v1/chat/completions', 'POST /api/chat']),
+    keyHeader: 'authorization',
+  }),
+  'anthropic-loopback': Object.freeze({
+    alias: 'cc-backend',
+    apiPort: 8080,
+    allowed: Object.freeze(['POST /v1/messages']),
+    keyHeader: 'x-api-key',
+  }),
 });
 /** Where the API image keeps its embedded Postgres data. */
 export const API_DATA_PATH = '/home/hindsight/.pg0';

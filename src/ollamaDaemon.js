@@ -1,5 +1,5 @@
 // A read-only client for the Ollama daemon (it runs in cc's container): its version, and the
-// models it lists. Everything else the plugin sends it goes through ollamaProxy.
+// models it lists. Everything else the plugin sends it goes through relayProxy.
 import { AppError } from './errors.js';
 
 export const OLLAMA_PROBE_TIMEOUT_MS = 3_000;

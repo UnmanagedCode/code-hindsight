@@ -66,7 +66,7 @@ export function Status({ status, onAction, busy }: { status: StatusT; onAction: 
           </AlertDescription>
         </Alert>
       )}
-      {status.ollama?.problems.map((p) => (
+      {status.relay?.problems.map((p) => (
         <Alert key={p.code} variant="warning" data-hint={p.code}>
           <InfoIcon />
           <AlertTitle>{p.title}</AlertTitle>
@@ -79,12 +79,15 @@ export function Status({ status, onAction, busy }: { status: StatusT; onAction: 
           <Row label="State"><span data-state={status.state}>{status.state}</span></Row>
           <Row label="Docker">{status.docker.mode ? `${status.docker.mode === 'sudo' ? 'sudo -n docker' : 'docker'} (daemon ${status.docker.serverVersion ?? '?'})` : 'not resolved'}</Row>
           <Row label="Image">{status.variant}</Row>
-          <Row label="Published on">{status.bindAddress}{status.bindAuto ? ' (automatic)' : ''} — API {status.ports.api}, control plane {status.ports.cp}{status.ollama ? `, relay ${status.ports.relay}` : ''}</Row>
+          <Row label="Published on">{status.bindAddress}{status.bindAuto ? ' (automatic)' : ''} — API {status.ports.api}, control plane {status.ports.cp}{status.relay ? `, relay ${status.ports.relay}` : ''}</Row>
           <Row label="LLM">{status.llmMode === 'none' ? 'none (memories are stored as chunks; reflect is unavailable)' : status.llmMode}</Row>
-          {status.ollama && (
-            <Row label="Ollama">
-              daemon {status.ollama.daemon.ok ? `${status.ollama.daemon.version ?? '?'} at ${status.ollama.daemonUrl}` : `not answering at ${status.ollama.daemonUrl}`}; relay {status.ollama.tunnel.state}
-              {status.ollama.tunnel.state === 'connected' ? ` (${status.ollama.tunnel.idle} idle)` : ''}
+          {status.relay && (
+            <Row label="Relay">
+              {status.relay.target?.kind === 'ollama'
+                ? `Ollama daemon ${status.relay.upstream?.ok ? `${status.relay.upstream.version ?? '?'} at ${status.relay.target.url}` : `not answering at ${status.relay.target.url}`}`
+                : `cc backend endpoint at ${status.relay.target?.url ?? '?'} (${status.relay.upstream?.ok ? 'answering' : 'not answering'})`}
+              ; tunnel {status.relay.tunnel.state}
+              {status.relay.tunnel.state === 'connected' ? ` (${status.relay.tunnel.idle} idle)` : ''}
             </Row>
           )}
           {status.startedAt && <Row label="Ready since">{status.startedAt}</Row>}

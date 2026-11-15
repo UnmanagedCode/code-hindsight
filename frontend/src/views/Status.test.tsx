@@ -78,36 +78,45 @@ describe('Shutdown failure notice', () => {
   });
 });
 
-// OL9 (UI): an Ollama link shows the daemon and relay state, its warnings, and the relay's container and log.
-describe('Ollama link', () => {
-  const ollama = (over: Partial<NonNullable<ReturnType<typeof status>['ollama']>> = {}) => ({
-    daemonUrl: 'http://127.0.0.1:11434',
+// OL9 / LB15 (UI): a relay link shows the target and tunnel state, its warnings, and the relay's container and log.
+describe('Relay link', () => {
+  const relay = (over: Partial<NonNullable<ReturnType<typeof status>['relay']>> = {}) => ({
+    target: { kind: 'ollama' as const, url: 'http://127.0.0.1:11434' },
     tunnel: { state: 'connected' as const, idle: 4, error: null, address: '172.20.0.1:18434' },
     lastForward: null,
-    daemon: { ok: true, version: '0.40.13', error: null, at: 'x' },
+    upstream: { ok: true, version: '0.40.13', error: null, at: 'x' },
     problems: [],
     ...over,
   });
-  const linked = (o: ReturnType<typeof ollama>) => status({ ollama: o, containers: { ...status().containers!, relay: { name: 'code-hindsight-relay', state: 'running' } } });
+  const loopback = (over: Partial<NonNullable<ReturnType<typeof status>['relay']>> = {}) => relay({ target: { kind: 'anthropic-loopback', url: 'http://127.0.0.1:18765' }, upstream: { ok: true, version: null, error: null, at: 'x' }, ...over });
+  const linked = (o: ReturnType<typeof relay>) => status({ relay: o, containers: { ...status().containers!, relay: { name: 'code-hindsight-relay', state: 'running' } } });
 
-  it('shows nothing about Ollama without a link', () => {
+  it('shows nothing about the relay without a link', () => {
     render(<Status status={status()} onAction={() => {}} busy={false} />);
-    expect(screen.queryByText('Ollama')).toBeNull();
+    expect(screen.queryByText('Relay')).toBeNull();
     expect(screen.queryByRole('button', { name: 'Relay log' })).toBeNull();
   });
 
-  it('shows the daemon version and URL, the relay state and the relay container', () => {
-    render(<Status status={linked(ollama())} onAction={() => {}} busy={false} />);
-    expect(screen.getByText(/daemon 0\.40\.13 at http:\/\/127\.0\.0\.1:11434; relay connected/)).toBeTruthy();
+  it('shows the Ollama daemon version and URL, the tunnel state and the relay container', () => {
+    render(<Status status={linked(relay())} onAction={() => {}} busy={false} />);
+    expect(screen.getByText(/Ollama daemon 0\.40\.13 at http:\/\/127\.0\.0\.1:11434; tunnel connected/)).toBeTruthy();
     expect(screen.getByText('Relay container')).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Relay log' })).toBeTruthy();
   });
 
-  it('shows a warning for each problem', () => {
-    const problems = [catalogError('OLLAMA_UNREACHABLE', null), catalogError('RELAY_DISCONNECTED', 'restart')];
-    render(<Status status={linked(ollama({ daemon: { ok: false, version: null, error: 'ECONNREFUSED', at: 'x' }, tunnel: { state: 'connecting', idle: 0, error: 'ECONNREFUSED', address: null }, problems }))} onAction={() => {}} busy={false} />);
-    expect(document.querySelector('[data-hint="OLLAMA_UNREACHABLE"]')?.textContent).toContain('OLLAMA_UNREACHABLE message');
+  // LB15: the loopback target shows its endpoint and whether it answers.
+  it('LB15: shows a loopback cc backend endpoint as answering or not answering', () => {
+    const { unmount } = render(<Status status={linked(loopback())} onAction={() => {}} busy={false} />);
+    expect(screen.getByText(/cc backend endpoint at http:\/\/127\.0\.0\.1:18765 \(answering\); tunnel connected/)).toBeTruthy();
+    unmount();
+    render(<Status status={linked(loopback({ upstream: { ok: false, version: null, error: 'ECONNREFUSED', at: 'x' } }))} onAction={() => {}} busy={false} />);
+    expect(screen.getByText(/\(not answering\); tunnel connected/)).toBeTruthy();
+  });
+
+  it('LB15: shows a warning for each problem', () => {
+    const problems = [catalogError('CC_BACKEND_UNREACHABLE', null), catalogError('RELAY_DISCONNECTED', 'restart')];
+    render(<Status status={linked(loopback({ upstream: { ok: false, version: null, error: 'ECONNREFUSED', at: 'x' }, tunnel: { state: 'connecting', idle: 0, error: 'ECONNREFUSED', address: null }, problems }))} onAction={() => {}} busy={false} />);
+    expect(document.querySelector('[data-hint="CC_BACKEND_UNREACHABLE"]')?.textContent).toContain('CC_BACKEND_UNREACHABLE message');
     expect(document.querySelector('[data-hint="RELAY_DISCONNECTED"]')?.textContent).toContain('RELAY_DISCONNECTED message');
-    expect(screen.getByText(/not answering at http:\/\/127\.0\.0\.1:11434; relay connecting/)).toBeTruthy();
   });
 });

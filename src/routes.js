@@ -32,9 +32,9 @@ const isJson = (req) => /^application\/json\b/i.test(String(req.headers['content
  * @param {() => string} o.detectBind
  * @param {{api: string, cp: string, relay: string}} o.containerNames
  * @param {{tags(): Promise<{model: string, cloud: boolean}[]>, version(): Promise<string|null>}} o.ollamaDaemon
- * @param {{probeDaemon(): Promise<{ok: boolean, version: string|null, error: string|null, at: string}>}} o.ollamaProxy
+ * @param {{probeTarget(): Promise<{ok: boolean, version: string|null, error: string|null, at: string}|null>}} o.relayProxy
  */
-export function createRoutes({ supervisor, jobs, docker, settings: settingsStore, secrets, fetchCcModels, fetchPluginRow, detectBind, containerNames, ollamaDaemon, ollamaProxy, scopes, activity, cc, backfill, now = () => Date.now() }) {
+export function createRoutes({ supervisor, jobs, docker, settings: settingsStore, secrets, fetchCcModels, fetchPluginRow, detectBind, containerNames, ollamaDaemon, relayProxy, scopes, activity, cc, backfill, now = () => Date.now() }) {
   let autoStart = { at: 0, value: undefined };
 
   async function readAutoStart() {
@@ -56,14 +56,17 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
     };
   }
 
-  /** The link's status plus the daemon's answer and the problems to show (a down daemon, a relay the plugin cannot reach). */
-  async function withDaemon(ollama) {
-    const daemon = await ollamaProxy.probeDaemon();
+  /** The relay's status plus the target's answer and the problems to show (a silent target, a relay the plugin cannot reach). */
+  async function withUpstream(relay) {
+    const upstream = await relayProxy.probeTarget();
     const problems = [];
-    if (!daemon.ok) problems.push(describeError('OLLAMA_UNREACHABLE', { url: ollama.daemonUrl, detail: daemon.error }));
+    if (upstream && !upstream.ok) {
+      const code = relay.target?.kind === 'ollama' ? 'OLLAMA_UNREACHABLE' : 'CC_BACKEND_UNREACHABLE';
+      problems.push(describeError(code, { url: relay.target?.url, detail: upstream.error }));
+    }
     // Only a real failure: no idle connection yet during a burst of requests is not a problem.
-    if (ollama.tunnel.state === 'connecting' && ollama.tunnel.error) problems.push(describeError('RELAY_DISCONNECTED', { address: ollama.tunnel.address, detail: ollama.tunnel.error }));
-    return { ...ollama, daemon, problems };
+    if (relay.tunnel.state === 'connecting' && relay.tunnel.error) problems.push(describeError('RELAY_DISCONNECTED', { address: relay.tunnel.address, detail: relay.tunnel.error }));
+    return { ...relay, upstream, problems };
   }
 
   /** The daemon's state and models for the picker (a failure is a state, not an error). */
@@ -80,7 +83,7 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
     if (refresh) await supervisor.refresh();
     const s = supervisor.status();
     const a = await readAutoStart();
-    if (s.ollama) s.ollama = await withDaemon(s.ollama);
+    if (s.relay) s.relay = await withUpstream(s.relay);
     return { ...s, ...(a === undefined ? {} : { autoStart: a }), job: jobs.current(), bundles: jobs.bundles(), bundleNames: Object.fromEntries(VARIANTS.map((v) => [v, bundleName(v)])) };
   }
 

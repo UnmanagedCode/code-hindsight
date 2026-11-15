@@ -100,7 +100,7 @@ export function createRelayTunnel({ key, onSocket, idleTarget = 4, retryMs = 1_0
       if (target && target.host === host && target.port === port) return;
       stop();
       target = { host, port };
-      log(`ollama tunnel: dialling ${host}:${port}`);
+      log(`relay tunnel: dialling ${host}:${port}`);
       fill();
     },
     stop,

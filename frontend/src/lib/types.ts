@@ -47,13 +47,14 @@ export interface Job {
   tail?: string;
 }
 
-/** The Ollama link while the API's LLM goes through the relay (docs/protocol.md → /-/api/status). */
-export interface OllamaStatus {
-  daemonUrl: string;
+/** The relay while the API's LLM goes through it: cc's Ollama daemon, or a loopback cc backend (docs/protocol.md → /-/api/status). */
+export interface RelayStatus {
+  target: { kind: 'ollama' | 'anthropic-loopback'; url: string } | null;
   tunnel: { state: 'connected' | 'connecting' | 'stopped'; idle: number; error: string | null; address: string | null };
   lastForward: { at: string; path: string; status: number | null; error: string | null } | null;
-  daemon: { ok: boolean; version: string | null; error: string | null; at: string };
-  /** Catalog errors to show as warnings (a silent daemon, a relay the plugin cannot reach). */
+  /** The target's answer, null with no target. */
+  upstream: { ok: boolean; version: string | null; error: string | null; at: string } | null;
+  /** Catalog errors to show as warnings (a silent target, a relay the plugin cannot reach). */
   problems: CatalogError[];
 }
 
@@ -74,8 +75,8 @@ export interface Status {
   /** A previous backend could not stop the containers on SIGTERM. */
   lastShutdownFailure: { at: string; error: string } | null;
   llmMode: string;
-  /** Null unless the LLM is linked to cc's Ollama backend. */
-  ollama: OllamaStatus | null;
+  /** Null unless the LLM is linked to a backend reached through the relay. */
+  relay: RelayStatus | null;
   autoStart?: boolean;
   job: Job | null;
   bundles: { name: string; size: number }[];
@@ -112,6 +113,10 @@ export interface CcBackend {
   /** `ollama`: cc's Ollama daemon, reached through the relay. */
   kind: 'anthropic' | 'ollama' | null;
   host: string | null;
+  /** A plain-HTTP loopback endpoint in cc's container, reached through the relay. */
+  loopback: boolean;
+  /** Anthropic rows: the row names no concrete model, so any id may be typed. */
+  freeModel?: boolean;
   usable: boolean;
   refusal: string | null;
   /** Ollama rows only. */

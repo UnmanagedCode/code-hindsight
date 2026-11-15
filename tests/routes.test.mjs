@@ -294,7 +294,7 @@ test('OL6: with the daemon down the route still answers, daemon unreachable and 
 });
 
 // OL10 (+ status shape): linked status shows the daemon and problems, and no route returns the relay key.
-test('OL10: with an Ollama link, status carries daemon and relay state and no route returns the relay key', async (t) => {
+test('OL10: with an Ollama link, status carries relay state with the daemon answer and no route returns the relay key', async (t) => {
   const { fake, cc } = await ollamaWorld(t);
   const llm = { mode: 'cc-backend', provider: null, model: 'qwen3:4b', baseUrl: null, backendId: 'ollama', maxConcurrent: 1 };
   const { url, app } = await boot(t, { cc, ollamaUrl: fake.url, settings: { llm }, probe: async () => 200, cpSession: { token: async () => 't', clear() {} } });
@@ -303,11 +303,11 @@ test('OL10: with an Ollama link, status carries daemon and relay state and no ro
   assert.ok(key.length >= 32);
   const st = await (await fetch(`${url}/-/api/status`)).json();
   assert.equal(st.state, 'ready', JSON.stringify(st.error));
-  assert.equal(st.ollama.daemonUrl, fake.url);
-  assert.deepEqual([st.ollama.daemon.ok, st.ollama.daemon.version], [true, '0.40.13']);
+  assert.equal(st.relay.target.url, fake.url);
+  assert.deepEqual([st.relay.upstream.ok, st.relay.upstream.version], [true, '0.40.13']);
   assert.equal(st.containers.relay.state, 'running');
   // Nothing listens at the fake docker's bind address: the tunnel cannot connect, and says so.
-  assert.deepEqual(st.ollama.problems.map((p) => p.code), ['RELAY_DISCONNECTED']);
+  assert.deepEqual(st.relay.problems.map((p) => p.code), ['RELAY_DISCONNECTED']);
 
   const bodies = [];
   for (const p of ['/-/api/settings', '/-/api/status', '/-/api/status?refresh=1', '/-/api/cc-backends', '/-/api/jobs', '/-/api/logs/relay']) bodies.push(await (await fetch(url + p)).text());
@@ -323,20 +323,87 @@ test('OL10: a down daemon is a status problem, not an error state', async (t) =>
   t.after(() => app.supervisor.stop());
   const st = await (await fetch(`${url}/-/api/status`)).json();
   assert.equal(st.state, 'ready');
-  assert.equal(st.ollama.daemon.ok, false);
-  assert.ok(st.ollama.problems.some((p) => p.code === 'OLLAMA_UNREACHABLE'));
+  assert.equal(st.relay.upstream.ok, false);
+  assert.ok(st.relay.problems.some((p) => p.code === 'OLLAMA_UNREACHABLE'));
 });
 
 // C-3: RELAY_DISCONNECTED needs a real tunnel failure; no idle connection yet (a burst) is not one.
 test('C-3: a connecting tunnel without an error shows no relay warning; with an error it does', async (t) => {
   const { fake, cc } = await ollamaWorld(t);
   let tunnel = { state: 'connecting', idle: 0, error: null, address: '127.0.0.1:18434' };
-  const relay = { start() {}, stop() {}, status: () => ({ daemonUrl: fake.url, tunnel, lastForward: null }) };
+  const relay = { start() {}, stop() {}, status: () => ({ target: { kind: 'ollama', url: fake.url }, tunnel, lastForward: null }) };
   const llm = { mode: 'cc-backend', provider: null, model: 'qwen3:4b', baseUrl: null, backendId: 'ollama', maxConcurrent: null };
   const { url, app } = await boot(t, { cc, ollamaUrl: fake.url, settings: { llm }, probe: async () => 200, cpSession: { token: async () => 't', clear() {} }, relay });
   t.after(() => app.supervisor.stop());
-  const problems = async () => (await (await fetch(`${url}/-/api/status`)).json()).ollama.problems.map((p) => p.code);
+  const problems = async () => (await (await fetch(`${url}/-/api/status`)).json()).relay.problems.map((p) => p.code);
   assert.deepEqual(await problems(), []);
   tunnel = { ...tunnel, error: 'ECONNREFUSED' };
   assert.deepEqual(await problems(), ['RELAY_DISCONNECTED']);
+});
+
+// LB13: with a loopback link status names the target and its answer, an outage is a warning, and no route returns the token or the relay key.
+test('LB13: a loopback link shows the relay target, a down endpoint is a CC_BACKEND_UNREACHABLE problem, and no route leaks the token or relay key', async (t) => {
+  const { startFakeAnthropic } = await import('./support/fakeAnthropic.mjs');
+  const fake = await startFakeAnthropic(t);
+  const TOKEN = 'ROW-TOKEN-LB13';
+  const ccServer = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/api/settings/models') {
+      return res.end(JSON.stringify({ backends: [{ id: 'opencode', label: 'OpenCode', template: 'claude', env: [{ key: 'ANTHROPIC_BASE_URL', value: fake.url }, { key: 'ANTHROPIC_AUTH_TOKEN', value: TOKEN }] }], backendModels: { opencode: [{ model: 'opencode-go/glm-5', label: 'GLM 5' }] } }));
+    }
+    res.statusCode = 404; return res.end('{}');
+  });
+  await new Promise((r) => ccServer.listen(0, '127.0.0.1', r));
+  t.after(() => ccServer.close());
+  const llm = { mode: 'cc-backend', provider: null, model: 'opencode-go/glm-5', baseUrl: null, backendId: 'opencode', maxConcurrent: null };
+  const { url, app } = await boot(t, { cc: `http://127.0.0.1:${ccServer.address().port}`, settings: { llm }, probe: async () => 200, cpSession: { token: async () => 't', clear() {} } });
+  t.after(() => app.supervisor.stop());
+  const st = await (await fetch(`${url}/-/api/status`)).json();
+  assert.equal(st.state, 'ready', JSON.stringify(st.error));
+  assert.deepEqual(st.relay.target, { kind: 'anthropic-loopback', url: fake.url });
+  assert.equal(st.relay.upstream.ok, true);
+  const bodies = [];
+  for (const p of ['/-/api/settings', '/-/api/status', '/-/api/status?refresh=1', '/-/api/cc-backends', '/-/api/jobs', '/-/api/logs/relay']) bodies.push(await (await fetch(url + p)).text());
+  const key = app.secrets.get().relayKey;
+  for (const b of bodies) { assert.equal(b.includes(TOKEN), false, 'token leaked'); assert.equal(b.includes(key), false, 'relay key leaked'); }
+});
+
+test('LB13: a loopback endpoint that is down is a CC_BACKEND_UNREACHABLE status problem, not an error state', async (t) => {
+  const ccServer = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/api/settings/models') return res.end(JSON.stringify({ backends: [{ id: 'o', template: 'claude', env: [{ key: 'ANTHROPIC_BASE_URL', value: 'http://127.0.0.1:1' }, { key: 'ANTHROPIC_AUTH_TOKEN', value: 't' }] }] }));
+    res.statusCode = 404; return res.end('{}');
+  });
+  await new Promise((r) => ccServer.listen(0, '127.0.0.1', r));
+  t.after(() => ccServer.close());
+  const llm = { mode: 'cc-backend', provider: null, model: 'm', baseUrl: null, backendId: 'o', maxConcurrent: null };
+  const { url, app } = await boot(t, { cc: `http://127.0.0.1:${ccServer.address().port}`, settings: { llm }, probe: async () => 200, cpSession: { token: async () => 't', clear() {} } });
+  t.after(() => app.supervisor.stop());
+  const st = await (await fetch(`${url}/-/api/status`)).json();
+  assert.equal(st.state, 'ready');
+  assert.equal(st.relay.upstream.ok, false);
+  assert.ok(st.relay.problems.some((p) => p.code === 'CC_BACKEND_UNREACHABLE'));
+});
+
+// LB13b: a row URL with userinfo and a query is probed, and nothing the plugin serves carries the credential.
+test('LB13b: a userinfo/query loopback row URL answers in status and no route body contains its credential', async (t) => {
+  const { startFakeAnthropic } = await import('./support/fakeAnthropic.mjs');
+  const fake = await startFakeAnthropic(t);
+  const base = `${fake.url.replace('http://', 'http://user:pw-Zq81@')}/?key=pw-Zq81`;
+  const ccServer = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/api/settings/models') return res.end(JSON.stringify({ backends: [{ id: 'o', template: 'claude', env: [{ key: 'ANTHROPIC_BASE_URL', value: base }, { key: 'ANTHROPIC_AUTH_TOKEN', value: 't' }] }] }));
+    res.statusCode = 404; return res.end('{}');
+  });
+  await new Promise((r) => ccServer.listen(0, '127.0.0.1', r));
+  t.after(() => ccServer.close());
+  const llm = { mode: 'cc-backend', provider: null, model: 'm', baseUrl: null, backendId: 'o', maxConcurrent: null };
+  const { url, app } = await boot(t, { cc: `http://127.0.0.1:${ccServer.address().port}`, settings: { llm }, probe: async () => 200, cpSession: { token: async () => 't', clear() {} } });
+  t.after(() => app.supervisor.stop());
+  const st = await (await fetch(`${url}/-/api/status`)).json();
+  assert.equal(st.relay.upstream.ok, true, JSON.stringify(st.relay));
+  assert.ok(!st.relay.problems.some((p) => p.code === 'CC_BACKEND_UNREACHABLE'));
+  for (const p of ['/-/api/settings', '/-/api/status', '/-/api/status?refresh=1', '/-/api/cc-backends', '/-/api/jobs', '/-/api/logs/relay']) {
+    assert.equal((await (await fetch(url + p)).text()).includes('pw-Zq81'), false, p);
+  }
 });

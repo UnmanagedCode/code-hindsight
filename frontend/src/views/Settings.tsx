@@ -36,6 +36,7 @@ function KeyField({ id, label, isSet, value, clear, onValue, onClear, error }: {
 }
 
 const nul = (s: string) => (s.trim() === '' ? null : s.trim());
+const OTHER_MODEL = '__other__';
 
 export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onApply: () => void; busy: boolean }) {
   const [view, setView] = useState<SettingsView | null>(null);
@@ -47,6 +48,7 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
   const [saving, setSaving] = useState(false);
   const [backends, setBackends] = useState<CcBackend[] | null>(null);
   const [backendsError, setBackendsError] = useState<string | null>(null);
+  const [otherModel, setOtherModel] = useState(false);
 
   useEffect(() => {
     api<SettingsView>('-/api/settings').then((v) => { setView(v); setForm(v.settings); }, (e) => setMessage(String(e.message ?? e)));
@@ -99,6 +101,9 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
 
   const backend = backends?.find((b) => b.id === form.llm.backendId);
   const chosen = backend?.models.find((m) => m.model === form.llm.model);
+  const listed = !!chosen;
+  // A free-text model id: picked through "Other…", or saved earlier and not in the list.
+  const showOther = !!backend?.freeModel && backend.models.length > 0 && (otherModel || (!!form.llm.model && !listed));
   return (
     <form className="space-y-4" onSubmit={(e) => { e.preventDefault(); void save(true); }}>
       <Card>
@@ -122,7 +127,7 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
       <Card>
         <CardHeader>
           <CardTitle>Network</CardTitle>
-          <CardDescription>The API and control-plane ports are published on one host address and both need a key. With an Ollama backend, the relay port is published there too and also needs a key.</CardDescription>
+          <CardDescription>The API and control-plane ports are published on one host address and both need a key. With an Ollama or loopback backend, the relay port is published there too and also needs a key.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 sm:grid-cols-4">
           <Field id="network.bindAddress" label="Bind address" error={err('network.bindAddress')} hint={`Empty = automatic (${view.detectedBindAddress})`}>
@@ -134,7 +139,7 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
           <Field id="network.cpPort" label="Control-plane port" error={err('network.cpPort')}>
             <Input id="network.cpPort" type="number" value={form.network.cpPort} onChange={(e) => set('network', { cpPort: Number(e.target.value) })} />
           </Field>
-          <Field id="network.relayPort" label="Relay port" error={err('network.relayPort')} hint="Used only with an Ollama backend">
+          <Field id="network.relayPort" label="Relay port" error={err('network.relayPort')} hint="Used only with an Ollama or loopback backend">
             <Input id="network.relayPort" type="number" value={form.network.relayPort} onChange={(e) => set('network', { relayPort: Number(e.target.value) })} />
           </Field>
         </CardContent>
@@ -172,11 +177,11 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
             <div className="grid gap-3 sm:grid-cols-2">
               <Field id="llm.backendId" label="cc backend" error={err('llm.backendId')} hint="Its URL and token are read from cc each time the container is created; they are not stored here.">
                 {backendsError ? <p className="text-sm text-destructive">{backendsError}</p> : !backends ? <LoaderCircleIcon className="size-4 animate-spin" /> : (
-                  <NativeSelect id="llm.backendId" value={form.llm.backendId ?? ''} onChange={(e) => set('llm', { backendId: nul(e.target.value), model: null })}>
+                  <NativeSelect id="llm.backendId" value={form.llm.backendId ?? ''} onChange={(e) => { setOtherModel(false); set('llm', { backendId: nul(e.target.value), model: null }); }}>
                     <option value="">Choose…</option>
                     {backends.map((b) => (
                       <option key={b.id} value={b.id} disabled={!b.usable}>
-                        {b.label}{b.kind === 'ollama' ? ' (cc\'s Ollama daemon, via relay)' : b.host ? ` (${b.host})` : ''}{b.usable ? '' : b.refusal === 'CC_BACKEND_LOOPBACK' ? ' — loopback, unreachable from a container' : ' — no Anthropic URL and token'}
+                        {b.label}{b.kind === 'ollama' ? ' (cc\'s Ollama daemon, via relay)' : b.loopback ? ` (${b.host}${b.usable ? ', via relay' : ''})` : b.host ? ` (${b.host})` : ''}{b.usable ? '' : b.refusal === 'CC_BACKEND_LOOPBACK' ? ' — loopback over https, not relayed' : ' — no Anthropic URL and token'}
                       </option>
                     ))}
                   </NativeSelect>
@@ -184,7 +189,11 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
               </Field>
               <Field id="llm.model" label="Model" error={err('llm.model')}>
                 {backend && backend.models.length > 0 ? (
-                  <NativeSelect id="llm.model" value={form.llm.model ?? ''} onChange={(e) => set('llm', { model: nul(e.target.value) })}>
+                  <NativeSelect id="llm.model" value={showOther ? OTHER_MODEL : form.llm.model ?? ''} onChange={(e) => {
+                    const other = e.target.value === OTHER_MODEL;
+                    setOtherModel(other);
+                    set('llm', { model: other ? (listed ? null : form.llm.model) : nul(e.target.value) });
+                  }}>
                     <option value="">Choose…</option>
                     {backend.kind === 'ollama' ? (
                       (['cc', 'daemon'] as const).map((source) => {
@@ -196,11 +205,22 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
                         );
                       })
                     ) : backend.models.map((m) => <option key={m.model} value={m.model}>{m.label}</option>)}
+                    {backend.freeModel && <option value={OTHER_MODEL}>Other… (type a model id)</option>}
                   </NativeSelect>
                 ) : (
                   <Input id="llm.model" value={form.llm.model ?? ''} onChange={(e) => set('llm', { model: nul(e.target.value) })} />
                 )}
               </Field>
+              {showOther && (
+                <Field id="llm.modelOther" label="Model id" hint="Sent to the backend as written">
+                  <Input id="llm.modelOther" value={form.llm.model ?? ''} onChange={(e) => set('llm', { model: nul(e.target.value) })} />
+                </Field>
+              )}
+              {backend?.loopback && backend.usable && (
+                <p className="text-xs text-destructive sm:col-span-2" role="alert" data-hint="loopback-route">
+                  This backend is a local endpoint in cc's container ({backend.host}). Retained, imported and recall text goes wherever it routes it, possibly a cloud provider under its own account.
+                </p>
+              )}
               {backend?.kind === 'ollama' && (
                 <div className="space-y-1 text-xs sm:col-span-2" data-hint="ollama">
                   {backend.daemon && !backend.daemon.reachable && (

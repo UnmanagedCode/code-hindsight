@@ -183,4 +183,61 @@ describe('Settings', () => {
     await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
     expect(putBody(calls).settings.network.relayPort).toBe(20000);
   });
+
+  // LB14 (UI): a loopback row is selectable and says it goes through the relay; choosing it warns where text goes; a free-model row takes a typed id; https loopback stays disabled.
+  const loopbackWorld = (model: string | null) => {
+    const view = settingsView();
+    view.settings.llm = { mode: 'cc-backend', provider: null, model, baseUrl: null, backendId: 'opencode', maxConcurrent: null };
+    const backends = [
+      { id: 'opencode', label: 'OpenCode', kind: 'anthropic', host: '127.0.0.1', loopback: true, freeModel: true, usable: true, refusal: null, models: [{ model: 'opencode-go/glm-5', label: 'GLM 5' }] },
+      { id: 'codex', label: 'Codex', kind: 'anthropic', host: '127.0.0.1', loopback: true, freeModel: false, usable: true, refusal: null, models: [{ model: 'gpt-5.6-luna', label: 'Luna' }] },
+      { id: 'tls', label: 'TLS', kind: 'anthropic', host: '127.0.0.1', loopback: true, usable: false, refusal: 'CC_BACKEND_LOOPBACK', models: [] },
+    ];
+    return stubFetch((url, init) => {
+      if (url === '-/api/settings') return { body: init ? { ...view } : view };
+      if (url === '-/api/cc-backends') return { body: { backends } };
+      return undefined;
+    });
+  };
+
+  it('LB14: lists a loopback row as via relay, and refuses https loopback with its reason', async () => {
+    loopbackWorld(null);
+    render(<Settings onSaved={() => {}} onApply={() => {}} busy={false} />);
+    const select = (await screen.findByLabelText('cc backend')) as HTMLSelectElement;
+    const option = (id: string) => [...select.options].find((o) => o.value === id)!;
+    expect(option('opencode').disabled).toBe(false);
+    expect(option('opencode').textContent).toMatch(/127\.0\.0\.1, via relay/);
+    expect(option('tls').disabled).toBe(true);
+    expect(option('tls').textContent).toMatch(/loopback over https, not relayed/);
+    expect(option('tls').textContent).not.toMatch(/via relay/);
+  });
+
+  it('LB14: choosing a loopback row shows the privacy alert', async () => {
+    loopbackWorld('opencode-go/glm-5');
+    render(<Settings onSaved={() => {}} onApply={() => {}} busy={false} />);
+    await waitFor(() => expect(document.querySelector('[data-hint="loopback-route"]')?.textContent).toMatch(/local endpoint in cc's container .*goes wherever it routes it/));
+    expect(document.querySelector('[data-hint="loopback-route"]')?.getAttribute('role')).toBe('alert');
+  });
+
+  it('LB14: a free-model row offers Other… and reveals a text input whose value is saved', async () => {
+    const calls = loopbackWorld('opencode-go/glm-5');
+    render(<Settings onSaved={() => {}} onApply={() => {}} busy={false} />);
+    const other = await screen.findByRole('option', { name: /Other…/ }); // the picker is up once cc's backends have loaded
+    expect(screen.queryByLabelText('Model id')).toBeNull();
+    await userEvent.selectOptions(screen.getByLabelText('Model'), other);
+    const typed = await screen.findByLabelText('Model id');
+    await userEvent.type(typed, 'my/model');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    expect(putBody(calls).settings.llm.model).toBe('my/model');
+  });
+
+  it('LB14: a row that names its models offers no Other…', async () => {
+    loopbackWorld(null);
+    render(<Settings onSaved={() => {}} onApply={() => {}} busy={false} />);
+    const select = (await screen.findByLabelText('cc backend')) as HTMLSelectElement;
+    await userEvent.selectOptions(select, 'codex');
+    expect(await screen.findByRole('option', { name: 'Luna' })).toBeTruthy();
+    expect(screen.queryByRole('option', { name: /Other…/ })).toBeNull();
+  });
 });

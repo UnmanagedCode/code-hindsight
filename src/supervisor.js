@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { API_IMAGES, BASE_PATH, CP_IMAGE, LABELS, UPSTREAM_REVISION } from './pins.js';
+import { API_IMAGES, BASE_PATH, CP_IMAGE, LABELS, RELAY_TARGETS, UPSTREAM_REVISION } from './pins.js';
 import { isPinnedApiImage } from './trust.js';
 import { AppError, describeError, toAppError } from './errors.js';
 import { validateSettings, embeddingsFingerprint, containerSettingsHash } from './settings.js';
@@ -63,7 +63,7 @@ function pidAlive(pid) {
  * @param {() => string} o.detectBind the automatic bind address
  * @param {() => Promise<unknown>} o.fetchCcModels
  * @param {{token(): Promise<string>, clear(): void}} o.cpSession
- * @param {{start(target: {host: string, port: number}): void, stop(): void, status(): object}} o.relay the plugin's side of the relay tunnel
+ * @param {{start(addr: {host: string, port: number}, target: object): void, stop(): void, status(): object}} o.relay the plugin's side of the relay: the tunnel, and the target it serves (what composeLlmEnv returns as `relay`)
  * @param {(url: string) => Promise<number>} [o.probe]
  * @param {{now(): number, sleep(ms: number): Promise<void>}} [o.clock]
  * @param {Partial<typeof DEFAULT_TIMEOUTS>} [o.timeouts]
@@ -87,8 +87,8 @@ export function createSupervisor({
   let appliedKey = null;
   let images = null;
   let containers = null;
-  /** Whether the running API's LLM goes through the relay. */
-  let ollamaLinked = false;
+  /** Whether the running API's LLM goes through the relay (an Ollama or a loopback cc backend). */
+  let relayLinked = false;
   let wantRunning = false;
   let generation = 0;
   let queue = Promise.resolve();
@@ -253,19 +253,21 @@ export function createSupervisor({
 
     set('starting');
     const secrets = secretsStore.get();
-    const { env: llmEnv, relay: needsRelay } = await composeLlmEnv(settings, secrets, { fetchCcModels });
+    const { env: llmEnv, relay: relayTarget } = await composeLlmEnv(settings, secrets, { fetchCcModels });
     // A start cancelled while the LLM env was read must not bring the tunnel up.
     checkCancelled(gen);
-    if (needsRelay) {
-      // The relay first: the API's LLM client resolves `ollama` on the private network.
-      await adoptOrCreate(relaySpec({ names, image: { id: api.Id }, bind, port: ports.relay, key: secrets.relayKey, owner }), api.Id, 'relayPort');
+    if (relayTarget) {
+      // The relay first: the API's LLM client resolves the target's alias on the private network.
+      await adoptOrCreate(relaySpec({ names, image: { id: api.Id }, bind, port: ports.relay, key: secrets.relayKey, owner, target: RELAY_TARGETS[relayTarget.kind] }), api.Id, 'relayPort');
       checkCancelled(gen);
-      relay.start({ host: bind, port: ports.relay });
+      relay.start({ host: bind, port: ports.relay }, relayTarget);
+      relayStarted = true;
     } else {
       relay.stop();
+      relayLinked = false; // before the removal can throw: status must not show a relay that is no longer served
       await removeOwnedRelay();
     }
-    ollamaLinked = needsRelay;
+    relayLinked = relayTarget !== null;
     const apiS = apiSpec({ names, image: { id: api.Id }, variant: settings.variant, bind, port: ports.api, apiKey: secrets.apiKey, llmEnv, embeddingsEnv: embeddingsEnv(settings, secrets), owner });
     await adoptOrCreate(apiS, api.Id, 'apiPort');
     const cpS = cpSpec({ names, image: { id: cp.Id }, bind, port: ports.cp, apiKey: secrets.apiKey, accessKey: secrets.cpAccessKey, owner });
@@ -286,8 +288,12 @@ export function createSupervisor({
     startWatch();
   }
 
+  /** Whether the current start attempt reached `relay.start`: only then is the relay this attempt's to undo. */
+  let relayStarted = false;
+
   async function runBringUp() {
     const gen = ++generation;
+    relayStarted = false;
     stopWatch();
     try {
       await bringUp(gen);
@@ -295,8 +301,15 @@ export function createSupervisor({
       if (e instanceof Cancelled) {
         // stop()/restart() ended this start: whatever it began with the tunnel ends with it.
         relay.stop();
-        ollamaLinked = false;
+        relayLinked = false;
         return;
+      }
+      // A failure before the relay step touches nothing: the previous tunnel keeps serving the running API.
+      // A failure after it ends what this attempt began, so no tunnel, token or relay container outlives it.
+      if (relayStarted) {
+        relay.stop();
+        relayLinked = false;
+        try { await removeOwnedRelay(); } catch (re) { log(`removing the relay after a failed start: ${re?.message ?? re}`); }
       }
       const err = toAppError(e, 'DOCKER_FAILED', { command: 'start' });
       if (!(e instanceof AppError)) log(`start failed: ${e?.stack ?? e}`);
@@ -325,7 +338,7 @@ export function createSupervisor({
     const gen = generation;
     if ((await probe(`http://${bind}:${ports.api}/health`)) === 200) {
       watchFailures = 0;
-      const sideCrash = (await crashedOrNull('cp', names.cp)) ?? (ollamaLinked ? await crashedOrNull('relay', names.relay) : null);
+      const sideCrash = (await crashedOrNull('cp', names.cp)) ?? (relayLinked ? await crashedOrNull('relay', names.relay) : null);
       if (sideCrash && gen === generation) { stopWatch(); set('error', sideCrash.toJSON()); }
       return;
     }
@@ -347,7 +360,7 @@ export function createSupervisor({
    * `docker stop` of a missing name only errors for that name.
    */
   async function relayMayRun() {
-    if (ollamaLinked) return true;
+    if (relayLinked) return true;
     if (!docker.info().mode) return false;
     try {
       const r = await docker.exec(['container', 'inspect', names.relay], { check: false, timeoutMs: T.shutdownProbeMs });
@@ -381,7 +394,7 @@ export function createSupervisor({
       generation++;
       stopWatch();
       relay.stop();
-      ollamaLinked = false;
+      relayLinked = false;
       return serial(async () => {
         set('stopping');
         try {
@@ -402,7 +415,7 @@ export function createSupervisor({
       generation++;
       stopWatch();
       relay.stop();
-      ollamaLinked = false;
+      relayLinked = false;
       return serial(async () => {
         try {
           await docker.resolve();
@@ -478,7 +491,7 @@ export function createSupervisor({
         volume: names.volume,
         lastShutdownFailure,
         llmMode: settings.llm.mode,
-        ollama: ollamaLinked ? relay.status() : null,
+        relay: relayLinked ? relay.status() : null,
       };
     },
 
