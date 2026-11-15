@@ -1,25 +1,27 @@
 import { useCallback, useEffect, useState } from 'react';
-import { ArrowDownIcon, ArrowUpIcon, PlusIcon, Trash2Icon, XIcon } from 'lucide-react';
+import { ArrowDownIcon, ArrowUpIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon, Trash2Icon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
-import { CcPicker } from '@/components/CcPicker';
+import { NameListInput } from '@/components/NameListInput';
 import { Backfill } from '@/views/Backfill';
 import { api, ApiError, send } from '@/lib/api';
 import type { ActivityEntry, CcProjectsView, FieldError, Scope, ScopesView, StagesView, Status } from '@/lib/types';
 
 const ACTIVITY_POLL_MS = 5000;
 const PREVIEW_DELAY_MS = 250;
+const CONDUCTOR_PROJECT = '.conduct';
 const KINDS = ['conductor', 'worker'] as const;
 const ACTIONS = ['recall', 'retain'] as const;
 
-/** A scope as edited: lists the user types are plain text until saved. */
+/** A scope as edited. `open` is UI-only (never sent): whether the card shows its fields. */
 interface ScopeForm {
   key: number;
+  open: boolean;
   name: string;
-  projects: string;
+  projects: string[];
   workspaces: string[];
   sessions: Record<(typeof KINDS)[number], boolean>;
   stages: string[];
@@ -29,12 +31,13 @@ interface ScopeForm {
 
 let nextKey = 1;
 
-function toForm(s: Scope): ScopeForm {
+function toForm(s: Scope, open = false): ScopeForm {
   const kinds = s.match.sessions;
   return {
     key: nextKey++,
+    open,
     name: s.name,
-    projects: (s.match.projects ?? []).join('\n'),
+    projects: s.match.projects ?? [],
     workspaces: s.match.workspaces ?? [],
     sessions: { conductor: !kinds || kinds.includes('conductor'), worker: !kinds || kinds.includes('worker') },
     stages: s.match.stages ?? [],
@@ -43,18 +46,10 @@ function toForm(s: Scope): ScopeForm {
   };
 }
 
-/** The project lines with `name` appended as a new line, unless it is already one; typed lines are kept. */
-function addProjectLine(text: string, name: string): string {
-  if (text.split('\n').some((l) => l.trim() === name)) return text;
-  const kept = text.replace(/\s+$/, '');
-  return kept ? `${kept}\n${name}` : name;
-}
-
 /** Both kinds ticked means "any": the key is omitted, never sent as an empty list. */
 function toScope(f: ScopeForm): Scope {
   const match: Scope['match'] = {};
-  const projects = f.projects.split('\n').map((l) => l.trim()).filter(Boolean);
-  if (projects.length) match.projects = projects;
+  if (f.projects.length) match.projects = f.projects;
   if (f.workspaces.length) match.workspaces = f.workspaces;
   const kinds = KINDS.filter((k) => f.sessions[k]);
   if (kinds.length === 1) match.sessions = [...kinds];
@@ -63,7 +58,7 @@ function toScope(f: ScopeForm): Scope {
 }
 
 function blankScope(n: number): ScopeForm {
-  return toForm({ name: `scope ${n}`, match: {}, bank: 'cc-{project}', actions: ['recall', 'retain'] });
+  return toForm({ name: `scope ${n}`, match: {}, bank: 'cc-{project}', actions: ['recall', 'retain'] }, true);
 }
 
 function FieldMsg({ errors, field }: { errors: FieldError[]; field: string }) {
@@ -85,36 +80,24 @@ function BankPreview({ template }: { template: string }) {
     : <p className="text-xs text-muted-foreground">Preview for project “example”, main checkout, worker: <code>{preview.bank}</code></p>;
 }
 
-/** Chips for a list of names, a free-text entry, and an "unknown to cc" marker for a literal name cc does not list. */
-function NameListEditor({ id, noun, values, known, knownError, emptyText, unknownTitle, placeholder, onChange }: {
-  id: string; noun: string; values: string[]; known: string[] | null; knownError: boolean; emptyText: string; unknownTitle: string; placeholder: string; onChange: (v: string[]) => void;
-}) {
-  const [draft, setDraft] = useState('');
-  const add = () => {
-    const v = draft.trim();
-    if (v && !values.includes(v)) onChange([...values, v]);
-    setDraft('');
-  };
-  return (
-    <div className="space-y-1">
-      <div className="flex flex-wrap gap-1">
-        {values.map((v) => (
-          <Badge key={v} variant="secondary" className="gap-1" {...{ [`data-${noun}`]: v }}>
-            {v}
-            {known && !/[*?]/.test(v) && !known.includes(v) && <span className="text-warning" title={unknownTitle}>unknown to cc</span>}
-            <button type="button" aria-label={`Remove ${noun} ${v}`} onClick={() => onChange(values.filter((x) => x !== v))}><XIcon className="size-3" /></button>
-          </Badge>
-        ))}
-        {values.length === 0 && <span className="text-xs text-muted-foreground">{emptyText}</span>}
-      </div>
-      <div className="flex gap-2">
-        <Input id={id} list={`${id}-known`} value={draft} placeholder={placeholder} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } }} />
-        <datalist id={`${id}-known`}>{(known ?? []).map((k) => <option key={k} value={k} />)}</datalist>
-        <Button type="button" size="sm" variant="outline" onClick={add}>Add {noun}</Button>
-      </div>
-      {knownError && <p className="text-xs text-warning">cc's {noun} names could not be read, so names are not checked.</p>}
-    </div>
-  );
+const SUMMARY_LIST_MAX = 2;
+
+/** "a, b +3": the first names of a list and how many more there are. */
+function briefList(list: string[]): string {
+  const extra = list.length - SUMMARY_LIST_MAX;
+  return list.slice(0, SUMMARY_LIST_MAX).join(', ') + (extra > 0 ? ` +${extra}` : '');
+}
+
+/** One line for a collapsed card: what the scope narrows to ("any session" when nothing), its bank and its actions. */
+function summarize(f: ScopeForm): string {
+  const narrowing = [
+    f.projects.length ? `projects ${briefList(f.projects)}` : null,
+    f.workspaces.length ? `workspaces ${briefList(f.workspaces)}` : null,
+    f.stages.length ? `stages ${briefList(f.stages)}` : null,
+    KINDS.every((k) => f.sessions[k]) ? null : `${KINDS.filter((k) => f.sessions[k]).join(', ')} only`,
+  ].filter((p): p is string => p !== null);
+  const actions = ACTIONS.filter((a) => f.actions[a]);
+  return [...(narrowing.length ? narrowing : ['any session']), `bank ${f.bank}`, actions.length ? actions.join(', ') : 'no actions'].join(' · ');
 }
 
 function Activity() {
@@ -169,18 +152,20 @@ export function Memory({ status }: { status: Status }) {
   const [ccProjects, setCcProjects] = useState<CcProjectsView | null>(null);
 
   useEffect(() => {
-    api<ScopesView>('-/api/scopes').then((v) => { setSaved(v.scopes); setForms(v.scopes.map(toForm)); }, (e) => setMessage(String(e.message ?? e)));
+    api<ScopesView>('-/api/scopes').then((v) => { setSaved(v.scopes); setForms(v.scopes.map((sc) => toForm(sc))); }, (e) => setMessage(String(e.message ?? e)));
     api<StagesView>('-/api/memory/stages').then(setStages, () => setStages({ stages: [], error: 'unreachable' }));
     api<CcProjectsView>('-/api/memory/cc-projects').then(setCcProjects, () => setCcProjects({ projects: [], workspaces: [], error: 'unreachable' }));
   }, []);
 
   if (saved === null) return <p className="text-sm text-muted-foreground">{message ?? 'Loading memory scopes…'}</p>;
 
-  const known = stages && !stages.error ? stages.stages.map((s) => s.name) : null;
+  /** Suggestions for each list field; null while loading or when cc could not be read (names are typed then). */
+  const stageItems = stages && !stages.error ? stages.stages.map((s) => ({ name: s.name, hint: s.playbooks.join(', ') })) : null;
   /** cc's projects and workspaces, or null while loading or when cc could not be read (names are typed then). */
   const cc = ccProjects && !ccProjects.error ? ccProjects : null;
-  const projectItems = (cc?.projects ?? []).map((p) => ({ name: p.name, hint: p.workspace ?? 'no workspace' }));
-  const workspaceItems = (cc?.workspaces ?? []).map((w) => ({ name: w.name, hint: `${w.projectCount} projects` }));
+  /** cc never lists `.conduct`, the project every conductor session runs in, so it is offered here and never flagged unknown. */
+  const projectItems = cc ? [{ name: CONDUCTOR_PROJECT, hint: 'conductor sessions' }, ...cc.projects.map((p) => ({ name: p.name, hint: p.workspace ?? 'no workspace' }))] : null;
+  const workspaceItems = cc ? cc.workspaces.map((w) => ({ name: w.name, hint: `${w.projectCount} projects` })) : null;
   const patch = (i: number, p: Partial<ScopeForm>) => setForms(forms.map((f, j) => (j === i ? { ...f, ...p } : f)));
   const move = (i: number, d: -1 | 1) => {
     const next = [...forms];
@@ -195,11 +180,16 @@ export function Memory({ status }: { status: Status }) {
     try {
       const r = await send<{ scopes: Scope[] }>('-/api/scopes', 'PUT', { scopes: forms.map(toScope) });
       setSaved(r.scopes);
-      setForms(r.scopes.map(toForm));
+      // The saved list has the sent order and length, so each card keeps its open state.
+      setForms((prev) => r.scopes.map((sc, i) => toForm(sc, prev[i]?.open ?? false)));
       setMessage(r.scopes.length ? 'Saved. Sessions started from now on use these scopes at their next prompt.' : 'Saved. Memory is off.');
     } catch (e) {
       if (e instanceof ApiError && e.code === 'SCOPES_INVALID') {
-        setErrors(((e.body as { params?: { fields?: FieldError[] } })?.params?.fields) ?? []);
+        const fields = ((e.body as { params?: { fields?: FieldError[] } })?.params?.fields) ?? [];
+        setErrors(fields);
+        // A refusal inside a collapsed card must not stay hidden.
+        const named = new Set(fields.map((x) => /^scopes\[(\d+)\]\./.exec(x.field)?.[1]).filter((n) => n !== undefined).map(Number));
+        setForms((prev) => prev.map((f, i) => (named.has(i) ? { ...f, open: true } : f)));
         setMessage('Some scopes are not valid.');
       } else setMessage(e instanceof Error ? e.message : String(e));
     } finally {
@@ -221,41 +211,52 @@ export function Memory({ status }: { status: Status }) {
         <CardHeader>
           <CardTitle>Scopes</CardTitle>
           <CardDescription>
-            Checked on every prompt, in this order. <strong>Recall</strong> reads every matching scope's bank (merged, at most four banks). <strong>Retain</strong> writes to the first matching scope that retains. A blank field matches anything; a conductor's project is <code>.conduct</code>. A session matches when its project matches a <strong>Projects</strong> line <em>or</em> is in one of the <strong>Workspaces</strong>, and Sessions and Stages match too. Placeholders: <code>{'{project}'}</code> <code>{'{worktree}'}</code> <code>{'{kind}'}</code>.
+            Checked on every prompt, in this order. <strong>Recall</strong> reads every matching scope's bank (merged, at most four banks). <strong>Retain</strong> writes to the first matching scope that retains. A blank field matches anything; a conductor's project is <code>.conduct</code>. A session matches when its project matches a <strong>Projects</strong> entry <em>or</em> is in one of the <strong>Workspaces</strong>, and Sessions and Stages match too. Placeholders: <code>{'{project}'}</code> <code>{'{worktree}'}</code> <code>{'{kind}'}</code>.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
           {forms.map((f, i) => {
             const p = `scopes[${i}]`;
             const id = `scope-${f.key}`;
+            const invalid = errors.some((x) => x.field.startsWith(`${p}.`));
             return (
               <div key={f.key} className="space-y-3 rounded-md border p-3" data-scope={i}>
-                <div className="flex items-end gap-2">
-                  <div className="flex-1 space-y-1">
-                    <Label htmlFor={`${id}-name`}>Name</Label>
-                    <Input id={`${id}-name`} value={f.name} onChange={(e) => patch(i, { name: e.target.value })} />
-                    <FieldMsg errors={errors} field={`${p}.name`} />
-                  </div>
+                <div className="flex items-center gap-2">
+                  <button type="button" aria-expanded={f.open} aria-controls={`${id}-body`} onClick={() => patch(i, { open: !f.open })} className="flex min-w-0 flex-1 items-center gap-2 rounded px-1 py-1 text-left hover:bg-accent">
+                    {f.open ? <ChevronDownIcon className="size-4 shrink-0" /> : <ChevronRightIcon className="size-4 shrink-0" />}
+                    <span className="shrink-0 text-sm font-medium">{f.name || 'unnamed scope'}</span>
+                    {invalid && <Badge variant="destructive">invalid</Badge>}
+                    <span className="truncate text-xs text-muted-foreground">{summarize(f)}</span>
+                  </button>
                   <Button type="button" size="icon" variant="outline" aria-label={`Move ${f.name} up`} disabled={i === 0} onClick={() => move(i, -1)}><ArrowUpIcon /></Button>
                   <Button type="button" size="icon" variant="outline" aria-label={`Move ${f.name} down`} disabled={i === forms.length - 1} onClick={() => move(i, 1)}><ArrowDownIcon /></Button>
                   <Button type="button" size="icon" variant="outline" aria-label={`Delete ${f.name}`} onClick={() => setForms(forms.filter((_, j) => j !== i))}><Trash2Icon /></Button>
                 </div>
+                {/* Kept mounted while collapsed so drafts and the bank preview survive toggling. */}
+                <div id={`${id}-body`} hidden={!f.open} className="space-y-3">
                 <div className="space-y-1">
-                  <Label htmlFor={`${id}-projects`}>Projects (one glob per line; * and ? allowed)</Label>
-                  <textarea id={`${id}-projects`} rows={2} className="w-full rounded-md border border-input bg-transparent px-3 py-1 font-mono text-sm" placeholder="any project" value={f.projects} onChange={(e) => patch(i, { projects: e.target.value })} />
-                  {cc && <CcPicker id={`${id}-projects`} noun="project" items={projectItems} picked={f.projects.split('\n').map((l) => l.trim())} onPick={(name) => patch(i, { projects: addProjectLine(f.projects, name) })} />}
+                  <Label htmlFor={`${id}-name`}>Name</Label>
+                  <Input id={`${id}-name`} value={f.name} onChange={(e) => patch(i, { name: e.target.value })} />
+                  <FieldMsg errors={errors} field={`${p}.name`} />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor={`${id}-projects`}>Projects (project names or globs; * and ? allowed)</Label>
+                  <NameListInput
+                    id={`${id}-projects`} noun="project" values={f.projects} suggestions={projectItems}
+                    emptyText="any project" unknownTitle="cc has no project with this name" placeholder="project name or glob"
+                    onChange={(v) => patch(i, { projects: v })}
+                  />
                   {ccProjects?.error && <p className="text-xs text-warning">cc's project and workspace lists could not be read; type the names.</p>}
                   <FieldMsg errors={errors} field={`${p}.match.projects`} />
                 </div>
                 <div className="space-y-1">
                   <Label htmlFor={`${id}-workspace`}>Workspaces (cc workspaces; * and ? allowed)</Label>
-                  <NameListEditor
-                    id={`${id}-workspace`} noun="workspace" values={f.workspaces} known={cc ? cc.workspaces.map((w) => w.name) : null} knownError={!!ccProjects?.error}
-                    emptyText="none: only the Projects lines decide" unknownTitle="cc has no workspace with this name" placeholder="workspace name or glob"
+                  <NameListInput
+                    id={`${id}-workspace`} noun="workspace" values={f.workspaces} suggestions={workspaceItems}
+                    emptyText="none: only the Projects entries decide" unknownTitle="cc has no workspace with this name" placeholder="workspace name or glob"
                     onChange={(w) => patch(i, { workspaces: w })}
                   />
-                  {cc && <CcPicker id={`${id}-workspaces`} noun="workspace" items={workspaceItems} picked={f.workspaces} onPick={(name) => { if (!f.workspaces.includes(name)) patch(i, { workspaces: [...f.workspaces, name] }); }} />}
-                  <p className="text-xs text-muted-foreground">Projects in these workspaces match in addition to the Projects lines, as cc reports membership when matching. A project in no workspace matches only through Projects.</p>
+                  <p className="text-xs text-muted-foreground">Projects in these workspaces match in addition to the Projects entries, as cc reports membership when matching. A project in no workspace matches only through Projects.</p>
                   <FieldMsg errors={errors} field={`${p}.match.workspaces`} />
                 </div>
                 <fieldset className="space-y-1">
@@ -271,11 +272,12 @@ export function Memory({ status }: { status: Status }) {
                 </fieldset>
                 <div className="space-y-1">
                   <Label htmlFor={`${id}-stage`}>Stages</Label>
-                  <NameListEditor
-                    id={`${id}-stage`} noun="stage" values={f.stages} known={known} knownError={!!stages?.error}
+                  <NameListInput
+                    id={`${id}-stage`} noun="stage" values={f.stages} suggestions={stageItems}
                     emptyText="any stage (including sessions without one)" unknownTitle="No cc playbook has a stage with this name" placeholder="stage name"
                     onChange={(s) => patch(i, { stages: s })}
                   />
+                  {stages?.error && <p className="text-xs text-warning">cc's stage names could not be read, so names are not checked.</p>}
                   <FieldMsg errors={errors} field={`${p}.match.stages`} />
                 </div>
                 <div className="space-y-1">
@@ -293,6 +295,7 @@ export function Memory({ status }: { status: Status }) {
                   ))}
                   <FieldMsg errors={errors} field={`${p}.actions`} />
                 </fieldset>
+                </div>
               </div>
             );
           })}
