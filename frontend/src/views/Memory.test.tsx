@@ -206,6 +206,17 @@ describe('Memory', () => {
     expect(document.getElementById(toggle.getAttribute('aria-controls')!)!.hidden).toBe(false);
   });
 
+  // cc's list_projects never lists the conductor's project, which scopes legitimately name.
+  it('never flags .conduct as unknown to cc, and offers it as a project suggestion', async () => {
+    stub({ scopes: [scope('a', { match: { projects: ['.conduct', 'gone'] } }), scope('b')] });
+    render(<Memory status={status()} />);
+    await expand('a');
+    await waitFor(() => expect(document.querySelector('[data-project="gone"]')?.textContent).toMatch(/unknown to cc/));
+    expect(document.querySelector('[data-project=".conduct"]')!.textContent).not.toMatch(/unknown to cc/);
+    await userEvent.type(within(await expand('b')).getByLabelText(/Projects/), '.con');
+    expect(screen.getByRole('option').textContent).toMatch(/^\.conduct/);
+  });
+
   // spec 1
   it('moves and deletes a scope while it is collapsed', async () => {
     const calls = stub({ scopes: [scope('alpha'), scope('beta')] });
@@ -293,7 +304,7 @@ describe('Memory', () => {
     render(<Memory status={status()} />);
     const card = within(await expand('a'));
     await userEvent.click(card.getByLabelText(/Projects/));
-    expect(card.getByRole('option').textContent).toBe(hostile + hostile);
+    expect(card.getAllByRole('option').map((o) => o.textContent)).toContain(hostile + hostile);
     await userEvent.click(card.getByLabelText(/Workspaces/));
     expect(card.getByRole('option').textContent).toBe(hostile + '1 projects');
     expect(document.querySelector('img')).toBeNull();

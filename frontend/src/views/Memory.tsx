@@ -12,6 +12,7 @@ import type { ActivityEntry, CcProjectsView, FieldError, Scope, ScopesView, Stag
 
 const ACTIVITY_POLL_MS = 5000;
 const PREVIEW_DELAY_MS = 250;
+const CONDUCTOR_PROJECT = '.conduct';
 const KINDS = ['conductor', 'worker'] as const;
 const ACTIONS = ['recall', 'retain'] as const;
 
@@ -162,7 +163,8 @@ export function Memory({ status }: { status: Status }) {
   const stageItems = stages && !stages.error ? stages.stages.map((s) => ({ name: s.name, hint: s.playbooks.join(', ') })) : null;
   /** cc's projects and workspaces, or null while loading or when cc could not be read (names are typed then). */
   const cc = ccProjects && !ccProjects.error ? ccProjects : null;
-  const projectItems = cc ? cc.projects.map((p) => ({ name: p.name, hint: p.workspace ?? 'no workspace' })) : null;
+  /** cc never lists `.conduct`, the project every conductor session runs in, so it is offered here and never flagged unknown. */
+  const projectItems = cc ? [{ name: CONDUCTOR_PROJECT, hint: 'conductor sessions' }, ...cc.projects.map((p) => ({ name: p.name, hint: p.workspace ?? 'no workspace' }))] : null;
   const workspaceItems = cc ? cc.workspaces.map((w) => ({ name: w.name, hint: `${w.projectCount} projects` })) : null;
   const patch = (i: number, p: Partial<ScopeForm>) => setForms(forms.map((f, j) => (j === i ? { ...f, ...p } : f)));
   const move = (i: number, d: -1 | 1) => {

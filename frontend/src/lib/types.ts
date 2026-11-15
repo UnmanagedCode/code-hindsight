@@ -140,7 +140,7 @@ export interface ScopesView {
 
 export interface StagesView { stages: { name: string; playbooks: string[] }[]; error: string | null }
 
-/** cc's projects (with the workspace each is in; null: none) and workspaces, for the scope pickers. */
+/** cc's projects (with the workspace each is in; null: none) and workspaces, for scope editor suggestions. */
 export interface CcProjectsView {
   projects: { name: string; workspace: string | null }[];
   workspaces: { name: string; projectCount: number }[];
