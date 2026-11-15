@@ -133,6 +133,10 @@ function anthropicModels(row, configured) {
  * followed by the daemon's own. A model is `cloud: false` only when the daemon lists it
  * without `remote_host`; anything else (cc's unpulled cloud models, an unreachable daemon)
  * counts as cloud.
+ * Every row has `loopback` (a plain-HTTP loopback endpoint, reached through the relay). An
+ * Anthropic row's `models` are cc's list with Claude Code's launch tag stripped, merged with the
+ * concrete `ANTHROPIC_DEFAULT_*_MODEL` ids (deduped, cc's label wins), and `freeModel` says the
+ * row names no concrete model, so any id may be typed.
  * @param {unknown} data cc's /api/settings/models
  * @param {{reachable: boolean, version: string|null, error: string|null, tags: {model: string, cloud: boolean}[]}|null} [daemon]
  */

@@ -209,6 +209,7 @@ describe('Settings', () => {
     expect(option('opencode').textContent).toMatch(/127\.0\.0\.1, via relay/);
     expect(option('tls').disabled).toBe(true);
     expect(option('tls').textContent).toMatch(/loopback over https, not relayed/);
+    expect(option('tls').textContent).not.toMatch(/via relay/);
   });
 
   it('LB14: choosing a loopback row shows the privacy alert', async () => {

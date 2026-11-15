@@ -23,7 +23,7 @@ const digest = (s) => crypto.createHash('sha256').update(s).digest();
  */
 export function createRelayProxy({ key, ollamaUrl, daemon, clock = { now: () => Date.now() }, fetchImpl = fetch }) {
   const keyDigest = digest(key);
-  /** The active target: `{kind, url, auth, allowed, keyHeader}` (auth is held here and nowhere else), or null. */
+  /** The active target: `{kind, url (credential-free), parsed (as written, for forwarding), auth, allowed, keyHeader}`; auth is held here and nowhere else. Or null. */
   let active = null;
   let lastForward = null;
   let probe = { at: -Infinity, value: null };
@@ -32,10 +32,11 @@ export function createRelayProxy({ key, ollamaUrl, daemon, clock = { now: () => 
   function setTarget(t) {
     probe = { at: -Infinity, value: null };
     if (!t) { active = null; return; }
+    if (!Object.hasOwn(RELAY_TARGETS, t.kind)) throw new Error(`unknown relay target kind: ${t.kind}`);
     const spec = RELAY_TARGETS[t.kind];
-    if (!spec) throw new Error(`unknown relay target kind: ${t.kind}`);
-    const url = t.kind === 'ollama' ? ollamaUrl : t.url;
-    active = { kind: t.kind, url, parsed: new URL(url), auth: t.auth ?? null, allowed: spec.allowed, keyHeader: spec.keyHeader };
+    const parsed = new URL(t.kind === 'ollama' ? ollamaUrl : t.url);
+    // What is shown, probed and put in an error: no userinfo, query or fragment (a row URL may carry a secret there).
+    active = { kind: t.kind, url: `${parsed.origin}${parsed.pathname === '/' ? '' : parsed.pathname}`, parsed, auth: t.auth ?? null, allowed: spec.allowed, keyHeader: spec.keyHeader };
   }
 
   const authorized = (t, headers) => {
@@ -138,7 +139,8 @@ export function createRelayProxy({ key, ollamaUrl, daemon, clock = { now: () => 
       try {
         value = await probeNow(t);
       } catch (e) {
-        value = { ok: false, version: null, error: e?.params?.detail ?? e?.cause?.code ?? e?.message ?? String(e) };
+        // Never a raw fetch message: it can quote the URL.
+        value = { ok: false, version: null, error: t.kind === 'ollama' ? (e?.params?.detail ?? e?.message ?? String(e)) : (e?.cause?.code ?? e?.name ?? 'unreachable') };
       }
       // A switch during the probe must not leave the old target's answer cached.
       if (active === t) probe = { at: clock.now(), value: { ...value, at: new Date(clock.now()).toISOString() } };

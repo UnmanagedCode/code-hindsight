@@ -739,6 +739,17 @@ test('LB12: the row token appears in no docker call and no container env', async
   assert.equal(JSON.stringify(dockerState(r).containers).includes(SENTINEL), false);
 });
 
+// LB11b: a start that fails after the relay began leaves no live target (the token leaves memory).
+test('LB11b: a failure after relay.start stops the relay, so no target stays active', async (t) => {
+  const rows = { backends: [loopRow()] };
+  const { sup, relay } = make(t, { settings: linkTo('opencode'), fetchCcModels: async () => rows, health: { api: 0, cp: 200 } });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'error');
+  assert.equal(relay.calls.filter((c) => c[0] === 'start').length, 1);
+  assert.deepEqual(relay.calls.at(-1), ['stop']);
+  assert.equal(sup.status().relay, null);
+});
+
 const stopArgs = (r) => dockerCalls(r).find((a) => a[0] === 'stop');
 
 // R2-C2: the shutdown's look at the relay is bounded, so a hung `docker inspect` cannot hold up the detached stop.

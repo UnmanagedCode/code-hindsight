@@ -432,3 +432,59 @@ test('LB8: an upstream outage is 502 recorded as CC_BACKEND_UNREACHABLE, and pro
   assert.ok(down.error);
   assert.ok(!JSON.stringify([first, down, probing.target()]).includes(ROW_TOKEN));
 });
+
+// LB7b: a request keeps the target it began with, even when setTarget runs while it is in flight.
+test('LB7b: an in-flight request completes against its original upstream and token; the next request goes to the new target', async (t) => {
+  let release;
+  const held = new Promise((r) => { release = r; });
+  const seenA = [];
+  const slow = http.createServer((req, res) => {
+    seenA.push(req.headers.authorization);
+    req.resume();
+    req.on('end', () => held.then(() => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"from":"A"}'); }));
+  });
+  await new Promise((r) => slow.listen(0, '127.0.0.1', r));
+  t.after(() => { release(); slow.closeAllConnections(); slow.close(); });
+  const { rl, proxy, tunnel } = await stack(t, { kind: 'anthropic-loopback', anthropic: { url: `http://127.0.0.1:${slow.address().port}` }, auth: { header: 'authorization', value: 'Bearer token-A' } });
+  const inflight = call(rl.apiPort, { kind: 'anthropic-loopback' });
+  await waitFor(() => seenA.length === 1);
+  const b = await startFakeAnthropic(t);
+  proxy.setTarget({ kind: 'anthropic-loopback', url: b.url, auth: { header: 'authorization', value: 'Bearer token-B' } });
+  assert.equal(b.requests.length, 0);
+  release();
+  const done = await inflight;
+  assert.equal(done.status, 200);
+  assert.match(done.text, /"from":"A"/);
+  assert.deepEqual(seenA, ['Bearer token-A']);
+  assert.equal(b.requests.length, 0, 'the new target saw nothing of the in-flight request');
+  await tunnelReady(tunnel);
+  assert.equal((await call(rl.apiPort, { kind: 'anthropic-loopback' })).status, 200);
+  assert.equal(b.requests.length, 1);
+  assert.equal(b.requests[0].headers.authorization, 'Bearer token-B');
+});
+
+// LB8c: a row URL with userinfo and a query probes fine, and the credential reaches no display, error or probe result.
+test('LB8c: a userinfo/query row URL is probed and shown without its credential, and unknown target kinds are rejected', async (t) => {
+  const fake = await startFakeAnthropic(t);
+  const secretUrl = fake.url.replace('http://', 'http://user:pw-Zq81@') + '/base?key=pw-Zq81#frag';
+  const proxy = createRelayProxy({ key: KEY, ollamaUrl: 'http://127.0.0.1:1', daemon: { version: async () => null } });
+  proxy.setTarget({ kind: 'anthropic-loopback', url: secretUrl, auth: ROW_AUTH });
+  assert.equal(proxy.target().url, `${fake.url}/base`);
+  const up = await proxy.probeTarget();
+  assert.equal(up.ok, true, JSON.stringify(up));
+  fake.down = true;
+  proxy.setTarget({ kind: 'anthropic-loopback', url: secretUrl, auth: ROW_AUTH });
+  const down = await proxy.probeTarget();
+  assert.equal(down.ok, false);
+  assert.ok(!JSON.stringify([proxy.target(), up, down]).includes('pw-Zq81'));
+  for (const kind of ['constructor', '__proto__', 'toString']) assert.throws(() => proxy.setTarget({ kind, url: fake.url }), /unknown relay target/, kind);
+  // A forwarded call to the down upstream: the 502 body and lastForward hold no credential either.
+  const rl = await startRelay(t);
+  const tunnel = createRelayTunnel({ key: KEY, onSocket: proxy.handleSocket, idleTarget: 1, retryMs: 20, maxRetryMs: 100 });
+  tunnel.start({ host: '127.0.0.1', port: rl.tunnelPort });
+  t.after(() => tunnel.stop());
+  await waitFor(() => tunnel.status().idle >= 1);
+  const res = await call(rl.apiPort, { kind: 'anthropic-loopback' });
+  assert.equal(res.status, 502);
+  assert.ok(!res.text.includes('pw-Zq81') && !JSON.stringify(proxy.lastForward()).includes('pw-Zq81'));
+});

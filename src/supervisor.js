@@ -298,6 +298,9 @@ export function createSupervisor({
         relayLinked = false;
         return;
       }
+      // A failed start leaves no live tunnel, and so no credential in memory.
+      relay.stop();
+      relayLinked = false;
       const err = toAppError(e, 'DOCKER_FAILED', { command: 'start' });
       if (!(e instanceof AppError)) log(`start failed: ${e?.stack ?? e}`);
       set('error', err.toJSON());

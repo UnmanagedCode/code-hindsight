@@ -384,3 +384,26 @@ test('LB13: a loopback endpoint that is down is a CC_BACKEND_UNREACHABLE status 
   assert.equal(st.relay.upstream.ok, false);
   assert.ok(st.relay.problems.some((p) => p.code === 'CC_BACKEND_UNREACHABLE'));
 });
+
+// LB13b: a row URL with userinfo and a query is probed, and nothing the plugin serves carries the credential.
+test('LB13b: a userinfo/query loopback row URL answers in status and no route body contains its credential', async (t) => {
+  const { startFakeAnthropic } = await import('./support/fakeAnthropic.mjs');
+  const fake = await startFakeAnthropic(t);
+  const base = `${fake.url.replace('http://', 'http://user:pw-Zq81@')}/?key=pw-Zq81`;
+  const ccServer = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/api/settings/models') return res.end(JSON.stringify({ backends: [{ id: 'o', template: 'claude', env: [{ key: 'ANTHROPIC_BASE_URL', value: base }, { key: 'ANTHROPIC_AUTH_TOKEN', value: 't' }] }] }));
+    res.statusCode = 404; return res.end('{}');
+  });
+  await new Promise((r) => ccServer.listen(0, '127.0.0.1', r));
+  t.after(() => ccServer.close());
+  const llm = { mode: 'cc-backend', provider: null, model: 'm', baseUrl: null, backendId: 'o', maxConcurrent: null };
+  const { url, app } = await boot(t, { cc: `http://127.0.0.1:${ccServer.address().port}`, settings: { llm }, probe: async () => 200, cpSession: { token: async () => 't', clear() {} } });
+  t.after(() => app.supervisor.stop());
+  const st = await (await fetch(`${url}/-/api/status`)).json();
+  assert.equal(st.relay.upstream.ok, true, JSON.stringify(st.relay));
+  assert.ok(!st.relay.problems.some((p) => p.code === 'CC_BACKEND_UNREACHABLE'));
+  for (const p of ['/-/api/settings', '/-/api/status', '/-/api/status?refresh=1', '/-/api/cc-backends', '/-/api/jobs', '/-/api/logs/relay']) {
+    assert.equal((await (await fetch(url + p)).text()).includes('pw-Zq81'), false, p);
+  }
+});

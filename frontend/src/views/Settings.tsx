@@ -181,7 +181,7 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
                     <option value="">Choose…</option>
                     {backends.map((b) => (
                       <option key={b.id} value={b.id} disabled={!b.usable}>
-                        {b.label}{b.kind === 'ollama' ? ' (cc\'s Ollama daemon, via relay)' : b.loopback ? ` (${b.host}, via relay)` : b.host ? ` (${b.host})` : ''}{b.usable ? '' : b.refusal === 'CC_BACKEND_LOOPBACK' ? ' — loopback over https, not relayed' : ' — no Anthropic URL and token'}
+                        {b.label}{b.kind === 'ollama' ? ' (cc\'s Ollama daemon, via relay)' : b.loopback ? ` (${b.host}${b.usable ? ', via relay' : ''})` : b.host ? ` (${b.host})` : ''}{b.usable ? '' : b.refusal === 'CC_BACKEND_LOOPBACK' ? ' — loopback over https, not relayed' : ' — no Anthropic URL and token'}
                       </option>
                     ))}
                   </NativeSelect>

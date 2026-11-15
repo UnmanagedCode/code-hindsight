@@ -174,7 +174,7 @@ Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP f
 
 ## Docker resources
 
-All names derive from `RESOURCE_PREFIX` (`src/pins.js`) through `resourceNames` (`src/containerSpec.js`): `<prefix>-api`, `<prefix>-cp`, `<prefix>-net`, `<prefix>-data`, `<prefix>-build` (the CP build helper), `<prefix>-relay` (the relay; only while an Ollama backend is linked). The plugin never touches a container, volume or network outside the prefix, and never connects anything to a network.
+All names derive from `RESOURCE_PREFIX` (`src/pins.js`) through `resourceNames` (`src/containerSpec.js`): `<prefix>-api`, `<prefix>-cp`, `<prefix>-net`, `<prefix>-data`, `<prefix>-build` (the CP build helper), `<prefix>-relay` (the relay; only while a backend is linked through the relay). The plugin never touches a container, volume or network outside the prefix, and never connects anything to a network.
 
 Labels (`LABELS` in `src/pins.js`):
 
