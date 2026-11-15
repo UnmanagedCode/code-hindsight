@@ -43,7 +43,8 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 - A stopped or crashed backend cannot log its own absence: hooks give up silently (a memoryless turn) and only cc's plugin row shows it.
 - The recall tool is text-only (no JSON format).
 - Bank names are sanitized, so different projects can map to the same bank.
-- Workspace scopes (`match.workspaces`) see a project moved into or out of a cc workspace only within `WORKSPACES_TTL_MS` (`src/ccSession.js`). They depend on cc's `list_projects`, which runs git per project: a cc slower than `WORKSPACES_TIMEOUT_MS` leaves scopes that depend on the workspace unapplied for that call, logged `WORKSPACE_UNRESOLVED`.
+- A slow Hindsight delays every prompt of a session with a recall scope, up to `HOOK_TIMEOUTS.recall` (`claude/hooks/limits.mjs`). Recall time is dominated by Hindsight's reranker and grows under load, for example while an import's retains are extracting.
+- Workspace scopes (`match.workspaces`) see a project moved into or out of a cc workspace only within `WORKSPACES_TTL_MS` (`src/ccSession.js`). They depend on cc's `list_projects`, which runs git per project: a cc slower than its deadline (`WORKSPACES_TIMEOUT_MS` at Stop and import, `MEMORY_LIMITS.recallDeadlineMs` on recall) leaves scopes that depend on the workspace unapplied for that call, logged `WORKSPACE_UNRESOLVED`.
 - If `memory/cursors.json` is lost, turns already retained can be retained again.
 - `memory/cursors.json` is one file, rewritten synchronously on each Stop and each drain step, and it holds each session's unacknowledged batch. Hundreds of sessions blocked at once on large batches make it large, and writing it can slow concurrent recalls.
 - With LLM mode `none`, retain stores raw chunks without fact extraction.

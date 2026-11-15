@@ -88,6 +88,24 @@ test('concurrent lookups on a cold cache share one list_projects read', async (t
   assert.equal(cc.listProjectsCalls(), 1);
 });
 
+test('a caller\'s signal bounds each lookup: a describe or list_projects slower than it is unresolved', async (t) => {
+  const { cc, ccClient } = await clocked(t);
+  cc.session('slow', (send) => setTimeout(() => send(200, {}), 1000).unref());
+  await assert.rejects(ccClient.resolveSession('slow', { signal: AbortSignal.timeout(50) }), { code: 'SESSION_UNRESOLVED', message: /did not answer in time/ });
+  cc.failProjects('hang');
+  await assert.rejects(ccClient.workspaceOf('proj', { signal: AbortSignal.timeout(50) }), { code: 'WORKSPACE_UNRESOLVED', message: /did not answer in time/ });
+});
+
+test('a short-deadline waiter gives up alone; the shared list_projects read still answers a longer one', async (t) => {
+  const { cc, ccClient } = await clocked(t);
+  cc.delayProjects(150);
+  const short = assert.rejects(ccClient.workspaceOf('proj', { signal: AbortSignal.timeout(50) }), { code: 'WORKSPACE_UNRESOLVED' });
+  const long = ccClient.workspaceOf('proj', { signal: AbortSignal.timeout(1000) });
+  await short;
+  assert.equal(await long, 'WS');
+  assert.equal(cc.listProjectsCalls(), 1);
+});
+
 test('listWorkspaces answers cc\'s workspaces by name and throws on a bad answer; listProjects answers name and workspace', async (t) => {
   const { cc, ccClient } = await clocked(t);
   cc.setWorkspaces([{ name: 'TTD', projectCount: 3 }, { name: 'AI', projectCount: 0 }]);

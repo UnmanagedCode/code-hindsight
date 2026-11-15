@@ -84,19 +84,20 @@ test('Hindsight not ready: recall is skipped (no Hindsight call), logged, and th
   assert.deepEqual(errors(x.activity).map((e) => e.code), ['HINDSIGHT_NOT_READY']);
 });
 
-test('a retired, unknown or slow-to-describe session is memoryless, logged by cause, and never reaches Hindsight', async (t) => {
-  const x = await setup(t, { describeTimeoutMs: 50 });
+test('a retired, unknown or slow-to-describe session is memoryless on recall, logged by cause, and never reaches Hindsight; retain keeps its own cap', async (t) => {
+  const x = await setup(t, { limits: { ...MEMORY_LIMITS, recallDeadlineMs: 50 }, describeTimeoutMs: 50 });
   x.cc.session('gone', 'retired');
   x.cc.session('slow', (send) => setTimeout(() => send(200, {}), 1000).unref());
   for (const id of ['gone', 'unknown', 'slow']) assert.equal((await recall(x.memory, id, 'q')).context, null);
   assert.deepEqual(x.activity.list().map((e) => e.code).reverse(), ['SESSION_NOT_LIVE', 'SESSION_NOT_LIVE', 'SESSION_UNRESOLVED']);
   assert.equal(x.hs.requests.length, 0);
+  assert.deepEqual(await x.memory.retainForHook('slow', [turn(1, 'user')]), { status: 'unresolved' });
 });
 
-test('a slow bank costs only itself: the others answer within the budget and the slow one is logged', async (t) => {
+test('a slow bank costs only itself: banks that answered before the recall deadline are used and the slow one is logged, on the hook and the tool', async (t) => {
   const x = await setup(t, {
     scopes: [scope({ name: 'a', bank: 'slow', actions: ['recall'] }), scope({ name: 'b', bank: 'fast', actions: ['recall'] })],
-    limits: { ...MEMORY_LIMITS, recallTimeoutMs: 80 },
+    limits: { ...MEMORY_LIMITS, recallDeadlineMs: 150 },
   });
   x.hs.bank('slow', [{ id: '1', text: 'from slow' }]);
   x.hs.bank('fast', [{ id: '2', text: 'from fast' }]);
@@ -108,6 +109,25 @@ test('a slow bank costs only itself: the others answer within the budget and the
   assert.doesNotMatch(out.context, /from slow/);
   const err = errors(x.activity);
   assert.deepEqual(err.map((e) => [e.code, e.banks]), [['RECALL_FAILED', ['slow']]]);
+  const viaTool = await x.memory.recallForMcp(S, 'q');
+  assert.match(viaTool, /from fast/);
+  assert.doesNotMatch(viaTool, /from slow/);
+  assert.deepEqual(errors(x.activity).filter((e) => e.event === 'mcp-recall').map((e) => [e.code, e.banks]), [['RECALL_FAILED', ['slow']]]);
+});
+
+test('the recall deadline is shared: a slow session lookup leaves the fan-out less time', async (t) => {
+  const x = await setup(t, {
+    scopes: [scope({ bank: 'b', actions: ['recall'] })],
+    limits: { ...MEMORY_LIMITS, recallDeadlineMs: 300 },
+  });
+  x.hs.bank('b', [{ id: '1', text: 'bank note' }]);
+  x.hs.latency.b = 150;
+  assert.match((await recall(x.memory, S, 'q')).context, /bank note/, 'an instant lookup leaves the bank time to answer');
+  x.memory.resetContext(S);
+  x.cc.session(S, (send) => setTimeout(() => send(200, { sessionId: S, live: live() }), 200).unref());
+  const out = await recall(x.memory, S, 'q2');
+  assert.equal(out.context, null);
+  assert.deepEqual(errors(x.activity).map((e) => [e.code, e.banks]), [['RECALL_FAILED', ['b']]], 'the bank missed the shared deadline; the lookup itself was not reported unresolved');
 });
 
 test('a bank that was never created (404) is an empty result, not an error', async (t) => {
@@ -636,6 +656,24 @@ test('a failed workspace lookup on recall: the workspace scope gives no bank, an
   const err = errors(x.activity);
   assert.deepEqual(err.map((e) => e.code), ['WORKSPACE_UNRESOLVED']);
   assert.match(err[0].message, /Scope ws: .*project proj: .*HTTP 500/);
+});
+
+test('a workspace lookup that hangs past the recall deadline keeps WORKSPACE_UNRESOLVED; the other scope still recalls, and the tool with only that scope rejects', async (t) => {
+  const x = await setup(t, {
+    scopes: [wsScope({ actions: ['recall'] }), scope({ name: 'all', bank: 'all', actions: ['recall'] })],
+    limits: { ...MEMORY_LIMITS, recallDeadlineMs: 150 },
+  });
+  x.hs.bank('all', [{ id: 'a', text: 'shared note' }]);
+  x.cc.failProjects('hang');
+  // The shared deadline is spent waiting, so the bank of the other scope has no time left either; the point is the code and logging.
+  const out = await recall(x.memory, S, 'q');
+  const codes = errors(x.activity).map((e) => e.code);
+  assert.ok(codes.includes('WORKSPACE_UNRESOLVED'));
+  assert.match(errors(x.activity).find((e) => e.code === 'WORKSPACE_UNRESOLVED').message, /did not answer in time/);
+  assert.doesNotMatch(out.context ?? '', /workspace note/);
+  const y = await setup(t, { scopes: [wsScope({ actions: ['recall'] })], limits: { ...MEMORY_LIMITS, recallDeadlineMs: 150 } });
+  y.cc.failProjects('hang');
+  await assert.rejects(y.memory.recallForMcp(S, 'q'), { code: 'WORKSPACE_UNRESOLVED' });
 });
 
 test('a failed workspace lookup at Stop never retains into a later scope: nothing is recorded, and the next resolved Stop takes those turns into the workspace bank', async (t) => {

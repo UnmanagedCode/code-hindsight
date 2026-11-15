@@ -45,21 +45,22 @@ export function createHindsightClient({ connection, fetchImpl = fetch }) {
      * an empty result, not an error. No `types` filter: with LLM none Hindsight stores raw chunks as
      * `world` facts, and filtering would hide them.
      */
-    async recall(bank, query, { timeoutMs }) {
+    async recall(bank, query, { signal }) {
       const c = conn();
       let res;
       try {
         res = await fetchImpl(bankUrl(c, bank, 'memories/recall'), {
           method: 'POST', headers: headers(c),
           body: JSON.stringify({ query, budget: RECALL_BUDGET, max_tokens: RECALL_MAX_TOKENS }),
-          signal: AbortSignal.timeout(timeoutMs),
+          signal,
         });
       } catch (e) {
-        throw new AppError('RECALL_FAILED', { bank, detail: e?.name === 'TimeoutError' ? `no answer within ${timeoutMs} ms` : (e?.message ?? String(e)) }, { cause: e });
+        throw new AppError('RECALL_FAILED', { bank, detail: e?.name === 'TimeoutError' ? 'no answer before the recall deadline' : (e?.message ?? String(e)) }, { cause: e });
       }
       if (res.status === 404) return [];
       if (!res.ok) throw new AppError('RECALL_FAILED', { bank, detail: `Hindsight answered HTTP ${res.status}` });
       const body = await res.json().catch(() => null);
+      if (signal.aborted) throw new AppError('RECALL_FAILED', { bank, detail: 'no answer before the recall deadline' }, { cause: signal.reason });
       return Array.isArray(body?.results) ? body.results.filter((r) => r && typeof r.text === 'string') : [];
     },
 

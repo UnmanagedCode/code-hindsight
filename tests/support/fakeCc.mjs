@@ -14,6 +14,8 @@ export async function startFakeCc(t, { playbooks = { solo: ['plan', 'review'], r
   let workspaceRows = [{ name: 'WS', projectCount: 1 }];
   /** null, an HTTP status, 'hang' (never answers) or 'bad-shape'. */
   let projectsFailure = null;
+  /** ms list_projects waits before answering. */
+  let projectsDelay = 0;
   /** null or an HTTP status for list_workspaces to answer. */
   let workspacesFailure = null;
   /** sessionId → answers, consumed in order (the last repeats). An answer is a `live` object, 'retired' or a raw body. */
@@ -38,7 +40,8 @@ export async function startFakeCc(t, { playbooks = { solo: ['plan', 'review'], r
       if (projectsFailure === 'hang') return undefined;
       if (projectsFailure === 'bad-shape') return send(200, { projects: [{ name: 'proj', workspace: 7 }] });
       if (projectsFailure) return send(projectsFailure, { ok: false, code: 'INTERNAL' });
-      return send(200, { projects: projectRows.map((p) => ({ path: `/x/${p.name}`, liveCount: 0, ...p })) });
+      const answer = () => send(200, { projects: projectRows.map((p) => ({ path: `/x/${p.name}`, liveCount: 0, ...p })) });
+      return projectsDelay ? void setTimeout(answer, projectsDelay).unref() : answer();
     }
     if (req.url === '/mcp/tools/list_workspaces') return workspacesFailure ? send(workspacesFailure, { ok: false, code: 'INTERNAL' }) : send(200, { workspaces: workspaceRows });
     if (req.url === '/api/playbooks') return send(200, { playbooks: Object.keys(playbooks).map((id) => ({ id })) });
@@ -58,6 +61,8 @@ export async function startFakeCc(t, { playbooks = { solo: ['plan', 'review'], r
     setWorkspaces(list) { workspaceRows = list; },
     /** Make list_projects fail: an HTTP status, 'hang', 'bad-shape'; null to answer again. */
     failProjects(how) { projectsFailure = how; },
+    /** Make list_projects answer only after `ms`. */
+    delayProjects(ms) { projectsDelay = ms; },
     /** Make list_workspaces answer this HTTP status; null to answer again. */
     failWorkspaces(status) { workspacesFailure = status; },
     /** Program a session: answers are consumed per call, the last repeats. */

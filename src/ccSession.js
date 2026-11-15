@@ -4,13 +4,13 @@
 // all go through documented cc routes.
 import { AppError } from './errors.js';
 
-/** Deadline of `describe_session` on the hook and recall-tool paths; with the other deadlines it must fit the hook's. */
+/** Deadline of `describe_session` at Stop (retain); recall uses `MEMORY_LIMITS.recallDeadlineMs` instead. With the other retain deadlines it must fit the hook's. */
 export const DESCRIBE_TIMEOUT_MS = 3000;
 export const STAGES_TTL_MS = 60_000;
 const STAGES_TIMEOUT_MS = 5000;
 /** How long the project → workspace index serves before it is read again (the membership lag). */
 export const WORKSPACES_TTL_MS = 30_000;
-/** Deadline of the `list_projects` read on the hook path; with the other deadlines it must fit the hook's. */
+/** Deadline of the `list_projects` read at Stop (retain) and import placement; recall uses `MEMORY_LIMITS.recallDeadlineMs` instead. */
 export const WORKSPACES_TIMEOUT_MS = 900;
 /** The project a cc conductor session reports; `describe_session` has no separate kind field. */
 export const CONDUCTOR_PROJECT = '.conduct';
@@ -30,7 +30,7 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
   let stagesCache = { at: -Infinity, value: null };
   /** name → {workspace, degraded}, as `list_projects` last answered. Never served past WORKSPACES_TTL_MS. */
   let projectsCache = { at: -Infinity, index: null };
-  /** The match path's refresh in flight, shared by concurrent lookups. */
+  /** The match path's refresh in flight, shared by concurrent lookups: `{controller, waiters, promise}`. */
   let refreshing = null;
 
   async function getJson(pathname, timeoutMs) {
@@ -40,17 +40,17 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
   }
 
   /** An MCP tool through cc's REST alias (`POST /mcp/tools/<name>` → the structured content). */
-  async function callTool(name, timeoutMs) {
+  async function callTool(name, signal) {
     const res = await fetchImpl(new URL(`/mcp/tools/${name}`, conductorUrl), {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(timeoutMs),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal,
     });
     if (!res.ok) throw new Error(`${name} answered HTTP ${res.status}`);
     return res.json();
   }
 
   /** Read `list_projects` into the cache; returns the new index. Throws on any failure. */
-  async function refreshProjects(timeoutMs) {
-    const body = await callTool('list_projects', timeoutMs);
+  async function refreshProjects(signal) {
+    const body = await callTool('list_projects', signal);
     const rows = body?.ok === false ? null : body?.projects;
     if (!Array.isArray(rows) || rows.some((p) => !isStr(p?.name) || !(isStr(p.workspace) || p.workspace === null))) {
       throw new Error('list_projects answered an unexpected shape');
@@ -96,6 +96,37 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
     };
   }
 
+  /**
+   * Wait for the shared `list_projects` read (started if none is in flight) against this caller's own
+   * signal. The read is aborted only when every waiter has given up, so a short-deadline caller
+   * neither cuts short a long-deadline one's read nor waits past its own deadline.
+   */
+  function joinRefresh(signal) {
+    if (!refreshing) {
+      const controller = new AbortController();
+      const r = { controller, waiters: 0, promise: null };
+      r.promise = refreshProjects(controller.signal).finally(() => { if (refreshing === r) refreshing = null; });
+      refreshing = r;
+    }
+    const r = refreshing;
+    r.waiters++;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        reject(signal.reason);
+        if (--r.waiters === 0) {
+          if (refreshing === r) refreshing = null;
+          r.controller.abort();
+        }
+      };
+      const finish = (fn) => (v) => { if (settled) return; settled = true; signal.removeEventListener('abort', onAbort); fn(v); };
+      r.promise.then(finish(resolve), finish(reject));
+      if (signal.aborted) onAbort(); else signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
   const freshIndex = () => (now() - projectsCache.at < WORKSPACES_TTL_MS ? projectsCache.index : null);
 
   return {
@@ -103,7 +134,7 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
      * The session's current facts.
      * @throws {AppError} SESSION_UNRESOLVED (cc unreachable, slow or confused) or SESSION_NOT_LIVE
      */
-    async resolveSession(sessionId) {
+    async resolveSession(sessionId, { signal = AbortSignal.timeout(describeTimeoutMs) } = {}) {
       if (!conductorUrl) throw new AppError('SESSION_UNRESOLVED', { detail: 'this backend has no cc to ask (CONDUCTOR_URL is unset)' });
       let body;
       try {
@@ -111,7 +142,7 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ sessionId }),
-          signal: AbortSignal.timeout(describeTimeoutMs),
+          signal,
         });
         if (!res.ok) throw new Error(`describe_session answered HTTP ${res.status}`);
         body = await res.json();
@@ -197,17 +228,16 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
     /**
      * The cc workspace a project is in (null: none; the conductor project is in none). Served from
      * an index at most WORKSPACES_TTL_MS old; a project missing from a cached index is read again
-     * once. Never answers from an older index.
+     * once. Never answers from an older index. `signal` bounds this caller's wait (default: `workspacesTimeoutMs`).
      * @throws {AppError} WORKSPACE_UNRESOLVED (cc unset, unreachable, slow or confused; the project unknown or unreadable to cc)
      */
-    async workspaceOf(project) {
+    async workspaceOf(project, { signal = AbortSignal.timeout(workspacesTimeoutMs) } = {}) {
       if (project === CONDUCTOR_PROJECT) return null;
       const unresolved = (reason, cause) => new AppError('WORKSPACE_UNRESOLVED', { project, detail: `project ${project}: ${reason}` }, cause ? { cause } : undefined);
       if (!conductorUrl) throw unresolved('this backend has no cc to ask (CONDUCTOR_URL is unset)');
       let index = freshIndex();
       if (!index?.has(project)) {
-        if (!refreshing) refreshing = refreshProjects(workspacesTimeoutMs).finally(() => { refreshing = null; });
-        try { index = await refreshing; } catch (e) {
+        try { index = await joinRefresh(signal); } catch (e) {
           throw unresolved(e?.name === 'TimeoutError' ? 'cc did not answer in time' : (e?.message ?? String(e)), e);
         }
       }
@@ -220,14 +250,14 @@ export function createCcClient({ conductorUrl, fetchImpl = fetch, now = () => Da
     /** cc's projects for the scope editor: `[{name, workspace}]` by name. Throws when cc cannot be read. */
     async listProjects() {
       if (!conductorUrl) throw new Error('CONDUCTOR_URL is unset');
-      const index = freshIndex() ?? await refreshProjects(STAGES_TIMEOUT_MS);
+      const index = freshIndex() ?? await refreshProjects(AbortSignal.timeout(STAGES_TIMEOUT_MS));
       return [...index].map(([name, { workspace }]) => ({ name, workspace })).sort((a, b) => a.name.localeCompare(b.name));
     },
 
     /** cc's workspaces for the scope editor: `[{name, projectCount}]` by name. Throws when cc cannot be read. */
     async listWorkspaces() {
       if (!conductorUrl) throw new Error('CONDUCTOR_URL is unset');
-      const body = await callTool('list_workspaces', STAGES_TIMEOUT_MS);
+      const body = await callTool('list_workspaces', AbortSignal.timeout(STAGES_TIMEOUT_MS));
       const rows = body?.ok === false ? null : body?.workspaces;
       if (!Array.isArray(rows) || rows.some((w) => !isStr(w?.name) || !Number.isInteger(w.projectCount))) {
         throw new Error('list_workspaces answered an unexpected shape');
