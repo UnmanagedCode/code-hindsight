@@ -12,7 +12,7 @@ import { API_IMAGES, BASE_PATH, CP_IMAGE, LABELS, UPSTREAM_REVISION } from './pi
 import { isPinnedApiImage } from './trust.js';
 import { AppError, describeError, toAppError } from './errors.js';
 import { validateSettings, embeddingsFingerprint, containerSettingsHash } from './settings.js';
-import { apiSpec, cpSpec, embeddingsEnv } from './containerSpec.js';
+import { apiSpec, cpSpec, relaySpec, embeddingsEnv } from './containerSpec.js';
 import { composeLlmEnv } from './llmEnv.js';
 import { readJsonFile, writePrivateFileAtomic } from './fsPrivate.js';
 
@@ -27,6 +27,8 @@ export const DEFAULT_TIMEOUTS = Object.freeze({
   /** How long a new backend waits for the previous one's detached `docker stop`. */
   pendingStopMs: 90_000,
   stopSeconds: 30,
+  /** The shutdown's look at the relay container: bounded, because cc's kill grace is short. */
+  shutdownProbeMs: 1_500,
 });
 
 const realClock = {
@@ -61,6 +63,7 @@ function pidAlive(pid) {
  * @param {() => string} o.detectBind the automatic bind address
  * @param {() => Promise<unknown>} o.fetchCcModels
  * @param {{token(): Promise<string>, clear(): void}} o.cpSession
+ * @param {{start(target: {host: string, port: number}): void, stop(): void, status(): object}} o.relay the plugin's side of the relay tunnel
  * @param {(url: string) => Promise<number>} [o.probe]
  * @param {{now(): number, sleep(ms: number): Promise<void>}} [o.clock]
  * @param {Partial<typeof DEFAULT_TIMEOUTS>} [o.timeouts]
@@ -68,7 +71,7 @@ function pidAlive(pid) {
  */
 export function createSupervisor({
   docker, settings: settingsStore, secrets: secretsStore, cpTrust, names, owner, dataDir,
-  detectBind, fetchCcModels, cpSession, probe = httpProbe, clock = realClock, timeouts = {}, watch = true,
+  detectBind, fetchCcModels, cpSession, relay, probe = httpProbe, clock = realClock, timeouts = {}, watch = true,
   log = (m) => console.error(`code-hindsight: ${m}`),
 }) {
   const T = { ...DEFAULT_TIMEOUTS, ...timeouts };
@@ -84,6 +87,8 @@ export function createSupervisor({
   let appliedKey = null;
   let images = null;
   let containers = null;
+  /** Whether the running API's LLM goes through the relay. */
+  let ollamaLinked = false;
   let wantRunning = false;
   let generation = 0;
   let queue = Promise.resolve();
@@ -153,7 +158,7 @@ export function createSupervisor({
       if (!c) return { name, state: 'missing' };
       return { name, state: c.State?.Status ?? 'unknown', running: !!c.State?.Running, restarting: !!c.State?.Restarting, exitCode: c.State?.ExitCode ?? null, ours: c.Config?.Labels?.[LABELS.owner] === owner };
     };
-    containers = { api: await one(names.api), cp: await one(names.cp) };
+    containers = { api: await one(names.api), cp: await one(names.cp), relay: await one(names.relay) };
     return containers;
   }
 
@@ -167,7 +172,8 @@ export function createSupervisor({
   async function adoptOrCreate(spec, imageId, portSetting) {
     const portError = (e) => {
       if (e instanceof AppError && e.code === 'PORT_IN_USE') {
-        return new AppError('PORT_IN_USE', { port: portSetting === 'apiPort' ? ports.api : ports.cp, address: bind, setting: `network.${portSetting}` });
+        const port = { apiPort: ports.api, cpPort: ports.cp, relayPort: ports.relay }[portSetting];
+        return new AppError('PORT_IN_USE', { port, address: bind, setting: `network.${portSetting}` });
       }
       return e;
     };
@@ -186,6 +192,12 @@ export function createSupervisor({
     }
     try { await docker.runContainer(spec); } catch (e) { throw portError(e); }
     return 'created';
+  }
+
+  /** An unlinked relay is removed (kept stopped it would still hold the plugin network). */
+  async function removeOwnedRelay() {
+    const c = await docker.inspectContainer(names.relay);
+    if (c && c.Config?.Labels?.[LABELS.owner] === owner) await docker.removeContainer(names.relay);
   }
 
   async function containerTail(name) {
@@ -221,7 +233,7 @@ export function createSupervisor({
     const { settings, errors } = currentSettings();
     if (errors.length) throw settingsError(errors);
     bind = settings.network.bindAddress ?? detectBind();
-    ports = { api: settings.network.apiPort, cp: settings.network.cpPort };
+    ports = { api: settings.network.apiPort, cp: settings.network.cpPort, relay: settings.network.relayPort };
 
     const { api, cp, want } = await inspectImages(settings.variant);
     if (!api) throw new AppError('IMAGE_MISSING', { image: want.ref });
@@ -241,7 +253,19 @@ export function createSupervisor({
 
     set('starting');
     const secrets = secretsStore.get();
-    const llmEnv = await composeLlmEnv(settings, secrets, { fetchCcModels });
+    const { env: llmEnv, relay: needsRelay } = await composeLlmEnv(settings, secrets, { fetchCcModels });
+    // A start cancelled while the LLM env was read must not bring the tunnel up.
+    checkCancelled(gen);
+    if (needsRelay) {
+      // The relay first: the API's LLM client resolves `ollama` on the private network.
+      await adoptOrCreate(relaySpec({ names, image: { id: api.Id }, bind, port: ports.relay, key: secrets.relayKey, owner }), api.Id, 'relayPort');
+      checkCancelled(gen);
+      relay.start({ host: bind, port: ports.relay });
+    } else {
+      relay.stop();
+      await removeOwnedRelay();
+    }
+    ollamaLinked = needsRelay;
     const apiS = apiSpec({ names, image: { id: api.Id }, variant: settings.variant, bind, port: ports.api, apiKey: secrets.apiKey, llmEnv, embeddingsEnv: embeddingsEnv(settings, secrets), owner });
     await adoptOrCreate(apiS, api.Id, 'apiPort');
     const cpS = cpSpec({ names, image: { id: cp.Id }, bind, port: ports.cp, apiKey: secrets.apiKey, accessKey: secrets.cpAccessKey, owner });
@@ -268,7 +292,12 @@ export function createSupervisor({
     try {
       await bringUp(gen);
     } catch (e) {
-      if (e instanceof Cancelled) return;
+      if (e instanceof Cancelled) {
+        // stop()/restart() ended this start: whatever it began with the tunnel ends with it.
+        relay.stop();
+        ollamaLinked = false;
+        return;
+      }
       const err = toAppError(e, 'DOCKER_FAILED', { command: 'start' });
       if (!(e instanceof AppError)) log(`start failed: ${e?.stack ?? e}`);
       set('error', err.toJSON());
@@ -296,8 +325,8 @@ export function createSupervisor({
     const gen = generation;
     if ((await probe(`http://${bind}:${ports.api}/health`)) === 200) {
       watchFailures = 0;
-      const cpCrash = await crashedOrNull('cp', names.cp);
-      if (cpCrash && gen === generation) { stopWatch(); set('error', cpCrash.toJSON()); }
+      const sideCrash = (await crashedOrNull('cp', names.cp)) ?? (ollamaLinked ? await crashedOrNull('relay', names.relay) : null);
+      if (sideCrash && gen === generation) { stopWatch(); set('error', sideCrash.toJSON()); }
       return;
     }
     const crashed = await crashedOrNull('api', names.api);
@@ -309,9 +338,28 @@ export function createSupervisor({
     }
   }
 
+  /**
+   * Whether the relay container may be running: this process linked it, or it is ours and
+   * running, whichever process started it. Inspecting needs a resolved docker (a shutdown
+   * must not wait on a resolve), so an unresolved docker counts only this process's own link.
+   * The inspect is bounded (`shutdownProbeMs`): a clean "missing", "not ours" or "not running"
+   * answer is no; anything else (a timeout, a docker error, unreadable output) is yes, since
+   * `docker stop` of a missing name only errors for that name.
+   */
+  async function relayMayRun() {
+    if (ollamaLinked) return true;
+    if (!docker.info().mode) return false;
+    try {
+      const r = await docker.exec(['container', 'inspect', names.relay], { check: false, timeoutMs: T.shutdownProbeMs });
+      if (r.code !== 0) return !/No such|not found/i.test(r.stderr);
+      const c = JSON.parse(r.stdout)[0];
+      return !!c && c.Config?.Labels?.[LABELS.owner] === owner && !!(c.State?.Running || c.State?.Restarting);
+    } catch { return true; }
+  }
+
   async function stopContainersNow() {
     const present = [];
-    for (const n of [names.cp, names.api]) {
+    for (const n of [names.relay, names.cp, names.api]) {
       const c = await docker.inspectContainer(n);
       if (c && c.Config?.Labels?.[LABELS.owner] === owner && (c.State?.Running || c.State?.Restarting)) present.push(n);
     }
@@ -332,6 +380,8 @@ export function createSupervisor({
       wantRunning = false;
       generation++;
       stopWatch();
+      relay.stop();
+      ollamaLinked = false;
       return serial(async () => {
         set('stopping');
         try {
@@ -351,6 +401,8 @@ export function createSupervisor({
       wantRunning = true;
       generation++;
       stopWatch();
+      relay.stop();
+      ollamaLinked = false;
       return serial(async () => {
         try {
           await docker.resolve();
@@ -392,9 +444,10 @@ export function createSupervisor({
     async shutdown() {
       generation++;
       stopWatch();
+      relay.stop();
       let pid;
       try {
-        pid = await docker.stopDetached([names.cp, names.api], T.stopSeconds);
+        pid = await docker.stopDetached([names.cp, names.api, ...((await relayMayRun()) ? [names.relay] : [])], T.stopSeconds);
       } catch (e) {
         // No pid to wait for: record the failure instead of a stopping.json the next backend
         // would read as "a stop is under way".
@@ -417,7 +470,7 @@ export function createSupervisor({
         variant: settings.variant,
         bindAddress: bind ?? (autoBind ? detectBind() : settings.network.bindAddress),
         bindAuto: autoBind,
-        ports: ports ?? { api: settings.network.apiPort, cp: settings.network.cpPort },
+        ports: ports ?? { api: settings.network.apiPort, cp: settings.network.cpPort, relay: settings.network.relayPort },
         images,
         containers,
         startedAt: state === 'ready' ? startedAt : null,
@@ -425,6 +478,7 @@ export function createSupervisor({
         volume: names.volume,
         lastShutdownFailure,
         llmMode: settings.llm.mode,
+        ollama: ollamaLinked ? relay.status() : null,
       };
     },
 

@@ -5,6 +5,17 @@ import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
+/** `OLLAMA_HOST` (the ollama CLI's variable) as an http URL: scheme and port defaulted, a wildcard bind address read as loopback. */
+export function ollamaUrlFrom(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return 'http://127.0.0.1:11434';
+  let u;
+  try { u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) ? raw : `http://${raw}`); } catch { throw new Error(`OLLAMA_HOST is not a host[:port] or URL: "${raw}"`); }
+  if (u.hostname === '0.0.0.0' || u.hostname === '[::]') u.hostname = '127.0.0.1';
+  if (!u.port) u.port = '11434';
+  return `${u.protocol}//${u.host}`;
+}
+
 export function loadConfig(env = process.env) {
   const dataDir = env.CONDUCTOR_PLUGIN_DATA_DIR;
   if (!dataDir || !path.isAbsolute(dataDir)) {
@@ -16,6 +27,8 @@ export function loadConfig(env = process.env) {
     port,
     dataDir,
     conductorUrl: env.CONDUCTOR_URL || null,
+    /** The Ollama daemon the relay's tunnel reaches (it runs in cc's container). */
+    ollamaUrl: ollamaUrlFrom(env.OLLAMA_HOST),
     pluginId: env.CONDUCTOR_PLUGIN_ID || 'code-hindsight',
     distDir: path.join(root, 'frontend', 'dist'),
     /** Where Claude Code keeps session transcripts (its own rule): what the backfill importer scans. */

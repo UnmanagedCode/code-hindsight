@@ -99,3 +99,37 @@ test('generated keys are created once and stay stable; user keys are write-only'
   assert.equal(createSecretsStore(r.dataDir).get().apiKey, a.apiKey, 'clearing a user key keeps the generated ones');
   assert.equal(path.basename(again.file), 'secrets.json');
 });
+
+// OL3: the parallel-request cap is empty (Hindsight's default) or a whole number in range.
+test('OL3: llm.maxConcurrent accepts null or 1..256 and refuses anything else by field', () => {
+  const llm = (maxConcurrent) => withChanges({ llm: { maxConcurrent } });
+  for (const ok of [null, 1, 32, 256]) assert.deepEqual(validateSettings(llm(ok)).errors, [], String(ok));
+  for (const bad of [0, 257, -1, 1.5, '4', NaN]) {
+    assert.deepEqual(validateSettings(llm(bad)).errors.map((e) => e.field), ['llm.maxConcurrent'], String(bad));
+  }
+});
+
+// OL4: the relay port is a user port that differs from the API and control plane ports.
+test('OL4: network.relayPort is 1024..65535 and distinct from apiPort and cpPort', () => {
+  assert.equal(DEFAULT_SETTINGS.network.relayPort, 18434);
+  const relay = (relayPort, extra = {}) => validateSettings(withChanges({ network: { relayPort, ...extra } })).errors.map((e) => e.field);
+  assert.deepEqual(relay(20000), []);
+  assert.deepEqual(relay(80), ['network.relayPort']);
+  assert.deepEqual(relay(70000), ['network.relayPort']);
+  assert.deepEqual(relay(18888), ['network.relayPort']);
+  assert.deepEqual(relay(19999), ['network.relayPort']);
+});
+
+// OL5: both fields shape the containers, so changing one is a pending restart; the stored
+// settings of an older install (no new fields) read as the defaults.
+test('OL5: the new fields join the container hash, and a settings file without them reads as defaults', (t) => {
+  const base = containerSettingsHash(DEFAULT_SETTINGS);
+  assert.notEqual(containerSettingsHash(withChanges({ llm: { maxConcurrent: 4 } })), base);
+  assert.notEqual(containerSettingsHash(withChanges({ network: { relayPort: 20000 } })), base);
+  const r = mkRoot(t);
+  fs.mkdirSync(r.dataDir, { recursive: true });
+  fs.writeFileSync(path.join(r.dataDir, 'settings.json'), JSON.stringify({ network: { bindAddress: null, apiPort: 18888, cpPort: 19999 }, llm: { mode: 'none' } }));
+  const got = createSettingsStore(r.dataDir).get();
+  assert.equal(got.network.relayPort, 18434);
+  assert.equal(got.llm.maxConcurrent, null);
+});

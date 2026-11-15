@@ -66,7 +66,7 @@ export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir,
   });
 
   async function assertStopped() {
-    for (const n of [names.api, names.cp]) {
+    for (const n of [names.api, names.cp, names.relay]) {
       const c = await docker.inspectContainer(n);
       if (c && c.Config?.Labels?.[LABELS.owner] === owner && (c.State?.Running || c.State?.Restarting)) throw new AppError('CONTAINERS_RUNNING');
     }
@@ -74,7 +74,7 @@ export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir,
 
   /** Remove our stopped containers (they pin the volume and the images). */
   async function removeOurContainers() {
-    for (const n of [names.cp, names.api]) {
+    for (const n of [names.relay, names.cp, names.api]) {
       const c = await docker.inspectContainer(n);
       if (c && c.Config?.Labels?.[LABELS.owner] === owner) await docker.removeContainer(n);
     }

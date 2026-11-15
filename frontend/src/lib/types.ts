@@ -47,6 +47,16 @@ export interface Job {
   tail?: string;
 }
 
+/** The Ollama link while the API's LLM goes through the relay (docs/protocol.md → /-/api/status). */
+export interface OllamaStatus {
+  daemonUrl: string;
+  tunnel: { state: 'connected' | 'connecting' | 'stopped'; idle: number; error: string | null; address: string | null };
+  lastForward: { at: string; path: string; status: number | null; error: string | null } | null;
+  daemon: { ok: boolean; version: string | null; error: string | null; at: string };
+  /** Catalog errors to show as warnings (a silent daemon, a relay the plugin cannot reach). */
+  problems: CatalogError[];
+}
+
 export interface Status {
   state: HindsightState;
   error: CatalogError | null;
@@ -54,9 +64,9 @@ export interface Status {
   variant: Variant;
   bindAddress: string;
   bindAuto: boolean;
-  ports: { api: number; cp: number };
+  ports: { api: number; cp: number; relay: number };
   images: { api: ImageInfo; cp: ImageInfo } | null;
-  containers: { api: ContainerInfo; cp: ContainerInfo } | null;
+  containers: { api: ContainerInfo; cp: ContainerInfo; relay: ContainerInfo } | null;
   startedAt: string | null;
   pendingRestart: boolean;
   /** The data volume's name (typed to confirm its deletion). */
@@ -64,6 +74,8 @@ export interface Status {
   /** A previous backend could not stop the containers on SIGTERM. */
   lastShutdownFailure: { at: string; error: string } | null;
   llmMode: string;
+  /** Null unless the LLM is linked to cc's Ollama backend. */
+  ollama: OllamaStatus | null;
   autoStart?: boolean;
   job: Job | null;
   bundles: { name: string; size: number }[];
@@ -73,8 +85,8 @@ export interface Status {
 export interface Settings {
   variant: Variant;
   docker: { allowSudo: boolean };
-  network: { bindAddress: string | null; apiPort: number; cpPort: number };
-  llm: { mode: 'none' | 'manual' | 'cc-backend'; provider: string | null; model: string | null; baseUrl: string | null; backendId: string | null };
+  network: { bindAddress: string | null; apiPort: number; cpPort: number; relayPort: number };
+  llm: { mode: 'none' | 'manual' | 'cc-backend'; provider: string | null; model: string | null; baseUrl: string | null; backendId: string | null; maxConcurrent: number | null };
   embeddings: { provider: string; model: string | null; baseUrl: string | null };
   reranker: { provider: string };
 }
@@ -83,7 +95,7 @@ export interface SettingsView {
   settings: Settings;
   secrets: { llmApiKey: boolean; embeddingsApiKey: boolean };
   detectedBindAddress: string;
-  choices: { variants: Variant[]; llmModes: Settings['llm']['mode'][]; embeddingsProviders: string[]; rerankerProviders: string[] };
+  choices: { variants: Variant[]; llmModes: Settings['llm']['mode'][]; embeddingsProviders: string[]; rerankerProviders: string[]; llmMaxConcurrentMax: number };
   images: { api: Record<Variant, { ref: string; version: string }>; cp: string; version: string };
   /** On a save: user keys removed because their provider or URL changed. */
   cleared?: string[];
@@ -97,10 +109,15 @@ export interface FieldError { field: string; code?: string; message: string }
 export interface CcBackend {
   id: string;
   label: string;
+  /** `ollama`: cc's Ollama daemon, reached through the relay. */
+  kind: 'anthropic' | 'ollama' | null;
   host: string | null;
   usable: boolean;
   refusal: string | null;
-  models: { model: string; label: string }[];
+  /** Ollama rows only. */
+  daemon?: { reachable: boolean; version: string | null; error: string | null };
+  /** Ollama rows add `cloud` (served from ollama.com) and `source` (cc's list or only the daemon's). */
+  models: { model: string; label: string; cloud?: boolean; source?: 'cc' | 'daemon' }[];
 }
 
 /** A memory scope as the backend stores it (docs/protocol.md → /-/api/scopes). An absent match key matches anything. */

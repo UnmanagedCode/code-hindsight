@@ -49,7 +49,7 @@ test('status reports images, the Auto-start flag from cc, and refreshes on reque
   assert.equal(st.error.code, 'IMAGE_MISSING');
   assert.equal(st.autoStart, false);
   assert.equal(st.images.api.present, false);
-  assert.deepEqual(st.ports, { api: 18888, cp: 19999 });
+  assert.deepEqual(st.ports, { api: 18888, cp: 19999, relay: 18434 });
   const noCc = await boot(t, { seed: { images: {} } });
   assert.equal('autoStart' in (await (await fetch(`${noCc.url}/-/api/status`)).json()), false, 'omitted when cc cannot be asked');
 });
@@ -250,4 +250,93 @@ test('a backfill-import body larger than the default limit is read up to selecti
   assert.equal(pull.status, 413, 'other kinds keep the default limit');
   const huge = await post(`${url}/-/api/jobs/backfill-import`, { scanId: 'x', sessions: keys(BACKFILL_LIMITS.selectionMaxBytes + 1024), confirm: true });
   assert.equal(huge.status, 413);
+});
+
+// A fake cc whose only backend is cc's Ollama row, and a fake daemon behind it.
+async function ollamaWorld(t, { down = false } = {}) {
+  const { startFakeOllama } = await import('./support/fakeOllama.mjs');
+  const fake = await startFakeOllama(t);
+  fake.down = down;
+  const server = http.createServer((req, res) => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/api/settings/models') {
+      return res.end(JSON.stringify({
+        backends: [{ id: 'ollama', label: 'Ollama', template: 'ollama launch claude --model {model} --yes --', env: [], managed: true }],
+        backendModels: { ollama: [{ model: 'kimi-k2:cloud', label: 'Kimi' }, { model: 'qwen3:4b', label: 'Qwen' }] },
+      }));
+    }
+    res.statusCode = 404; return res.end('{}');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  t.after(() => server.close());
+  return { fake, cc: `http://127.0.0.1:${server.address().port}` };
+}
+
+// OL6: the picker route merges cc's models with the daemon's and marks cloud by remote_host.
+test('OL6: /-/api/cc-backends lists the Ollama row with daemon state and cloud/local models', async (t) => {
+  const { fake, cc } = await ollamaWorld(t);
+  const { url } = await boot(t, { seed: { images: {} }, cc, ollamaUrl: fake.url, start: false });
+  const row = (await (await fetch(`${url}/-/api/cc-backends`)).json()).backends[0];
+  assert.equal(row.kind, 'ollama');
+  assert.deepEqual(row.daemon, { reachable: true, version: '0.40.13', error: null });
+  assert.deepEqual(row.models.map((m) => [m.model, m.source, m.cloud]), [['kimi-k2:cloud', 'cc', true], ['qwen3:4b', 'cc', false]]);
+});
+
+test('OL6: with the daemon down the route still answers, daemon unreachable and every model cloud', async (t) => {
+  const { fake, cc } = await ollamaWorld(t, { down: true });
+  const { url } = await boot(t, { seed: { images: {} }, cc, ollamaUrl: fake.url, start: false });
+  const res = await fetch(`${url}/-/api/cc-backends`);
+  assert.equal(res.status, 200);
+  const row = (await res.json()).backends[0];
+  assert.equal(row.daemon.reachable, false);
+  assert.ok(row.daemon.error);
+  assert.deepEqual(row.models.map((m) => m.cloud), [true, true]);
+});
+
+// OL10 (+ status shape): linked status shows the daemon and problems, and no route returns the relay key.
+test('OL10: with an Ollama link, status carries daemon and relay state and no route returns the relay key', async (t) => {
+  const { fake, cc } = await ollamaWorld(t);
+  const llm = { mode: 'cc-backend', provider: null, model: 'qwen3:4b', baseUrl: null, backendId: 'ollama', maxConcurrent: 1 };
+  const { url, app } = await boot(t, { cc, ollamaUrl: fake.url, settings: { llm }, probe: async () => 200, cpSession: { token: async () => 't', clear() {} } });
+  t.after(() => app.supervisor.stop());
+  const key = app.secrets.get().relayKey;
+  assert.ok(key.length >= 32);
+  const st = await (await fetch(`${url}/-/api/status`)).json();
+  assert.equal(st.state, 'ready', JSON.stringify(st.error));
+  assert.equal(st.ollama.daemonUrl, fake.url);
+  assert.deepEqual([st.ollama.daemon.ok, st.ollama.daemon.version], [true, '0.40.13']);
+  assert.equal(st.containers.relay.state, 'running');
+  // Nothing listens at the fake docker's bind address: the tunnel cannot connect, and says so.
+  assert.deepEqual(st.ollama.problems.map((p) => p.code), ['RELAY_DISCONNECTED']);
+
+  const bodies = [];
+  for (const p of ['/-/api/settings', '/-/api/status', '/-/api/status?refresh=1', '/-/api/cc-backends', '/-/api/jobs', '/-/api/logs/relay']) bodies.push(await (await fetch(url + p)).text());
+  for (const b of bodies) assert.equal(b.includes(key), false, `the relay key leaked in ${b.slice(0, 80)}`);
+  const logs = await fetch(`${url}/-/api/logs/relay`);
+  assert.equal(logs.status, 200);
+});
+
+test('OL10: a down daemon is a status problem, not an error state', async (t) => {
+  const { fake, cc } = await ollamaWorld(t, { down: true });
+  const llm = { mode: 'cc-backend', provider: null, model: 'qwen3:4b', baseUrl: null, backendId: 'ollama', maxConcurrent: null };
+  const { url, app } = await boot(t, { cc, ollamaUrl: fake.url, settings: { llm }, probe: async () => 200, cpSession: { token: async () => 't', clear() {} } });
+  t.after(() => app.supervisor.stop());
+  const st = await (await fetch(`${url}/-/api/status`)).json();
+  assert.equal(st.state, 'ready');
+  assert.equal(st.ollama.daemon.ok, false);
+  assert.ok(st.ollama.problems.some((p) => p.code === 'OLLAMA_UNREACHABLE'));
+});
+
+// C-3: RELAY_DISCONNECTED needs a real tunnel failure; no idle connection yet (a burst) is not one.
+test('C-3: a connecting tunnel without an error shows no relay warning; with an error it does', async (t) => {
+  const { fake, cc } = await ollamaWorld(t);
+  let tunnel = { state: 'connecting', idle: 0, error: null, address: '127.0.0.1:18434' };
+  const relay = { start() {}, stop() {}, status: () => ({ daemonUrl: fake.url, tunnel, lastForward: null }) };
+  const llm = { mode: 'cc-backend', provider: null, model: 'qwen3:4b', baseUrl: null, backendId: 'ollama', maxConcurrent: null };
+  const { url, app } = await boot(t, { cc, ollamaUrl: fake.url, settings: { llm }, probe: async () => 200, cpSession: { token: async () => 't', clear() {} }, relay });
+  t.after(() => app.supervisor.stop());
+  const problems = async () => (await (await fetch(`${url}/-/api/status`)).json()).ollama.problems.map((p) => p.code);
+  assert.deepEqual(await problems(), []);
+  tunnel = { ...tunnel, error: 'ECONNREFUSED' };
+  assert.deepEqual(await problems(), ['RELAY_DISCONNECTED']);
 });

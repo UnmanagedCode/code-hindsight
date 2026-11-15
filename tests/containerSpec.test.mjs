@@ -2,7 +2,7 @@
 // hash adoption compares.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { apiSpec, cpSpec, embeddingsEnv, resourceNames, ownerId } from '../src/containerSpec.js';
+import { apiSpec, cpSpec, relaySpec, embeddingsEnv, resourceNames, ownerId } from '../src/containerSpec.js';
 import { DEFAULT_SETTINGS } from '../src/settings.js';
 import { API_IMAGES, LABELS } from '../src/pins.js';
 import { defaultBindAddress, defaultGateway } from '../src/netDetect.js';
@@ -15,7 +15,7 @@ const base = {
 const label = (args, key) => args[args.indexOf(`${key}=${args.find((a) => a.startsWith(`${key}=`))?.split('=')[1]}`)]?.split('=')[1];
 
 test('resource names all carry the prefix', () => {
-  assert.deepEqual(resourceNames('p'), { api: 'p-api', cp: 'p-cp', network: 'p-net', volume: 'p-data', build: 'p-build' });
+  assert.deepEqual(resourceNames('p'), { api: 'p-api', cp: 'p-cp', network: 'p-net', volume: 'p-data', build: 'p-build', relay: 'p-relay' });
   assert.equal(ownerId('/a'), ownerId('/a'));
   assert.notEqual(ownerId('/a'), ownerId('/b'));
 });
@@ -80,4 +80,29 @@ test('bind auto-detect: default gateway in a container, else loopback', () => {
   assert.equal(defaultBindAddress({ dockerenvExists: true, procNetRoute: route }), '172.20.0.1');
   assert.equal(defaultBindAddress({ dockerenvExists: false, procNetRoute: route }), '127.0.0.1');
   assert.equal(defaultBindAddress({ dockerenvExists: true, procNetRoute: 'Iface\tDestination\n' }), '127.0.0.1');
+});
+
+// OL7: the relay container: prefixed, aliased `ollama`, only the tunnel port published, run by
+// the verified API image ID, its key in env only, its hash following the script and the port.
+test('OL7: relay spec is prefixed, read-only, publishes only the tunnel port and runs the verified image', () => {
+  const o = { names, image: { id: API_IMAGES.full.ids[0] }, bind: '172.20.0.1', port: 18434, key: 'rk'.repeat(32), owner: 'o1' };
+  const s = relaySpec(o);
+  assert.equal(s.name, 'code-hindsight-relay');
+  const arg = (flag) => s.args[s.args.indexOf(flag) + 1];
+  assert.equal(arg('--network'), 'code-hindsight-net');
+  assert.equal(arg('--network-alias'), 'ollama');
+  assert.equal(arg('--entrypoint'), 'node');
+  assert.deepEqual(s.args.filter((a, i) => s.args[i - 1] === '-p'), ['172.20.0.1:18434:7070'], 'the API-facing port is not published');
+  for (const f of ['--read-only', '--cap-drop', '--security-opt']) assert.ok(s.args.includes(f), f);
+  const image = s.args.indexOf(API_IMAGES.full.ids[0]);
+  assert.ok(image > 0, 'run by the verified image ID');
+  assert.deepEqual(s.args.slice(image + 1, image + 3), ['--input-type=module', '-e']);
+  assert.match(s.args[image + 3], /HSR1/, 'the relay program is the script argument');
+  assert.equal(s.args.join(' ').includes(o.key), false, 'the key is env only');
+  assert.equal(s.env.RELAY_KEY, o.key);
+  assert.equal(label(s.args, LABELS.role), 'relay');
+  assert.equal(label(s.args, LABELS.spec), s.hash);
+  assert.notEqual(relaySpec({ ...o, port: 18435 }).hash, s.hash);
+  assert.notEqual(relaySpec({ ...o, image: { id: API_IMAGES.full.ids[1] } }).hash, s.hash);
+  assert.equal(relaySpec(o).hash, s.hash, 'deterministic');
 });

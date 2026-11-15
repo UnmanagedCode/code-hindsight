@@ -8,6 +8,7 @@
 //   FAKE_DOCKER_MODE   comma list: denied (refused unless via sudo), daemon-down, port-clash,
 //                      crash (a run/start container exits 1), fail-<subcommand>
 //   FAKE_DOCKER_VIA_SUDO  set by fake-sudo
+//   state.hangRelayInspect  (in the state file) inspecting a container named *-relay never answers
 import fs from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -79,6 +80,8 @@ switch (cmd) {
     break;
   }
   case 'inspect-container': {
+    // Test switch: state.hangRelayInspect makes inspecting the relay container never answer.
+    if (s.hangRelayInspect && rest[0].endsWith('-relay')) await new Promise(() => setTimeout(() => {}, 60_000));
     const c = s.containers[rest[0]];
     if (!c) fail(`Error response from daemon: No such container: ${rest[0]}`);
     out(JSON.stringify([c]));
@@ -118,7 +121,13 @@ switch (cmd) {
     }
     const opt = (flag) => { const i = rest.indexOf(flag); return i === -1 ? null : rest[i + 1]; };
     const name = opt('--name');
-    const image = rest[rest.length - 1];
+    // The image is the first positional after the options (a command may follow it).
+    const valued = new Set(['--name', '--network', '--network-alias', '--restart', '-p', '-v', '--label', '--env-file', '--security-opt', '--cap-drop', '--entrypoint']);
+    let image;
+    for (let i = 0; i < rest.length; i++) {
+      if (!rest[i].startsWith('-')) { image = rest[i]; break; }
+      if (valued.has(rest[i])) i++;
+    }
     if (!findImage(s, image)) fail(`Unable to find image '${image}' locally`, 125);
     if (s.containers[name]) fail(`docker: Error response from daemon: Conflict. The container name "/${name}" is already in use by container "x".`, 125);
     const envFile = opt('--env-file');
