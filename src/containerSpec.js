@@ -20,6 +20,8 @@ export function ownerId(dataDir) {
 
 /** The API's alias on the private network; the CP reaches the API by it. */
 const API_ALIAS = 'api';
+// pg0 grows DSM segments in /dev/shm during vector-index builds; Docker's 64 MiB default fails bank creation.
+const API_SHM_SIZE = '1g';
 
 function specHash(imageId, args, env) {
   const sortedEnv = Object.keys(env).sort().map((k) => `${k}=${env[k]}`);
@@ -71,6 +73,7 @@ export function apiSpec({ names, image, variant, bind, port, apiKey, llmEnv, emb
     '--restart', 'on-failure:3',
     '-p', `${bind}:${port}:${API_CONTAINER_PORT}`,
     '-v', `${names.volume}:${API_DATA_PATH}`,
+    '--shm-size', API_SHM_SIZE,
   ];
   const hash = specHash(image.id, base, env);
   const labels = { [LABELS.managed]: '1', [LABELS.owner]: owner, [LABELS.role]: 'api', [LABELS.spec]: hash };

@@ -62,6 +62,18 @@ test('CP spec: own access key, API key, API by alias, published on the bind addr
   assert.equal(s.args.at(-1), 'sha256:c');
 });
 
+// Spec 4: the API's shm holds pg0's vector-index DSM segment (bank creation).
+test('API spec: /dev/shm is large enough for bank creation', () => {
+  const OBSERVED_DSM_REQUEST = 533_795_360;
+  const units = { b: 1, k: 1024, m: 1024 ** 2, g: 1024 ** 3 };
+  const parse = (v) => { const m = /^(\d+)([bkmg]?)$/i.exec(v); assert.ok(m, `unparseable --shm-size ${v}`); return Number(m[1]) * units[(m[2] || 'b').toLowerCase()]; };
+  const { args } = apiSpec(base);
+  const i = args.indexOf('--shm-size');
+  assert.notEqual(i, -1, '--shm-size is set');
+  assert.ok(parse(args[i + 1]) >= OBSERVED_DSM_REQUEST);
+  assert.ok(i < args.indexOf('--label'), 'inside the hashed base args');
+});
+
 // Decision 9: adoption requires the same spec hash; any change in image, args or env changes it.
 test('the spec hash changes with the image, the env and the ports, and only with them', () => {
   const h = apiSpec(base).hash;
@@ -71,6 +83,9 @@ test('the spec hash changes with the image, the env and the ports, and only with
   assert.notEqual(apiSpec({ ...base, port: 18889 }).hash, h);
   assert.notEqual(apiSpec({ ...base, llmEnv: { HINDSIGHT_API_LLM_PROVIDER: 'openai' } }).hash, h);
   assert.equal(apiSpec({ ...base, owner: 'o2' }).hash, h, 'the owner label is not part of the spec');
+  // The spec hash this fixture yields without `--shm-size`.
+  const NO_SHM_HASH = '8441e108850926f702b6f4cf';
+  assert.notEqual(h, NO_SHM_HASH, 'an API container created without --shm-size is recreated');
 });
 
 // Spec 5: bind auto-detect — the gateway inside a container, loopback elsewhere.

@@ -14,6 +14,7 @@ test('real stack: start, keys, retain/recall, CP through the proxy, adoption, SI
   assert.equal(st.state, 'ready', JSON.stringify(st.error));
   assert.ok(st.docker.mode, 'docker resolved');
   const conn = app.supervisor.connection();
+  assert.ok(Number(hostDocker(['inspect', '-f', '{{.HostConfig.ShmSize}}', `${prefix}-api`]).stdout) >= 533_795_360, 'API /dev/shm holds the vector-index DSM segment');
 
   // The API refuses a request without its key.
   assert.equal((await hindsightApi(conn, 'GET', '/v1/default/banks', undefined, { key: null })).status, 401);
