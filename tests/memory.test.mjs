@@ -658,15 +658,21 @@ test('a failed workspace lookup on recall: the workspace scope gives no bank, an
   assert.match(err[0].message, /Scope ws: .*project proj: .*HTTP 500/);
 });
 
-test('a workspace lookup that hangs past the recall deadline keeps WORKSPACE_UNRESOLVED; the other scope still recalls, and the tool with only that scope rejects', async (t) => {
+// Pins: a hung workspace lookup on recall is bounded by the shared recall deadline (not WORKSPACES_TIMEOUT_MS),
+// keeps WORKSPACE_UNRESOLVED and its logging, and never recalls the undecided scope's bank.
+test('a workspace lookup that hangs is cut off by the recall deadline, logged WORKSPACE_UNRESOLVED, and its scope\'s bank is never recalled; the tool rejects when it is the only scope', async (t) => {
   const x = await setup(t, {
     scopes: [wsScope({ actions: ['recall'] }), scope({ name: 'all', bank: 'all', actions: ['recall'] })],
     limits: { ...MEMORY_LIMITS, recallDeadlineMs: 150 },
   });
+  x.hs.bank('ws-proj', [{ id: 'w', text: 'workspace note' }]);
   x.hs.bank('all', [{ id: 'a', text: 'shared note' }]);
   x.cc.failProjects('hang');
-  // The shared deadline is spent waiting, so the bank of the other scope has no time left either; the point is the code and logging.
+  const t0 = Date.now();
   const out = await recall(x.memory, S, 'q');
+  const took = Date.now() - t0;
+  assert.ok(took >= 100 && took < 600, `returned near the 150 ms recall deadline, not the default workspace cap (took ${took} ms)`);
+  assert.ok(!x.hs.recalls().some((r) => r.bank === 'ws-proj'), 'the undecided scope\'s bank is never recalled');
   const codes = errors(x.activity).map((e) => e.code);
   assert.ok(codes.includes('WORKSPACE_UNRESOLVED'));
   assert.match(errors(x.activity).find((e) => e.code === 'WORKSPACE_UNRESOLVED').message, /did not answer in time/);
