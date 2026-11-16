@@ -11,8 +11,7 @@ import { createSecretsStore } from '../src/secrets.js';
 import { createSupervisor } from '../src/supervisor.js';
 import { resourceNames, ownerId } from '../src/containerSpec.js';
 import { API_IMAGES, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, UPSTREAM_REVISION } from '../src/pins.js';
-import { createCpTrust } from '../src/trust.js';
-import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, setDockerState, fakeClock, waitFor, goodApiImage, goodCpImage, trustCp, CP_ID, FAKE_DOCKER } from './helpers.mjs';
+import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, setDockerState, fakeClock, waitFor, goodApiImage, goodCpImage, CP_ID, API_ID, FAKE_DOCKER } from './helpers.mjs';
 
 const PREFIX = 'code-hindsight';
 const names = resourceNames(PREFIX);
@@ -29,11 +28,10 @@ function fakeRelay() {
   };
 }
 
-function make(t, { mode = '', sudoMode, seed, settings, allowSudo, fetchCcModels, clock = fakeClock(), health, trusted = true, watch = false, env: envOverride } = {}) {
+function make(t, { mode = '', sudoMode, seed, settings, allowSudo, fetchCcModels, clock = fakeClock(), health, watch = false, env: envOverride } = {}) {
   const r = mkRoot(t);
   seedDocker(r, seed);
   const env = { ...fakeEnv(r, { mode, sudoMode }), ...envOverride };
-  if (trusted) trustCp(r);
   fs.mkdirSync(r.dataDir, { recursive: true, mode: 0o700 });
   const settingsStore = createSettingsStore(r.dataDir);
   const s = { ...JSON.parse(JSON.stringify(DEFAULT_SETTINGS)), ...settings };
@@ -42,7 +40,7 @@ function make(t, { mode = '', sudoMode, seed, settings, allowSudo, fetchCcModels
   const secrets = createSecretsStore(r.dataDir);
   const runDir = path.join(r.dataDir, 'run');
   fs.mkdirSync(runDir, { mode: 0o700 });
-  const docker = createDocker({ env, allowSudo: () => settingsStore.get().docker.allowSudo, prefix: PREFIX, images: [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE, BUILD_HELPER.ref], runDir });
+  const docker = createDocker({ env, allowSudo: () => settingsStore.get().docker.allowSudo, prefix: PREFIX, images: [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE, BUILD_HELPER], runDir });
   const h = health ?? { api: 200, cp: 200 };
   const probes = [];
   const probe = async (url) => { probes.push(url); return url.includes(`:${settingsStore.get().network.apiPort}/`) ? h.api : h.cp; };
@@ -51,7 +49,7 @@ function make(t, { mode = '', sudoMode, seed, settings, allowSudo, fetchCcModels
   const owner = ownerId(r.dataDir);
   const relay = fakeRelay();
   const sup = createSupervisor({
-    docker, settings: settingsStore, secrets, cpTrust: createCpTrust(r.dataDir), names, owner, dataDir: r.dataDir, detectBind: () => '127.0.0.1',
+    docker, settings: settingsStore, secrets, names, owner, dataDir: r.dataDir, detectBind: () => '127.0.0.1',
     fetchCcModels: fetchCcModels ?? (async () => { throw new Error('cc not expected'); }), cpSession, probe, clock, watch, relay,
     log: () => {},
   });
@@ -102,7 +100,7 @@ test('a second backend adopts the running containers: no run, stop or rm', async
   await first.sup.ensureRunning();
   fs.writeFileSync(first.r.logPath, '');
   const again = createSupervisor({
-    docker: first.docker, settings: first.settingsStore, secrets: first.secrets, cpTrust: createCpTrust(first.r.dataDir), names, owner: first.owner, dataDir: first.r.dataDir,
+    docker: first.docker, settings: first.settingsStore, secrets: first.secrets, names, owner: first.owner, dataDir: first.r.dataDir,
     detectBind: () => '127.0.0.1', fetchCcModels: async () => { throw new Error('x'); }, cpSession: { token: async () => 't', clear() {} }, relay: fakeRelay(),
     probe: async () => 200, clock: fakeClock(), watch: false, log: () => {},
   });
@@ -132,8 +130,8 @@ test('a changed spec recreates the container and keeps the volume', async (t) =>
 test('a container on an outdated image ID is recreated', async (t) => {
   const { r, sup } = make(t);
   await sup.ensureRunning();
-  // Another pinned form of the same release (e.g. after a pull on a classic-store daemon).
-  const other = API_IMAGES.full.ids[1];
+  // The tag re-pulled to new content.
+  const other = `sha256:${'1'.repeat(64)}`;
   setDockerState(r, (s) => { s.images[API_IMAGES.full.ref] = { ...goodApiImage('full'), Id: other }; });
   fs.writeFileSync(r.logPath, '');
   await sup.ensureRunning();
@@ -162,13 +160,6 @@ test('missing or mismatched images are named and nothing is created', async (t) 
   assert.equal(missing.sup.status().error.params.image, API_IMAGES.full.ref);
   assert.equal(missing.sup.status().error.action, 'pull');
   assert.ok(!cmds(missing.r).some((c) => ['run', 'network create', 'volume create'].includes(c)));
-
-  // S2: the right labels on another image ID (a loaded look-alike) are refused.
-  const forged = make(t, { seed: { images: { [API_IMAGES.full.ref]: { ...goodApiImage('full'), Id: `sha256:${'f'.repeat(64)}` }, [CP_IMAGE]: goodCpImage() } } });
-  await forged.sup.ensureRunning();
-  assert.equal(errCode(forged.sup), 'IMAGE_MISMATCH');
-  assert.equal(forged.sup.status().error.params.id, `sha256:${'f'.repeat(64)}`);
-  assert.ok(!cmds(forged.r).includes('run'));
 
   const noCp = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage('full') } } });
   await noCp.sup.ensureRunning();
@@ -214,7 +205,7 @@ test('a foreign resource with our name is NAME_TAKEN and left alone', async (t) 
   assert.equal(errCode(net.sup), 'NAME_TAKEN');
   assert.equal(net.sup.status().error.params.kind, 'network');
 
-  const ctr = make(t, { seed: { containers: { [names.api]: { Name: `/${names.api}`, Image: API_IMAGES.full.ids[0], Config: { Labels: { [LABELS.owner]: 'someone-else' } }, State: { Status: 'running', Running: true } } } } });
+  const ctr = make(t, { seed: { containers: { [names.api]: { Name: `/${names.api}`, Image: API_ID, Config: { Labels: { [LABELS.owner]: 'someone-else' } }, State: { Status: 'running', Running: true } } } } });
   await ctr.sup.ensureRunning();
   assert.equal(errCode(ctr.sup), 'NAME_TAKEN');
   assert.ok(!cmds(ctr.r).some((c) => ['rm', 'stop', 'run'].includes(c)), 'the foreign container is untouched');
@@ -395,7 +386,7 @@ function makeOver(t, r, { mode = '', timeouts } = {}) {
   const secrets = createSecretsStore(r.dataDir);
   const docker = createDocker({ env: fakeEnv(r, { mode }), allowSudo: () => true, prefix: PREFIX, images: [API_IMAGES.full.ref], runDir: path.join(r.dataDir, 'run') });
   const sup = createSupervisor({
-    docker, settings: settingsStore, secrets, cpTrust: createCpTrust(r.dataDir), names, owner: ownerId(r.dataDir), dataDir: r.dataDir,
+    docker, settings: settingsStore, secrets, names, owner: ownerId(r.dataDir), dataDir: r.dataDir,
     detectBind: () => '127.0.0.1', fetchCcModels: async () => ({}), cpSession: { token: async () => 't', clear() {} }, relay: fakeRelay(),
     probe: async () => 200, clock: fakeClock(), watch: false, log: () => {}, timeouts,
   });
@@ -448,30 +439,31 @@ test('every docker call targets only prefixed resources and none connects a netw
   for (const n of named) assert.ok(n.startsWith(`${PREFIX}-`), n);
 });
 
-// S2: the CP image runs only under the ID this plugin built or the user confirmed.
-test('a CP image whose ID is not the trusted one is CP_IMAGE_UNTRUSTED, with its ID, and not run', async (t) => {
-  const none = make(t, { trusted: false });
-  await none.sup.ensureRunning();
-  const e = none.sup.status().error;
-  assert.equal(e.code, 'CP_IMAGE_UNTRUSTED');
-  assert.equal(e.params.id, CP_ID);
-  assert.equal(e.action, 'trust-cp');
-  assert.equal(none.sup.status().images.cp.trusted, false);
-  assert.ok(!cmds(none.r).includes('run'));
+// Directive: no ID check; an API image under the pinned tag runs whatever its ID and labels.
+test('an API image under the pinned tag runs whatever its ID and labels', async (t) => {
+  const odd = `sha256:${'f'.repeat(64)}`;
+  const { r, sup } = make(t, { seed: { images: { [API_IMAGES.full.ref]: { Id: odd, Config: { Labels: {} } }, [CP_IMAGE]: goodCpImage() } } });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  assert.equal(dockerCalls(r).find((a) => a[0] === 'run' && a.includes(odd)).at(-1), odd);
+});
 
+// Directive: no CP trust; a CP image with this plugin's build labels runs whatever its ID.
+test('a CP image under its tag with this plugin\'s build labels runs whatever its ID; no trust file is read or written', async (t) => {
   const swapped = make(t);
   setDockerState(swapped.r, (s) => { s.images[CP_IMAGE] = goodCpImage(`sha256:${'d'.repeat(64)}`); });
   await swapped.sup.ensureRunning();
-  assert.equal(errCode(swapped.sup), 'CP_IMAGE_UNTRUSTED', 'a retagged or imported image replaces the trusted one');
-  assert.equal(BASE_PATH, goodCpImage().Config.Labels[LABELS.basePath], 'labels alone are not enough');
+  assert.equal(swapped.sup.status().state, 'ready', JSON.stringify(swapped.sup.status().error));
+  assert.ok(!fs.existsSync(path.join(swapped.r.dataDir, 'trusted-cp.json')));
+  assert.ok(!('trusted' in swapped.sup.status().images.cp));
 });
 
-// S2: containers run by the verified ID, so a retag between check and run cannot swap them.
+// Containers run by the ID the tag resolved to at start.
 test('both containers are run by image ID, never by tag', async (t) => {
   const { r, sup } = make(t);
   await sup.ensureRunning();
   const runs = dockerCalls(r).filter((a) => a[0] === 'run').map((a) => a.at(-1));
-  assert.deepEqual(runs, [API_IMAGES.full.ids[0], CP_ID]);
+  assert.deepEqual(runs, [API_ID, CP_ID]);
 });
 
 /** A clock whose sleeps resolve only on tick(). */

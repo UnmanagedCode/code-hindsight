@@ -1,14 +1,14 @@
 // The only module that runs docker. It resolves how docker is invoked (directly, or through
 // `sudo -n` when allowed), classifies failures into catalog errors, and refuses to touch any
 // container, volume or network whose name lacks this plugin's prefix, or any image that is
-// not pinned.
+// a pinned tag.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { AppError } from './errors.js';
 import { writePrivateFileAtomic } from './fsPrivate.js';
-import { isPinnedHelper } from './trust.js';
+import { BUILD_HELPER } from './pins.js';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 /** The Docker host's socket, mounted into the build helper so its buildx drives the same daemon. */
@@ -245,13 +245,13 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
     save: (refs, sink) => exec(['save', ...refs.map(assertPinnedImage)], { stdout: sink, timeoutMs: 60 * 60_000 }),
     removeImages: (refs) => exec(['rmi', ...refs.map(assertPinnedImage)]),
     /**
-     * Run the build helper with the host's Docker socket mounted. Only an image whose ID is
-     * pinned (BUILD_HELPER.ids) gets the socket, and it is run by that ID, never by a tag.
+     * Run the build helper with the host's Docker socket mounted. Only the pinned BUILD_HELPER
+     * tag gets the socket; any other image ref is refused.
      */
-    runHelper(name, imageId, command, onLine) {
+    runHelper(name, ref, command, onLine) {
       assertOwnedName(name);
-      if (!isPinnedHelper(imageId)) throw new Error(`refusing to give the Docker socket to image ${imageId}: not the pinned build helper`);
-      return exec(['run', '--rm', '--name', name, '-v', `${HOST_DOCKER_SOCKET}:${HOST_DOCKER_SOCKET}`, imageId, ...command], { onLine, timeoutMs: 2 * 60 * 60_000 });
+      if (ref !== BUILD_HELPER) throw new Error(`refusing to give the Docker socket to image ${ref}: not the pinned build helper`);
+      return exec(['run', '--rm', '--name', name, '-v', `${HOST_DOCKER_SOCKET}:${HOST_DOCKER_SOCKET}`, ref, ...command], { onLine, timeoutMs: 2 * 60 * 60_000 });
     },
   };
 }

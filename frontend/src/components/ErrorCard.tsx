@@ -12,7 +12,6 @@ export const ACTION_LABELS: Record<ErrorAction, string> = {
   restart: 'Restart Hindsight',
   settings: 'Open Settings',
   stop: 'Stop Hindsight',
-  'trust-cp': 'Review the image',
 };
 
 /** A catalog error from the backend: its title, its message (text only) and its one action. */

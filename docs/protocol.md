@@ -24,7 +24,7 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 | Method | Path | Body → answer |
 |---|---|---|
 | GET | `/-/api/health` | `{ok: true}` — always 200, whatever Hindsight's state (the manifest's `healthPath`) |
-| GET | `/-/api/status[?refresh=1]` | `{state, error, docker: {mode, serverVersion}, variant, bindAddress, bindAuto, ports: {api, cp, relay}, images: {api: {ref, present, id, version, ok}, cp: {ref, present, id, basePath, upstream, built, trusted, ok}} \| null, containers: {api, cp, relay} \| null, startedAt, pendingRestart, volume, lastShutdownFailure: {at, error} \| null, llmMode, relay: {target: {kind: ollama\|anthropic-loopback, url}, tunnel: {state: connected\|connecting\|stopped, idle, error, address}, lastForward: {at, path, status, error} \| null, upstream: {ok, version, error, at} \| null, problems: [catalog error]} \| null, autoStart?, job, bundles: [{name, size}], bundleNames: {full, slim}}`. `relay` is set only while the API's LLM goes through the relay; it never holds a credential, and `upstream` is the target's cached answer (`problems`: `OLLAMA_UNREACHABLE` or `CC_BACKEND_UNREACHABLE`, and `RELAY_DISCONNECTED`). `refresh=1` re-inspects images and containers first. `autoStart` is cc's flag for this plugin, omitted when cc cannot be asked |
+| GET | `/-/api/status[?refresh=1]` | `{state, error, docker: {mode, serverVersion}, variant, bindAddress, bindAuto, ports: {api, cp, relay}, images: {api: {ref, present, id, version, ok}, cp: {ref, present, id, basePath, upstream, built, ok}} \| null, containers: {api, cp, relay} \| null, startedAt, pendingRestart, volume, lastShutdownFailure: {at, error} \| null, llmMode, relay: {target: {kind: ollama\|anthropic-loopback, url}, tunnel: {state: connected\|connecting\|stopped, idle, error, address}, lastForward: {at, path, status, error} \| null, upstream: {ok, version, error, at} \| null, problems: [catalog error]} \| null, autoStart?, job, bundles: [{name, size}], bundleNames: {full, slim}}`. `relay` is set only while the API's LLM goes through the relay; it never holds a credential, and `upstream` is the target's cached answer (`problems`: `OLLAMA_UNREACHABLE` or `CC_BACKEND_UNREACHABLE`, and `RELAY_DISCONNECTED`). `refresh=1` re-inspects images and containers first. `autoStart` is cc's flag for this plugin, omitted when cc cannot be asked |
 | GET | `/-/api/settings` | `{settings, secrets: {llmApiKey: bool, embeddingsApiKey: bool}, defaults, detectedBindAddress, choices, images}` |
 | PUT | `/-/api/settings` | `{settings, secrets?: {llmApiKey?, embeddingsApiKey?}}` — the whole settings object; a secret string sets, `null`/`""` clears, absent keeps — except that an absent key whose endpoint changed is cleared (`keyEndpoints` in `src/settings.js`: LLM mode/provider/base URL; embeddings provider/base URL). `400 SETTINGS_INVALID` with `params.fields: [{field, code?, message}]` changes nothing. Answers the settings view plus `cleared: [key names]` and `status` |
 | GET | `/-/api/scopes` | `{scopes, choices: {actions, kinds, placeholders, limits}}` |
@@ -52,19 +52,18 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 
 | `<kind>` | Body | Result |
 |---|---|---|
-| `pull` | `{variant: "full"\|"slim"}` | `{image, id, pinned}` — `id` is the pulled image's ID (`null` if absent), `pinned` whether it is a pinned ID |
-| `build-cp` | `{}` | `{image, id}` — the built image's ID, now trusted |
-| `import` | `{path: "/abs/file.tar"}` (or the octet-stream upload) | `{loaded: [{ref, id, status: pinned\|not-pinned\|trusted\|needs-confirmation\|unused}], manifest: <code-hindsight-bundle.json> \| null}` |
-| `trust-cp` | `{confirm: "<the CP image's current ID>"}` | `{image, id}` — records it as the trusted CP image |
+| `pull` | `{variant: "full"\|"slim"}` | `{image, id}` — `id` is the pulled image's ID (`null` if absent) |
+| `build-cp` | `{}` | `{image, id}` — the built image's ID |
+| `import` | `{path: "/abs/file.tar"}` (or the octet-stream upload) | `{loaded: [{ref, id, status: pinned\|wrong-build\|unused}], manifest: <code-hindsight-bundle.json> \| null}` |
 | `export` | `{variant}` | `{name, path, size, sha256, images: [{ref, id}]}` |
 | `remove-images` | `{confirm: true}` | `{removed: [refs]}` (the pinned API refs and `CP_IMAGE` that were present) |
 | `delete-volume` | `{confirm: "<volume name>"}` | `{removed: "<volume name>" \| null}` (`null` when there was no volume) |
 | `backfill-scan` | `{fresh?: boolean}` | `{scanId, totals, hindsightChecked}`; the full scan is `GET /-/api/memory/backfill`. Refused `BACKFILL_NO_SCOPES` (no scope grants retain), `BACKFILL_CC_UNAVAILABLE` (no `CONDUCTOR_URL`), `SCOPES_INVALID`; fails `BACKFILL_CC_UNAVAILABLE` after `BACKFILL_LIMITS.ccFailuresMax` consecutive cc failures |
 | `backfill-import` | `{scanId, sessions: [key], confirm: true}` (body up to `BACKFILL_LIMITS.selectionMaxBytes`) | `{sessions, documents: {sent, replaced, alreadyImported, queued, retried, deleted}, failed: [{key, code, message}], skipped: [{key, code, message}], banks}`. Refused `CONFIRMATION_REQUIRED` (`params.expected: "confirm: true"`), `BACKFILL_STALE` (not the latest scan, or the saved scopes changed since), `BACKFILL_UNCHECKED` (the scan ran with `hindsightChecked: false`), `BAD_REQUEST` (an empty list, or a key that is not a `ready` row of that scan), `HINDSIGHT_NOT_READY` |
 
-- `remove-images` and `delete-volume` refuse `CONFIRMATION_REQUIRED` without their confirmation and fail `CONTAINERS_RUNNING` while a container of this plugin runs. `trust-cp` refuses `CONFIRMATION_REQUIRED` (with `params.expected` = the current ID) when the ID does not match.
-- `build-cp` inspects `BUILD_HELPER.ref` (a digest reference), pulls it when missing, fails `HELPER_UNTRUSTED` unless its ID is in `BUILD_HELPER.ids`, then runs `docker run --rm --name <prefix>-build -v /var/run/docker.sock:/var/run/docker.sock <helper ID> docker buildx build <repo>#<UPSTREAM_REVISION> …` (`buildCpCommand` in `src/jobs.js`) and records the built image's ID as trusted.
-- After a successful `pull`, `build-cp`, `import` or `trust-cp`, Hindsight starts if it was asked to run and is in `error`; the other Docker jobs only re-read images and containers. The backfill jobs never resolve docker and never touch Hindsight's lifecycle.
+- `remove-images` and `delete-volume` refuse `CONFIRMATION_REQUIRED` without their confirmation and fail `CONTAINERS_RUNNING` while a container of this plugin runs.
+- `build-cp` inspects `BUILD_HELPER` (a tag), pulls it when missing, then runs `docker run --rm --name <prefix>-build -v /var/run/docker.sock:/var/run/docker.sock <BUILD_HELPER> docker buildx build <repo>#<UPSTREAM_REVISION> …` (`buildCpCommand` in `src/jobs.js`).
+- After a successful `pull`, `build-cp` or `import`, Hindsight starts if it was asked to run and is in `error`; the other Docker jobs only re-read images and containers. The backfill jobs never resolve docker and never touch Hindsight's lifecycle.
 - One job runs at a time across all kinds. `backfill-scan` and `backfill-import` are cancellable: they stop at their next file, document or request.
 
 ### Backfill
@@ -106,20 +105,19 @@ Import, per session in scan order, acting only on the confirmed plan: `lstat` mu
 
 `$CLAUDE_CONFIG_DIR/projects`, else `~/.claude/projects` (Claude Code's own rule; `claudeProjectsDir` in `src/config.js`). Read only by `backfill-scan` and `backfill-import`.
 
-### Image trust (`src/trust.js`)
+### Image references (`src/pins.js`, `src/trust.js`)
 
 | Image | Runs when |
 |---|---|
-| API (`API_IMAGES[variant]`) | its `.Id` is in `API_IMAGES[variant].ids` (else `IMAGE_MISMATCH`); labels are shown, never trusted |
-| CP (`CP_IMAGE`) | it carries the base-path and upstream-revision labels (else `CP_IMAGE_MISMATCH`) **and** its `.Id` equals `trusted-cp.json`'s (else `CP_IMAGE_UNTRUSTED`) |
-| Build helper (`BUILD_HELPER`) | its `.Id` is in `BUILD_HELPER.ids` (else `HELPER_UNTRUSTED`); only then is it given the Docker socket |
+| API (`API_IMAGES[variant]`) | the pinned tag is present (else `IMAGE_MISSING`) |
+| CP (`CP_IMAGE`) | present (else `CP_IMAGE_MISSING`) with the base-path and upstream-revision labels (else `CP_IMAGE_MISMATCH`; `isOurCpBuild`) |
+| Build helper (`BUILD_HELPER`) | the pinned tag, pulled when missing; `runHelper` refuses any other ref |
 
-- Each pinned image lists its index digest (what `.Id` is under the containerd image store) and its linux/amd64 and linux/arm64 config digests (what `.Id` is under the classic store).
-- Containers run by the verified ID, never by tag.
+- Containers run by the image ID the tag resolved to at start; a different ID recreates them.
 
 ### Bundles
 
-An export is the `docker save` archive with one extra root file, `code-hindsight-bundle.json` (`BUNDLE_MANIFEST`): `{format: 1, hindsight, variant, images: [{ref, id}], createdAt}`. `docker load` ignores it; the import job reads it back. It is informational: what runs is decided by the loaded images' own IDs.
+An export is the `docker save` archive with one extra root file, `code-hindsight-bundle.json` (`BUNDLE_MANIFEST`): `{format: 1, hindsight, variant, images: [{ref, id}], createdAt}`. `docker load` ignores it; the import job reads it back. It is informational: nothing checks it.
 
 ## Hook and tool routes (`src/hookRoutes.js`)
 
@@ -168,7 +166,6 @@ Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP f
 | `memory/cursors.json` (0600) | per `CC_SESSION_ID`: `{lastId, lastTs, inflight?, pending, at}` — the last retained turn; the batch being sent (kept so a retry resends it unchanged); and `pending`, the windows of unsent turns `{bank \| null, session, lastId, lastTs}` in order, each with the bank its own stage chose. A Stop whose tail carries a timestamp more than `MEMORY_LIMITS.clockSkewMs` ahead of the backend's clock is refused and logged `RETAIN_FUTURE` (it would otherwise make later Stops look old). A Stop whose tail is provably older than the newest recorded end is ignored (best effort where nothing can be proven). An entry of the wrong shape is dropped (`CURSOR_INVALID`); a file unreadable as a whole is moved aside to `memory/cursors.json.corrupt`. Turn ids must be non-empty and at most `TURN_ID_MAX` characters (else `400`); entries older than `CURSOR_MAX_AGE_MS` are pruned on write. Losing it can duplicate turns |
 | `memory/backfill-placements.json` (0600) | `{version: 2, files: {"<dir>/<backingId>.jsonl": {size, mtimeMs, handle, outcome: placed\|unplaceable, session?, title?, detail?, summary?: {totalTurns, totalChars, turns, firstAt, lastAt, parts: [{chars, hash, firstId, lastId}], turnTooLarge, sessionTooLarge, malformed, oversized, …}}}}` (the summary of the whole file, without a cutoff) — what cc said about each transcript and its parse summary, used while the file's size and mtime are unchanged; cc's settled refusals are kept, live sessions and cc failures never. Entries of files gone are pruned after each scan; `fresh` rewrites it. Unreadable as a whole, or of another version (`PLACEMENTS_VERSION`, `src/backfillPlacements.js`) → moved aside to `memory/backfill-placements.json.corrupt` and rebuilt. Never holds transcript text |
 | `logs/memory.jsonl` (+ `.1`) | the activity log (rotated at `ACTIVITY_LIMITS.rotateBytes`) |
-| `trusted-cp.json` (0600) | `{id, source: build\|confirmed, at}`: the CP image ID allowed to run |
 | `run/` | short-lived `--env-file`s for `docker run`, removed after each run |
 | `logs/jobs/<id>.log` | each job's output |
 | `bundles/code-hindsight-<version>-<variant>.tar` (0600) | exported bundles |
@@ -186,15 +183,15 @@ Labels (`LABELS` in `src/pins.js`):
 | `io.code-hindsight.role` | containers | `api` / `cp` / `relay` |
 | `io.code-hindsight.spec` | containers | hash of image ID, run arguments and env; a mismatch recreates the container |
 | `io.code-hindsight.embeddings` | volume | `local` or `<provider>:<model>`; a mismatch with the settings is `EMBEDDINGS_CHANGED` |
-| `io.code-hindsight.basePath`, `io.code-hindsight.upstream` | CP image | the base path and upstream commit it was built with; checked before start (`CP_IMAGE_MISMATCH`), but trust comes from the ID |
+| `io.code-hindsight.basePath`, `io.code-hindsight.upstream` | CP image | the base path and upstream commit it was built with; checked before start (`CP_IMAGE_MISMATCH`) |
 
 ### Container environment (`apiSpec` / `cpSpec` in `src/containerSpec.js`)
 
-- Both run by image ID (the last `docker run` argument).
+- Both run by the image ID the pinned tag resolved to at start (the last `docker run` argument).
 - **API** (`<prefix>-api`, alias `api` on `<prefix>-net`, `-p <bind>:<apiPort>:8888`, volume at `/home/hindsight/.pg0`, `--restart on-failure:3`, `--shm-size <API_SHM_SIZE in src/containerSpec.js>`: pg0 vector-index builds use `/dev/shm`, and Docker's 64 MiB default fails bank creation): `HINDSIGHT_ENABLE_CP=false`, `HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension`, `HINDSIGHT_API_TENANT_API_KEY`; full image: `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`; LLM: `HINDSIGHT_API_LLM_PROVIDER` (`none` by default), `_MODEL`, `_BASE_URL`, `_API_KEY`; `HINDSIGHT_API_EMBEDDINGS_PROVIDER` (+ `_OPENAI_MODEL`, `_OPENAI_BASE_URL`, `_OPENAI_API_KEY`), `HINDSIGHT_API_RERANKER_PROVIDER`.
 - **CP** (`<prefix>-cp`, on `<prefix>-net`, `-p <bind>:<cpPort>:9999`, `--restart on-failure:3`): `HINDSIGHT_CP_DATAPLANE_API_URL=http://api:8888`, `HINDSIGHT_CP_DATAPLANE_API_KEY`, `HINDSIGHT_CP_ACCESS_KEY`.
 - Env reaches `docker run` through a 0600 `--env-file`, never the command line.
-- **Relay** (`relaySpec`; `<prefix>-relay`, alias and API-side port from the active target's entry in `RELAY_TARGETS` in `src/pins.js`, `-p <bind>:<relayPort>:<RELAY_TUNNEL_PORT>`, only the tunnel port published, `--read-only --cap-drop ALL --security-opt no-new-privileges`, `--restart on-failure:3`): runs the verified API image ID with `--entrypoint node --input-type=module -e <src/relay/relay.mjs>`, so its spec hash follows the script. Env set by the plugin: `RELAY_KEY`, `RELAY_API_PORT`, `RELAY_TUNNEL_PORT`, `RELAY_MAX_WAITING` (`LLM_MAX_CONCURRENT_MAX` in `src/settings.js`). Optional, with defaults in `src/relay/relay.mjs`: `RELAY_WAIT_MS` (how long an API connection waits for an idle tunnel), `RELAY_HANDSHAKE_MS`, `RELAY_ACK_MS` (how long a paired tunnel may take to ack), `RELAY_MAX_HANDSHAKING` (tunnel sockets still in their handshake). Created before the API while linked (a change of target recreates it: its spec hash includes the alias and port); removed when unlinked.
+- **Relay** (`relaySpec`; `<prefix>-relay`, alias and API-side port from the active target's entry in `RELAY_TARGETS` in `src/pins.js`, `-p <bind>:<relayPort>:<RELAY_TUNNEL_PORT>`, only the tunnel port published, `--read-only --cap-drop ALL --security-opt no-new-privileges`, `--restart on-failure:3`): runs the API image's ID with `--entrypoint node --input-type=module -e <src/relay/relay.mjs>`, so its spec hash follows the script. Env set by the plugin: `RELAY_KEY`, `RELAY_API_PORT`, `RELAY_TUNNEL_PORT`, `RELAY_MAX_WAITING` (`LLM_MAX_CONCURRENT_MAX` in `src/settings.js`). Optional, with defaults in `src/relay/relay.mjs`: `RELAY_WAIT_MS` (how long an API connection waits for an idle tunnel), `RELAY_HANDSHAKE_MS`, `RELAY_ACK_MS` (how long a paired tunnel may take to ack), `RELAY_MAX_HANDSHAKING` (tunnel sockets still in their handshake). Created before the API while linked (a change of target recreates it: its spec hash includes the alias and port); removed when unlinked.
 - **Ollama mapping** (cc backend whose launch command starts with `ollama`): `HINDSIGHT_API_LLM_PROVIDER=ollama`, `_MODEL=` the chosen model, `_BASE_URL=http://<alias>:<apiPort>/v1` (the `ollama` entry of `RELAY_TARGETS`), `_API_KEY=` the relay key (the provider sends it as a Bearer token).
 - **Anthropic-loopback mapping** (cc backend whose `ANTHROPIC_BASE_URL` is a plain-HTTP loopback address): `HINDSIGHT_API_LLM_PROVIDER=anthropic`, `_MODEL=` the chosen model as written, `_BASE_URL=http://<alias>:<apiPort>` (the `anthropic-loopback` entry of `RELAY_TARGETS`, no path), `_API_KEY=` the relay key (the SDK sends it as `x-api-key`). The row's own token never enters the container env.
 - **`HINDSIGHT_API_LLM_MAX_CONCURRENT`** is set from `llm.maxConcurrent` in every non-`none` mode when it is not null.

@@ -17,7 +17,7 @@ export function Images({ status, onChanged }: { status: Status; onChanged: () =>
   const [hostPath, setHostPath] = useState('');
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
-  const [confirm, setConfirm] = useState<'remove-images' | 'delete-volume' | 'trust-cp' | null>(null);
+  const [confirm, setConfirm] = useState<'remove-images' | 'delete-volume' | null>(null);
   const [typed, setTyped] = useState('');
   const busy = !!status.job || uploading;
 
@@ -49,7 +49,6 @@ export function Images({ status, onChanged }: { status: Status; onChanged: () =>
   };
 
   const volume = status.volume;
-  const cp = status.images?.cp;
   const exportName = status.bundleNames[exportVariant];
   const exported = status.bundles.find((b) => b.name === exportName);
   return (
@@ -76,22 +75,6 @@ export function Images({ status, onChanged }: { status: Status; onChanged: () =>
           </div>
         </CardContent>
       </Card>
-
-      {cp?.present && !cp.trusted && cp.id && (
-        <Card data-card="trust-cp">
-          <CardHeader>
-            <CardTitle>Control-plane image not trusted</CardTitle>
-            <CardDescription>
-              This control-plane image was not built here, or was replaced (an import, a retag). It runs inside cc's page with your memories, so it runs only after you confirm this exact image ID — or build it here instead.
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-2 text-sm">
-            <p>{cp.ref}</p>
-            <code className="block break-all rounded bg-muted p-2 text-xs" aria-label="Control-plane image ID">{cp.id}</code>
-            <Button size="sm" variant="outline" disabled={busy} onClick={() => setConfirm('trust-cp')}>Trust this image…</Button>
-          </CardContent>
-        </Card>
-      )}
 
       <Card>
         <CardHeader>
@@ -141,30 +124,27 @@ export function Images({ status, onChanged }: { status: Status; onChanged: () =>
       <Dialog open={confirm !== null} onOpenChange={(o) => { if (!o) setConfirm(null); }}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{confirm === 'delete-volume' ? 'Delete all memories?' : confirm === 'trust-cp' ? 'Trust this control-plane image?' : 'Remove the Hindsight images?'}</DialogTitle>
+            <DialogTitle>{confirm === 'delete-volume' ? 'Delete all memories?' : 'Remove the Hindsight images?'}</DialogTitle>
             <DialogDescription>
               {confirm === 'delete-volume'
                 ? `This deletes the Docker volume ${volume} and every memory in it. Type its name to confirm.`
-                : confirm === 'trust-cp'
-                  ? `Only trust it if you know where it came from, e.g. a bundle you exported yourself (compare the ID with the export's). Image ID: ${cp?.id ?? ''}`
-                  : 'This removes the pinned API images and the control-plane image. You will need to pull, build or import them again.'}
+                : 'This removes the pinned API images and the control-plane image. You will need to pull, build or import them again.'}
             </DialogDescription>
           </DialogHeader>
           {confirm === 'delete-volume' && <Input aria-label="Volume name" value={typed} onChange={(e) => setTyped(e.target.value)} />}
           <DialogFooter>
             <DialogClose asChild><Button type="button" variant="ghost">Cancel</Button></DialogClose>
             <Button
-              variant={confirm === 'trust-cp' ? 'default' : 'destructive'}
+              variant="destructive"
               disabled={confirm === 'delete-volume' && typed !== volume}
               onClick={() => {
                 const kind = confirm;
                 setConfirm(null);
                 if (kind === 'delete-volume') void start('delete-volume', { confirm: typed });
-                else if (kind === 'trust-cp') void start('trust-cp', { confirm: cp?.id });
                 else if (kind) void start('remove-images', { confirm: true });
               }}
             >
-              {confirm === 'delete-volume' ? 'Delete volume' : confirm === 'trust-cp' ? 'Trust image' : 'Remove images'}
+              {confirm === 'delete-volume' ? 'Delete volume' : 'Remove images'}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import net from 'node:net';
 import { spawn } from 'node:child_process';
-import { mkRoot, fakeEnv, seedDocker, writeSettings, dockerCalls, waitFor, trustCp, REPO } from './helpers.mjs';
+import { mkRoot, fakeEnv, seedDocker, writeSettings, dockerCalls, waitFor, REPO } from './helpers.mjs';
 import { DEFAULT_SETTINGS } from '../src/settings.js';
 
 const freePort = () => new Promise((res) => { const s = net.createServer().listen(0, '127.0.0.1', () => { const p = s.address().port; s.close(() => res(p)); }); });
@@ -16,7 +16,6 @@ const freePort = () => new Promise((res) => { const s = net.createServer().liste
 test('node server.js: health at once, Hindsight starting, SIGTERM → detached docker stop + stopping.json', async (t) => {
   const r = mkRoot(t);
   seedDocker(r);
-  trustCp(r);
   // Ports nothing listens on, so the health wait just keeps waiting.
   writeSettings(r, { ...DEFAULT_SETTINGS, network: { bindAddress: '127.0.0.1', apiPort: await freePort(), cpPort: await freePort() } });
   const port = await freePort();

@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createDocker, classifyDockerError } from '../src/docker.js';
-import { API_IMAGES, CP_IMAGE } from '../src/pins.js';
+import { API_IMAGES, BUILD_HELPER, CP_IMAGE } from '../src/pins.js';
 import { mkRoot, fakeEnv, seedDocker, dockerCalls, FAKE_DOCKER } from './helpers.mjs';
 
 const IMAGES = [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE];
@@ -88,7 +88,7 @@ test('the name guard refuses every resource outside the prefix', async (t) => {
     () => docker.stopContainers(['code-hindsight-api', 'code-conductor-conductor-1']),
     () => docker.logs('mystery'),
     () => docker.runContainer({ args: ['-d', '--name', 'evil', 'img'], env: {} }),
-    () => docker.runHelper('build', [], () => {}),
+    () => docker.runHelper('build', BUILD_HELPER, [], () => {}),
     () => docker.stopDetached(['code-conductor-conductor-1']),
   ]) {
     await assert.rejects(async () => call(), /refusing to touch/);

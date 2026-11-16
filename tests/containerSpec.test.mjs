@@ -4,12 +4,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { apiSpec, cpSpec, relaySpec, embeddingsEnv, resourceNames, ownerId } from '../src/containerSpec.js';
 import { DEFAULT_SETTINGS } from '../src/settings.js';
-import { API_IMAGES, LABELS, RELAY_TARGETS } from '../src/pins.js';
+import { LABELS, RELAY_TARGETS } from '../src/pins.js';
+import { API_ID } from './helpers.mjs';
+
+const OTHER_ID = `sha256:${'b'.repeat(64)}`;
 import { defaultBindAddress, defaultGateway } from '../src/netDetect.js';
 
 const names = resourceNames('code-hindsight');
 const base = {
-  names, image: { id: API_IMAGES.full.ids[0] }, variant: 'full', bind: '172.20.0.1', port: 18888,
+  names, image: { id: API_ID }, variant: 'full', bind: '172.20.0.1', port: 18888,
   apiKey: 'k'.repeat(64), llmEnv: { HINDSIGHT_API_LLM_PROVIDER: 'none' }, embeddingsEnv: embeddingsEnv(DEFAULT_SETTINGS, {}), owner: 'o1',
 };
 const label = (args, key) => args[args.indexOf(`${key}=${args.find((a) => a.startsWith(`${key}=`))?.split('=')[1]}`)]?.split('=')[1];
@@ -26,7 +29,7 @@ test('API spec: keyed, API-only, published on the bind address, data volume, HF 
   assert.equal(s.name, 'code-hindsight-api');
   assert.deepEqual(s.args.slice(0, 12), ['-d', '--name', 'code-hindsight-api', '--network', 'code-hindsight-net', '--network-alias', 'api', '--restart', 'on-failure:3', '-p', '172.20.0.1:18888:8888', '-v']);
   assert.equal(s.args[12], 'code-hindsight-data:/home/hindsight/.pg0');
-  assert.equal(s.args.at(-1), API_IMAGES.full.ids[0], 'run by the verified image ID, not a tag');
+  assert.equal(s.args.at(-1), API_ID, 'run by the verified image ID, not a tag');
   assert.equal(s.env.HINDSIGHT_ENABLE_CP, 'false');
   assert.equal(s.env.HINDSIGHT_API_TENANT_EXTENSION, 'hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension');
   assert.equal(s.env.HINDSIGHT_API_TENANT_API_KEY, base.apiKey);
@@ -43,7 +46,7 @@ test('API spec: keyed, API-only, published on the bind address, data volume, HF 
 
 test('slim API spec carries remote embeddings and no HF offline flags', () => {
   const settings = { ...DEFAULT_SETTINGS, variant: 'slim', embeddings: { provider: 'openai', model: 'text-embedding-3-small', baseUrl: 'https://e.example/v1' }, reranker: { provider: 'rrf' } };
-  const s = apiSpec({ ...base, variant: 'slim', image: { id: API_IMAGES.slim.ids[0] }, embeddingsEnv: embeddingsEnv(settings, { embeddingsApiKey: 'ek' }) });
+  const s = apiSpec({ ...base, variant: 'slim', image: { id: API_ID }, embeddingsEnv: embeddingsEnv(settings, { embeddingsApiKey: 'ek' }) });
   assert.equal(s.env.HF_HUB_OFFLINE, undefined);
   assert.equal(s.env.HINDSIGHT_API_EMBEDDINGS_PROVIDER, 'openai');
   assert.equal(s.env.HINDSIGHT_API_EMBEDDINGS_OPENAI_MODEL, 'text-embedding-3-small');
@@ -100,7 +103,7 @@ test('bind auto-detect: default gateway in a container, else loopback', () => {
 // OL7: the relay container: prefixed, aliased `ollama`, only the tunnel port published, run by
 // the verified API image ID, its key in env only, its hash following the script and the port.
 test('OL7: relay spec is prefixed, read-only, publishes only the tunnel port and runs the verified image', () => {
-  const o = { names, image: { id: API_IMAGES.full.ids[0] }, bind: '172.20.0.1', port: 18434, key: 'rk'.repeat(32), owner: 'o1', target: RELAY_TARGETS.ollama };
+  const o = { names, image: { id: API_ID }, bind: '172.20.0.1', port: 18434, key: 'rk'.repeat(32), owner: 'o1', target: RELAY_TARGETS.ollama };
   const s = relaySpec(o);
   assert.equal(s.name, 'code-hindsight-relay');
   const arg = (flag) => s.args[s.args.indexOf(flag) + 1];
@@ -109,7 +112,7 @@ test('OL7: relay spec is prefixed, read-only, publishes only the tunnel port and
   assert.equal(arg('--entrypoint'), 'node');
   assert.deepEqual(s.args.filter((a, i) => s.args[i - 1] === '-p'), ['172.20.0.1:18434:7070'], 'the API-facing port is not published');
   for (const f of ['--read-only', '--cap-drop', '--security-opt']) assert.ok(s.args.includes(f), f);
-  const image = s.args.indexOf(API_IMAGES.full.ids[0]);
+  const image = s.args.indexOf(API_ID);
   assert.ok(image > 0, 'run by the verified image ID');
   assert.deepEqual(s.args.slice(image + 1, image + 3), ['--input-type=module', '-e']);
   assert.match(s.args[image + 3], /HSR1/, 'the relay program is the script argument');
@@ -118,13 +121,13 @@ test('OL7: relay spec is prefixed, read-only, publishes only the tunnel port and
   assert.equal(label(s.args, LABELS.role), 'relay');
   assert.equal(label(s.args, LABELS.spec), s.hash);
   assert.notEqual(relaySpec({ ...o, port: 18435 }).hash, s.hash);
-  assert.notEqual(relaySpec({ ...o, image: { id: API_IMAGES.full.ids[1] } }).hash, s.hash);
+  assert.notEqual(relaySpec({ ...o, image: { id: OTHER_ID } }).hash, s.hash);
   assert.equal(relaySpec(o).hash, s.hash, 'deterministic');
 });
 
 // LB9: the relay's alias and API port follow the target, the hash tells the targets apart, and no row token is in the spec.
 test('LB9: relaySpec alias and RELAY_API_PORT follow the target; the spec hash differs between targets; the env has only the relay key', () => {
-  const o = { names, image: { id: API_IMAGES.full.ids[0] }, bind: '172.20.0.1', port: 18434, key: 'rk'.repeat(32), owner: 'o1' };
+  const o = { names, image: { id: API_ID }, bind: '172.20.0.1', port: 18434, key: 'rk'.repeat(32), owner: 'o1' };
   const ollama = relaySpec({ ...o, target: RELAY_TARGETS.ollama });
   const loop = relaySpec({ ...o, target: RELAY_TARGETS['anthropic-loopback'] });
   const arg = (s, flag) => s.args[s.args.indexOf(flag) + 1];

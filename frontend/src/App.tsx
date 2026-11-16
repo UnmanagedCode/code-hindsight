@@ -56,7 +56,7 @@ export function App() {
 
   const onAction = useCallback(async (action: ErrorAction) => {
     if (action === 'settings') return go({ view: 'settings', cp: null });
-    if (action === 'import' || action === 'trust-cp') return go({ view: 'images', cp: null });
+    if (action === 'import') return go({ view: 'images', cp: null });
     setBusy(true);
     try {
       if (action === 'pull') await send('-/api/jobs/pull', 'POST', { variant: status?.variant ?? 'full' });

@@ -7,10 +7,8 @@ import { Button } from '@/components/ui/button';
 
 const STATE_BADGE = { running: 'info', done: 'success', failed: 'destructive', cancelled: 'warning' } as const;
 const STANDING: Record<LoadedImage['status'], string> = {
-  pinned: 'pinned release',
-  'not-pinned': 'not the pinned release — will not run',
-  trusted: 'trusted',
-  'needs-confirmation': 'needs your confirmation before it runs',
+  pinned: 'pinned tag',
+  'wrong-build': 'built for something else — will not run',
   unused: 'not used by this plugin',
 };
 

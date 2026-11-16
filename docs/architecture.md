@@ -24,8 +24,8 @@ The Claude Code side is a plugin root, `claude/` (declared by `claudePlugin` in 
 
 | Module | Responsibility |
 |---|---|
-| `pins.js` | the single source of the Hindsight release, image refs and pinned image IDs, the build helper's digest, CP build inputs, base path, resource prefix, label keys, the relay's targets (`RELAY_TARGETS`: alias, API port, allowlist, key header) |
-| `trust.js` | which images may run: pinned-ID checks, the trusted CP image record (`trusted-cp.json`) |
+| `pins.js` | the single source of the Hindsight release, image tags, the build helper's tag, CP build inputs, base path, resource prefix, label keys, the relay's targets (`RELAY_TARGETS`: alias, API port, allowlist, key header) |
+| `trust.js` | which images may run: the pinned-tag rule and `isOurCpBuild` (the CP image's build labels) |
 | `tarStream.js` | streaming tar: append the bundle manifest on export, read it on import |
 | `config.js` | env → `{port, dataDir, conductorUrl, ollamaUrl (from `OLLAMA_HOST`, default `http://127.0.0.1:11434`), pluginId, distDir, claudeProjectsDir}` |
 | `fsPrivate.js` | 0700 dirs, atomic 0600 files |
@@ -66,10 +66,10 @@ The Claude Code side is a plugin root, `claude/` (declared by `claudePlugin` in 
   1. wait for a pending detached stop (`stopping.json`, pid alive and recent);
   2. resolve docker (`DOCKER_*`);
   3. validate the saved settings (`SETTINGS_INVALID`, `SLIM_*`);
-  4. check the API image's ID against the pins (`IMAGE_*`), the CP image's base-path/upstream labels (`CP_IMAGE_MISMATCH`) and its ID against `trusted-cp.json` (`CP_IMAGE_UNTRUSTED`) — never pull;
+  4. check the pinned API tag is present (`IMAGE_MISSING`) and the CP image is present with its base-path/upstream labels (`CP_IMAGE_MISSING`, `CP_IMAGE_MISMATCH`) — never pull;
   5. network and volume: create with labels, or verify the owner (`NAME_TAKEN`) and the volume's embeddings fingerprint (`EMBEDDINGS_CHANGED`);
-  6. compose the LLM env (cc-backend reads cc now); with a relay target (Ollama, or a loopback cc backend), run or adopt the relay container (verified API image ID, aliased for that target) and start the tunnel at `<bind>:<relayPort>` with the target, else stop the tunnel and remove an owned leftover relay;
-  7. API then CP container, run by the verified image ID: missing → `run`; another owner → `NAME_TAKEN`; spec hash or image ID differs → stop, rm, `run` (volume kept); exited → `start`; running and matching → adopt;
+  6. compose the LLM env (cc-backend reads cc now); with a relay target (Ollama, or a loopback cc backend), run or adopt the relay container (the API image ID the tag resolved to, aliased for that target) and start the tunnel at `<bind>:<relayPort>` with the target, else stop the tunnel and remove an owned leftover relay;
+  7. API then CP container, run by the image ID the tag resolved to: missing → `run`; another owner → `NAME_TAKEN`; spec hash or image ID differs → stop, rm, `run` (volume kept); exited → `start`; running and matching → adopt;
   8. wait for API `/health` 200 (detecting an exited container → `CRASHED`, timeout → `UNHEALTHY` with a log tail), then CP `<base path>/api/health`, then sign in to the CP → `ready`.
 - **Boot = apply.** Every backend start reconciles to the saved settings, so containers never run a spec the Settings page does not show. `pendingRestart` flags saved-but-not-applied settings while ready.
 - **Watch.** While ready, one loop polls API `/health` (each start bumps a token that ends any earlier loop at its next wake, so restarts never stack loops); an exited API, CP or (while linked) relay container is `CRASHED`, a running API failing several consecutive probes is `UNHEALTHY` (`DEFAULT_TIMEOUTS` in `src/supervisor.js`). Docker's `on-failure` restart policy handles transient crashes first.
@@ -78,14 +78,12 @@ The Claude Code side is a plugin root, `claude/` (declared by `claudePlugin` in 
   - *SIGTERM* (cc Stop, Disable, Restart, Update): cc SIGKILLs the process group after a short grace period, too short for Postgres. `shutdown()` spawns `docker stop -t 30 cp api` (plus the relay while linked) **detached** (own process group, outlives the backend), writes `stopping.json {pid, at}`, and the process exits. The next backend waits for that pid before reconciling. The stop uses the current docker invocation, else the last one that worked while still allowed (a settings save or a `DOCKER_DENIED` resets the current one; a remembered `sudo` invocation is never reused once sudo is switched off), else plain docker within a resolve bounded well inside the grace period. When the stop cannot start — no invocation resolves (`DOCKER_DENIED` after a sudo opt-out, an unreachable daemon) or the process fails to spawn — `shutdown-failed.json` records why (no pid-less `stopping.json`), and Status shows it until Hindsight is next ready.
   - *cc restart:* cc re-adopts its running backends without signalling them; nothing happens.
   - *SIGKILL of the backend alone:* containers keep running until the next backend start adopts them.
-- **No implicit network or destructive operation.** The start path only inspects, creates the network/volume, and runs/starts/stops/removes this plugin's own containers. Pull, build, load, save, rmi and volume rm happen only in jobs, and only precondition jobs (pull, build-cp, import, trust-cp) may start Hindsight afterwards.
+- **No implicit network or destructive operation.** The start path only inspects, creates the network/volume, and runs/starts/stops/removes this plugin's own containers. Pull, build, load, save, rmi and volume rm happen only in jobs, and only precondition jobs (pull, build-cp, import) may start Hindsight afterwards.
 
-## Image trust
+## Image pins
 
-- Tags and labels are whatever the last `docker pull`, `load` or `tag` said, so neither decides what runs. An image's `.Id` is content-addressed: the API images and the build helper are pinned by ID in `pins.js`; the CP image, built locally, is trusted on first use (`build-cp` records the ID it built) or by an explicit confirm of a shown ID (`trust-cp`).
-- `.Id` is the index digest under the containerd image store and the per-platform config digest under the classic store; the pins list both forms.
-- The build helper is the only image given the Docker socket (root on the host): it is resolved by a digest reference, verified by ID, and run by ID (`runHelper` refuses any other).
-- Containers run by the verified ID, so a retag between the check and `docker run` cannot swap the image.
+- Images are pinned by tag, never by digest; no image ID is recorded or compared as trust. Containers run by the ID the tag resolved to at start, so a re-pulled tag recreates them.
+- The build helper is the only image given the Docker socket (root on the host): `runHelper` accepts only the `BUILD_HELPER` tag.
 
 ## CP embedding
 
@@ -144,7 +142,7 @@ Memory tab ── POST /-/api/jobs/backfill-scan ──► jobs.js ──► bac
 
 ## Pins and bumping Hindsight
 
-`src/pins.js` holds the version, the upstream commit (the official images' `org.opencontainers.image.revision`, which the CP is built from), the per-variant image refs, version labels and image IDs, the CP image tag, the build helper (`docker:<version>-cli` by digest with its IDs; it carries buildx and must not be newer than the daemon's API), and the base path. To bump: update those (an image's IDs: `docker image inspect` for the index digest, `docker buildx imagetools inspect --raw` of each platform manifest for the config digests), run **Build CP image** and **Pull** (or import a bundle), then Start: the ID checks refuse any image of another release.
+`src/pins.js` holds the version, the upstream commit (the official images' `org.opencontainers.image.revision`, which the CP is built from), the per-variant image tags, the CP image tag, the build helper (`docker:<version>-cli` by tag; it carries buildx and must not be newer than the daemon's API), and the base path. To bump: update those, run **Build CP image** and **Pull** (or import a bundle), then Start.
 
 ## Tests
 
@@ -164,5 +162,5 @@ Memory tab ── POST /-/api/jobs/backfill-scan ──► jobs.js ──► bac
 - **Memory fakes.** `tests/support/fakeCc.mjs` (programmable `describe_session` per call — live sessions, `retired` handles, transcript `segment`s answering `SESSION_NOT_A_HANDLE`, `unlocatable` ids — `/api/playbooks`, `list_projects` / `list_workspaces` rows with switchable failures — HTTP status, hang, bad shape — a `list_projects` delay (`delayProjects`) and a call log) and `tests/support/fakeHindsight.mjs` (Bearer-checked recall and retain over in-memory banks: append vs replace, per-bank latency, status switches, 404 for an uncreated bank, repeated `operation_id` ignored, in-flight tracking; document reads and deletes, operation status (`opStatus`) and retry; `down` drops every connection). `tests/support/runHook.mjs` runs the real `hook.mjs` as a process.
 - **Synthetic transcripts.** `tests/support/transcripts.mjs` writes made-up transcript files (every line kind a transcript holds, malformed and oversized lines) into a temp Claude config dir; `boot` always points `claudeProjectsDir` at a temp path, so no test reads real transcripts. `tests/backfill.test.mjs` drives both backfill kinds through the real job runner over the fakes.
 - **Live check.** With `CODE_HINDSIGHT_LIVE_CC=$CONDUCTOR_URL` and `CODE_HINDSIGHT_LIVE_SESSION=<a live session id>`, `tests/memory.real.test.mjs` also boots a scratch backend on a temp data dir and random ports (so the enabled plugin's containers and data are never touched), points its cc at the live one for the read-only `describe_session` and `/api/playbooks` only, writes a scope matching that session's real project, kind and stage, and drives the real hook for recall, retain and recall; a scope for another stage must leave the session memoryless. With `RUN_REAL_CLI=1` it also runs a real `claude -p --plugin-dir claude` against that backend.
-- **Real stacks** (`tests/support/realStack.mjs`) use a random `code-hindsight-test-<hex>` prefix and random host ports, trust the local CP image through the `trust-cp` job, and remove their containers, network and volume afterwards, even on failure.
+- **Real stacks** (`tests/support/realStack.mjs`) use a random `code-hindsight-test-<hex>` prefix and random host ports, and remove their containers, network and volume afterwards, even on failure.
 - **Guards.** `tests/supervisor.test.mjs` checks over a full lifecycle that every docker call names only prefixed resources and none connects a network; `tests/frontend-source.test.mjs` scans the UI for HTML sinks, root-relative URLs and the head order.
