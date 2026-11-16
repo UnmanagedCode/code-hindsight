@@ -2,7 +2,8 @@
 // Bumping Hindsight: change the version and tags here, rebuild the CP image
 // (Images & data → Build CP image), and pull or import the matching API images. For the GPU
 // image: re-diff src/gpu/Dockerfile against upstream's docker/docker-compose/cuda/Dockerfile at
-// the new tag (UPSTREAM_TAG), re-read the models' `device:` start lines (`src/gpuCheck.js`), check a CUDA torch
+// the new tag (UPSTREAM_TAG), re-read the models' `device:` start lines (`src/gpuCheck.js`), re-check
+// whether the GPU API still needs TORCH_DISABLE_NATIVE_JIT (`apiSpec` in src/containerSpec.js), check a CUDA torch
 // wheel of the new base torch version exists under `GPU_TORCH_INDEX`, and rebuild the GPU image.
 //
 // Images are pinned by tag, never by digest: the tag is the pin.

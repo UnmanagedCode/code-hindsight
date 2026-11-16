@@ -68,8 +68,15 @@ export function apiSpec({ names, image, variant, compute = 'cpu', bind, port, ap
     ...(variant === 'full' ? { HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1' } : {}),
     ...llmEnv,
     ...embEnv,
-    // Upstream's GPU recipe: half-precision reranking, the same model, faster on CUDA.
-    ...(gpu ? { HINDSIGHT_API_RERANKER_LOCAL_FP16: 'true' } : {}),
+    ...(gpu ? {
+      // Upstream's GPU recipe: half-precision reranking, the same model, faster on CUDA.
+      HINDSIGHT_API_RERANKER_LOCAL_FP16: 'true',
+      // On CUDA, torch routes an op of the reranker's ModernBERT model to a Triton kernel, and
+      // Triton compiles a C launcher at first use; the full image has no C compiler, so the API
+      // exits at start ("RuntimeError: Failed to find C compiler"). This keeps torch on its
+      // built-in kernels. Re-check it when bumping Hindsight or torch.
+      TORCH_DISABLE_NATIVE_JIT: '1',
+    } : {}),
   };
   const base = [
     '-d', '--name', names.api,
