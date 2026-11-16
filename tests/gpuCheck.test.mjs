@@ -5,7 +5,8 @@ import assert from 'node:assert/strict';
 import { parseModelDevices, judgeDevices, assertOnCuda } from '../src/gpuCheck.js';
 import { DEFAULT_SETTINGS } from '../src/settings.js';
 
-// The lines as the pinned upstream logs them (engine/embeddings.py, engine/cross_encoder.py).
+// The lines as upstream logs them at UPSTREAM_TAG (hindsight-api-slim/hindsight_api/engine/
+// embeddings.py and cross_encoder.py).
 const START = [
   '2026-11-16 20:01:02,123 - INFO - hindsight_api.engine.embeddings - Embeddings: local provider initialized (dim: 384, device: cuda)',
   '2026-11-16 20:01:03,456 - INFO - hindsight_api.engine.cross_encoder - Reranker: local provider initialized (device: cuda, max_concurrent=4)',

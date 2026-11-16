@@ -1002,3 +1002,73 @@ test('GPU8: a watch tick after the API restarted on cuda stays ready', async (t)
   assert.equal(sup.status().state, 'ready');
   assert.deepEqual(sup.status().compute.devices, { embeddings: 'cuda', reranker: 'cuda' });
 });
+
+// GPU4: every build label of the GPU image is checked: the recipe, the upstream release tag and
+// the torch flavour, each on its own.
+for (const [what, labels] of [
+  ['no recipe label', (l) => { delete l[LABELS.recipe]; }],
+  ['another recipe', (l) => { l[LABELS.recipe] = 'docker/docker-compose/cuda/Dockerfile'; }],
+  ['an upstream commit instead of the release tag', (l) => { l[LABELS.upstream] = '0'.repeat(40); }],
+]) {
+  test(`GPU4: a GPU image with ${what} is GPU_IMAGE_MISMATCH naming the labels, and touches no container`, async (t) => {
+    const img = goodGpuImage();
+    labels(img.Config.Labels);
+    const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed({ [API_GPU_IMAGE]: img }) });
+    await sup.ensureRunning();
+    assert.equal(errCode(sup), 'GPU_IMAGE_MISMATCH');
+    assert.equal(sup.status().error.action, 'build-gpu');
+    assert.notEqual(sup.status().error.params.found, sup.status().error.params.expected, 'found and expected differ where the image does');
+    assert.match(sup.status().error.params.expected, /recipe src\/gpu\/Dockerfile/);
+    assert.ok(!cmds(r).some((c) => ['run', 'rm', 'stop', 'start'].includes(c)));
+  });
+}
+
+// Tag pins: a CP image labelled with an upstream commit (not the release tag) is refused, with the rebuild as its action.
+test('a CP image labelled with an upstream commit instead of the release tag is CP_IMAGE_MISMATCH with Build CP image', async (t) => {
+  const { r, sup } = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage('full'), [CP_IMAGE]: { Id: CP_ID, Config: { Labels: { [LABELS.basePath]: BASE_PATH, [LABELS.upstream]: '0'.repeat(40) } } } } } });
+  await sup.ensureRunning();
+  assert.equal(errCode(sup), 'CP_IMAGE_MISMATCH');
+  assert.equal(sup.status().error.action, 'build-cp');
+  assert.match(sup.status().error.message, /Build CP image/);
+  assert.ok(!cmds(r).some((c) => ['run', 'rm', 'stop', 'start'].includes(c)));
+});
+
+// GPU8: a Docker restart is judged by the settings the API was started with: a saved-but-not-applied
+// change (here a local reranker the running API does not load) never fails a healthy GPU API.
+test('GPU8: after a saved-but-not-applied reranker change, a Docker restart of the GPU API stays ready', async (t) => {
+  const s = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+  const { r, sup, settingsStore } = make(t, { settings: { compute: 'gpu', reranker: { provider: 'rrf' } }, seed: gpuSeed() });
+  setDockerState(r, (st) => { st.gpuDevice = 'cuda'; });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  const saved = settingsStore.get();
+  saved.reranker = { ...s.reranker, provider: 'local' };
+  settingsStore.save(saved);
+  assert.equal(sup.status().pendingRestart, true);
+  // Docker restarts the API (on-failure) with the env it was created with: no local reranker line.
+  setDockerState(r, (st) => {
+    st.containers[names.api].State.StartedAt = '2026-01-01T01:00:00.000Z';
+    st.containers[names.api].Log = 'Embeddings: local provider initialized (dim: 384, device: cuda)\nReranker: RRF passthrough provider initialized (neural reranking disabled)';
+  });
+  await sup.checkHealth();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  assert.equal(dockerState(r).containers[names.api].State.Running, true);
+});
+
+// The watch's GPU step reads the checked start once: a stop landing while it awaits the API's
+// inspect leaves it a no-op, never a TypeError on the cleared check.
+test('GPU8: a stop racing the watch\'s GPU step neither throws nor touches the stopped stack', async (t) => {
+  const { sup, docker } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed() });
+  await sup.ensureRunning();
+  const inspect = docker.inspectContainer;
+  let stopping = null;
+  docker.inspectContainer = async (name) => {
+    const c = await inspect(name);
+    if (name === names.api && !stopping) { stopping = sup.stop(); c.State.StartedAt = '2026-01-01T01:00:00.000Z'; }
+    return c;
+  };
+  await assert.doesNotReject(sup.checkHealth());
+  await stopping;
+  assert.ok(stopping, 'the stop landed inside the GPU step');
+  assert.equal(sup.status().state, 'stopped');
+});

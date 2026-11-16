@@ -24,7 +24,8 @@ export interface ImageInfo {
   revision?: string | null;
   basePath?: string | null;
   upstream?: string | null;
-  /** GPU image only: the CUDA torch flavour label it carries. */
+  /** GPU image only: the recipe and CUDA torch flavour labels it carries. */
+  recipe?: string | null;
   cuda?: string | null;
 }
 

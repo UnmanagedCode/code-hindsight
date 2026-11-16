@@ -47,7 +47,7 @@ test('pull pulls the pinned image of the variant and re-checks the preconditions
 
 // Spec 6 + S8: the CP image is built from the pinned upstream commit with our base path.
 // S1: the helper gets the Docker socket only as the pinned tag, run by that tag.
-test('build-cp runs buildx at the pinned commit in the helper, by its pinned tag', async (t) => {
+test('build-cp runs buildx at the pinned release tag in the helper, by its pinned tag', async (t) => {
   const { r, jobs, after } = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage(), [BUILD_HELPER]: helperImage() }, registry: { [CP_IMAGE]: goodCpImage() } } });
   const end = await jobs.start('build-cp').done;
   assert.equal(end.state, 'done', JSON.stringify(end.error));

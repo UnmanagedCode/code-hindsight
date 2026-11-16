@@ -15,6 +15,7 @@ import crypto from 'node:crypto';
 import { API_GPU_IMAGE, API_IMAGES, BASE_PATH, CP_IMAGE, GPU_TORCH_FLAVOR, LABELS, RELAY_TARGETS, UPSTREAM_TAG } from './pins.js';
 import { isOurCpBuild, isOurGpuBuild } from './trust.js';
 import { deviceReader, judgeDevices, assertOnCuda } from './gpuCheck.js';
+import { GPU_RECIPE_PATH } from './gpuRecipe.js';
 import { AppError, describeError, toAppError } from './errors.js';
 import { validateSettings, embeddingsFingerprint, containerSettingsHash } from './settings.js';
 import { apiSpec, cpSpec, relaySpec, embeddingsEnv } from './containerSpec.js';
@@ -99,7 +100,7 @@ export function createSupervisor({
   /** Bumped to end the running watch loop; each loop runs only while its token is current. */
   let watchToken = 0;
   let watchFailures = 0;
-  /** GPU compute: the API start whose devices were checked ({startedAt, devices}), else null. */
+  /** GPU compute: the API start whose devices were checked ({startedAt, devices, settings: those the API was started with}), else null. */
   let gpuChecked = null;
 
   const set = (s, e = null) => { state = s; error = e; };
@@ -156,7 +157,7 @@ export function createSupervisor({
       },
       gpu: {
         ref: API_GPU_IMAGE, present: !!gpu, id: gpu?.Id ?? null,
-        upstream: gpuLabels[LABELS.upstream] ?? null, cuda: gpuLabels[LABELS.cuda] ?? null,
+        recipe: gpuLabels[LABELS.recipe] ?? null, upstream: gpuLabels[LABELS.upstream] ?? null, cuda: gpuLabels[LABELS.cuda] ?? null,
         built: gpuBuilt,
         ok: gpuBuilt,
       },
@@ -273,7 +274,7 @@ export function createSupervisor({
         read = await readDevices();
       }
       assertOnCuda(read.devices, settings);
-      gpuChecked = read;
+      gpuChecked = { ...read, settings };
     } catch (e) {
       if (!(e instanceof Cancelled)) await stopApiQuietly();
       throw e;
@@ -295,7 +296,7 @@ export function createSupervisor({
     // Both checks come before any container is touched.
     if (onGpu) {
       if (!gpu) throw new AppError('GPU_IMAGE_MISSING', { image: API_GPU_IMAGE });
-      if (!images.gpu.built) throw new AppError('GPU_IMAGE_MISMATCH', { image: API_GPU_IMAGE, found: `upstream ${images.gpu.upstream ?? '?'}, torch ${images.gpu.cuda ?? '?'}`, expected: `upstream ${UPSTREAM_TAG}, torch ${GPU_TORCH_FLAVOR}` });
+      if (!images.gpu.built) throw new AppError('GPU_IMAGE_MISMATCH', { image: API_GPU_IMAGE, found: `recipe ${images.gpu.recipe ?? '?'}, upstream ${images.gpu.upstream ?? '?'}, torch ${images.gpu.cuda ?? '?'}`, expected: `recipe ${GPU_RECIPE_PATH}, upstream ${UPSTREAM_TAG}, torch ${GPU_TORCH_FLAVOR}` });
     } else if (!api) throw new AppError('IMAGE_MISSING', { image: want.ref });
     const apiImage = onGpu ? gpu : api;
     if (!cp) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
@@ -416,20 +417,26 @@ export function createSupervisor({
 
   /**
    * GPU compute's watch step: an API that Docker restarted (a new StartedAt) is checked again,
-   * since a lost GPU brings it back on the CPU. False when it failed (the API is then stopped).
+   * since a lost GPU brings it back on the CPU. It is judged by the settings it was started with,
+   * not settings saved since (those apply only at the next start). False when it failed (the API
+   * is then stopped).
    */
   async function gpuStillUsed(gen) {
+    // A start or stop may clear or replace the checked start while this step awaits.
+    const checked = gpuChecked;
+    if (!checked) return true;
+    const stale = () => gen !== generation || gpuChecked !== checked;
     const c = await docker.inspectContainer(names.api);
+    if (stale()) return true;
     const startedAt = c?.State?.StartedAt ?? null;
-    if (!startedAt || startedAt === gpuChecked.startedAt) return true;
-    const { settings } = currentSettings();
+    if (!startedAt || startedAt === checked.startedAt) return true;
     try {
       const read = await readDevices();
-      assertOnCuda(read.devices, settings);
-      if (gen === generation) gpuChecked = read;
+      assertOnCuda(read.devices, checked.settings);
+      if (!stale()) gpuChecked = { ...read, settings: checked.settings };
       return true;
     } catch (e) {
-      if (gen !== generation) return false;
+      if (stale()) return false;
       stopWatch();
       gpuChecked = null;
       await stopApiQuietly();

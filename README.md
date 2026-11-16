@@ -17,7 +17,7 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 ## Key defaults
 
 - Image variant **full** (local embeddings and reranker, works offline); **slim** needs remote embeddings and the `rrf` reranker.
-- Compute **CPU**. **GPU** runs the local embedding and reranker models on the host's NVIDIA GPUs: it needs the NVIDIA driver and Container Toolkit on the Docker host and a GPU image built locally once (**Images & data → Build GPU image**), and is ready only once both models report `cuda` ([docs/features.md → GPU compute](docs/features.md#gpu-compute)).
+- Compute **CPU**. **GPU** runs the local embedding and reranker models on the host's NVIDIA GPUs: it needs the NVIDIA driver and Container Toolkit on the Docker host and a GPU image built locally once (**Images & data → Build GPU image**), and is ready only once each local model reports `cuda` ([docs/features.md → GPU compute](docs/features.md#gpu-compute)).
 - LLM **none**: memories are stored as chunks; reflect and observations need an LLM (manual, or linked to one of cc's backends: Anthropic-compatible, including endpoints on cc's own loopback, or cc's Ollama daemon, both through a relay container).
 - Ports: fixed, configurable (`DEFAULT_SETTINGS` in `src/settings.js`); bind address automatic: the default gateway when cc runs in a container, else `127.0.0.1`.
 - `sudo -n docker` is used when docker is refused, unless switched off in Settings.
