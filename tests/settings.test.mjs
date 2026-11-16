@@ -133,3 +133,23 @@ test('OL5: the new fields join the container hash, and a settings file without t
   assert.equal(got.network.relayPort, 18434);
   assert.equal(got.llm.maxConcurrent, null);
 });
+
+// GPU1: compute is cpu by default and on an older settings file; gpu needs the full image and a
+// local model; the mode shapes the containers (a change is a pending restart).
+test('GPU1: compute defaults to cpu, takes cpu or gpu, and gpu needs the full image and a local model', (t) => {
+  assert.equal(DEFAULT_SETTINGS.compute, 'cpu');
+  assert.deepEqual(validateSettings(withChanges({ compute: 'gpu' })).errors, []);
+  assert.deepEqual(validateSettings(withChanges({ compute: 'cpu' })).errors, []);
+  assert.deepEqual(validateSettings(withChanges({ compute: 'cuda' })).errors.map((e) => e.field), ['compute']);
+  const slim = validateSettings(withChanges({ compute: 'gpu', variant: 'slim', embeddings: { provider: 'openai', model: 'm' }, reranker: { provider: 'rrf' } }), { embeddingsApiKey: true });
+  assert.deepEqual(slim.errors.map((e) => e.code), ['GPU_NEEDS_FULL']);
+  const noLocal = validateSettings(withChanges({ compute: 'gpu', embeddings: { provider: 'openai', model: 'm' }, reranker: { provider: 'rrf' } }), { embeddingsApiKey: true });
+  assert.deepEqual(noLocal.errors.map((e) => e.code), ['GPU_NEEDS_LOCAL_MODEL']);
+  const oneLocal = validateSettings(withChanges({ compute: 'gpu', reranker: { provider: 'rrf' } }));
+  assert.deepEqual(oneLocal.errors, [], 'local embeddings alone are enough');
+  assert.notEqual(containerSettingsHash(withChanges({ compute: 'gpu' })), containerSettingsHash(DEFAULT_SETTINGS));
+  const r = mkRoot(t);
+  fs.mkdirSync(r.dataDir, { recursive: true });
+  fs.writeFileSync(path.join(r.dataDir, 'settings.json'), JSON.stringify({ variant: 'full', llm: { mode: 'none' } }));
+  assert.equal(createSettingsStore(r.dataDir).get().compute, 'cpu');
+});

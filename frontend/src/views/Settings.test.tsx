@@ -173,6 +173,16 @@ describe('Settings', () => {
   });
 
   // OL4 (UI): the relay port is a network setting, sent with the form.
+  // GPU10: the Compute choice is saved as `compute`.
+  it('GPU10: the Compute choice saves compute', async () => {
+    const calls = stubFetch((url) => (url === '-/api/settings' ? { body: settingsView() } : undefined));
+    render(<Settings onSaved={() => {}} onApply={() => {}} busy={false} />);
+    await userEvent.selectOptions(await screen.findByLabelText('Compute'), 'gpu');
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    expect(putBody(calls).settings.compute).toBe('gpu');
+  });
+
   it('edits the relay port', async () => {
     const calls = stubFetch((url, init) => (url === '-/api/settings' ? { body: settingsView() } : undefined));
     render(<Settings onSaved={() => {}} onApply={() => {}} busy={false} />);

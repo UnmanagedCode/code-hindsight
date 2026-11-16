@@ -36,4 +36,14 @@ describe('Images & data', () => {
     expect(ids.textContent).toContain(CP_ID);
     expect(ids.textContent).toContain('sha256:aaa');
   });
+
+  // GPU10: the GPU image row starts the build-gpu job.
+  it('GPU10: the GPU image row shows its state and Build GPU image starts build-gpu', async () => {
+    const calls = stubFetch((url) => (url === '-/api/jobs/build-gpu' ? { body: { id: 'g1', kind: 'build-gpu', state: 'running', tail: '' } } : undefined));
+    render(<Images status={status()} onChanged={() => {}} />);
+    expect(document.querySelector('[data-image="gpu"]')?.textContent).toContain('missing');
+    await userEvent.click(screen.getByRole('button', { name: 'Build GPU image' }));
+    const post = calls.find((c) => c.url === '-/api/jobs/build-gpu');
+    expect(post?.init?.method).toBe('POST');
+  });
 });

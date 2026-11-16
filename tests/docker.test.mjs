@@ -76,6 +76,14 @@ test('classifyDockerError names the failures the UI acts on', () => {
   assert.equal(classifyDockerError('something else'), 'DOCKER_FAILED');
 });
 
+// GPU5: the daemon's refusals to attach a GPU are GPU_UNAVAILABLE, so a GPU start never ends as a generic failure.
+test('GPU5: classifyDockerError names a GPU the daemon cannot attach GPU_UNAVAILABLE', () => {
+  assert.equal(classifyDockerError('docker: Error response from daemon: could not select device driver "" with capabilities: [[gpu]].'), 'GPU_UNAVAILABLE');
+  assert.equal(classifyDockerError('docker: Error response from daemon: unknown or invalid runtime name: nvidia.'), 'GPU_UNAVAILABLE');
+  assert.equal(classifyDockerError('docker: Error response from daemon: failed to create task for container: failed to create shim task: OCI runtime create failed: runc create failed: unable to start container process: error during container init: error running prestart hook #0: exit status 1, stdout: , stderr: Auto-detected mode as \'legacy\'\nnvidia-container-cli: initialization error: nvml error: driver not loaded: unknown'), 'GPU_UNAVAILABLE');
+  assert.equal(classifyDockerError('docker: Error response from daemon: could not apply required modification to OCI specification: error modifying OCI spec: failed to inject CDI devices: unresolvable CDI devices nvidia.com/gpu=all'), 'GPU_UNAVAILABLE');
+});
+
 // Invariant (spec 4): no container, volume or network outside the prefix is ever touched.
 test('the name guard refuses every resource outside the prefix', async (t) => {
   const { r, docker } = make(t);

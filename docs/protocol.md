@@ -24,8 +24,8 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 | Method | Path | Body → answer |
 |---|---|---|
 | GET | `/-/api/health` | `{ok: true}` — always 200, whatever Hindsight's state (the manifest's `healthPath`) |
-| GET | `/-/api/status[?refresh=1]` | `{state, error, docker: {mode, serverVersion}, variant, bindAddress, bindAuto, ports: {api, cp, relay}, images: {api: {ref, present, id, version, ok}, cp: {ref, present, id, basePath, upstream, built, ok}} \| null, containers: {api, cp, relay} \| null, startedAt, pendingRestart, volume, lastShutdownFailure: {at, error} \| null, llmMode, relay: {target: {kind: ollama\|anthropic-loopback, url}, tunnel: {state: connected\|connecting\|stopped, idle, error, address}, lastForward: {at, path, status, error} \| null, upstream: {ok, version, error, at} \| null, problems: [catalog error]} \| null, autoStart?, job, bundles: [{name, size}], bundleNames: {full, slim}}`. `relay` is set only while the API's LLM goes through the relay; it never holds a credential, and `upstream` is the target's cached answer (`problems`: `OLLAMA_UNREACHABLE` or `CC_BACKEND_UNREACHABLE`, and `RELAY_DISCONNECTED`). `refresh=1` re-inspects images and containers first. `autoStart` is cc's flag for this plugin, omitted when cc cannot be asked |
-| GET | `/-/api/settings` | `{settings, secrets: {llmApiKey: bool, embeddingsApiKey: bool}, defaults, detectedBindAddress, choices, images}` |
+| GET | `/-/api/status[?refresh=1]` | `{state, error, docker: {mode, serverVersion}, variant, bindAddress, bindAuto, ports: {api, cp, relay}, images: {api: {ref, present, id, version, ok}, cp: {ref, present, id, basePath, upstream, built, ok}, gpu: {ref, present, id, upstream, cuda, built, ok}} \| null, containers: {api, cp, relay} \| null, startedAt, pendingRestart, volume, lastShutdownFailure: {at, error} \| null, llmMode, compute: {mode: cpu\|gpu, devices: {embeddings, reranker} \| null}, relay: {target: {kind: ollama\|anthropic-loopback, url}, tunnel: {state: connected\|connecting\|stopped, idle, error, address}, lastForward: {at, path, status, error} \| null, upstream: {ok, version, error, at} \| null, problems: [catalog error]} \| null, autoStart?, job, bundles: [{name, size}], bundleNames: {full, slim}}`. `relay` is set only while the API's LLM goes through the relay; it never holds a credential, and `upstream` is the target's cached answer (`problems`: `OLLAMA_UNREACHABLE` or `CC_BACKEND_UNREACHABLE`, and `RELAY_DISCONNECTED`). `refresh=1` re-inspects images and containers first. `autoStart` is cc's flag for this plugin, omitted when cc cannot be asked. `compute.mode` is the saved setting; `compute.devices` is what the running API's local models loaded on (a device name, or `null` for a model with no start line or not local), set once a GPU start passed its check, else `null` |
+| GET | `/-/api/settings` | `{settings, secrets: {llmApiKey: bool, embeddingsApiKey: bool}, defaults, detectedBindAddress, choices, images}`. `settings.compute` is one of `choices.computeModes` (`COMPUTE_MODES` in `src/settings.js`); `gpu` refuses `GPU_NEEDS_FULL` (slim) and `GPU_NEEDS_LOCAL_MODEL` (neither model local). `images.gpu` is `API_GPU_IMAGE` |
 | PUT | `/-/api/settings` | `{settings, secrets?: {llmApiKey?, embeddingsApiKey?}}` — the whole settings object; a secret string sets, `null`/`""` clears, absent keeps — except that an absent key whose endpoint changed is cleared (`keyEndpoints` in `src/settings.js`: LLM mode/provider/base URL; embeddings provider/base URL). `400 SETTINGS_INVALID` with `params.fields: [{field, code?, message}]` changes nothing. Answers the settings view plus `cleared: [key names]` and `status` |
 | GET | `/-/api/scopes` | `{scopes, choices: {actions, kinds, placeholders, limits}}` |
 | PUT | `/-/api/scopes` | `{scopes}` — the whole list, validated by `validateScopes` (`src/scopes.js`) and stored in `scopes.json`; `400 SCOPES_INVALID` with `params.fields: [{field: "scopes[i].…", message}]` changes nothing. Answers `{scopes}` |
@@ -54,6 +54,7 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 |---|---|---|
 | `pull` | `{variant: "full"\|"slim"}` | `{image, id}` — `id` is the pulled image's ID (`null` if absent) |
 | `build-cp` | `{}` | `{image, id}` — the built image's ID |
+| `build-gpu` | `{}` | `{image, id}` — `API_GPU_IMAGE` and its ID; fails `IMAGE_MISSING` (`API_IMAGES.full`) before running anything when the full image is absent, `GPU_IMAGE_MISSING` when the result lacks the GPU build labels |
 | `import` | `{path: "/abs/file.tar"}` (or the octet-stream upload) | `{loaded: [{ref, id, status: pinned\|wrong-build\|unused}], manifest: <code-hindsight-bundle.json> \| null}` |
 | `export` | `{variant}` | `{name, path, size, sha256, images: [{ref, id}]}` |
 | `remove-images` | `{confirm: true}` | `{removed: [refs]}` (the pinned API refs and `CP_IMAGE` that were present) |
@@ -63,7 +64,8 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 
 - `remove-images` and `delete-volume` refuse `CONFIRMATION_REQUIRED` without their confirmation and fail `CONTAINERS_RUNNING` while a container of this plugin runs.
 - `build-cp` inspects `BUILD_HELPER` (a tag), pulls it when missing, then runs `docker run --rm --name <prefix>-build -v /var/run/docker.sock:/var/run/docker.sock <BUILD_HELPER> docker buildx build <repo>#<UPSTREAM_REVISION> …` (`buildCpCommand` in `src/jobs.js`).
-- After a successful `pull`, `build-cp` or `import`, Hindsight starts if it was asked to run and is in `error`; the other Docker jobs only re-read images and containers. The backfill jobs never resolve docker and never touch Hindsight's lifecycle.
+- `build-gpu` ensures `BUILD_HELPER` the same way, then runs in it `docker buildx build <repo>#<UPSTREAM_REVISION> -f GPU_DOCKERFILE --build-arg HINDSIGHT_VERSION=… --build-arg PYTORCH_CUDA_FLAVOR=GPU_TORCH_FLAVOR --build-arg PYTORCH_CUDA_INDEX=GPU_TORCH_INDEX --label io.code-hindsight.upstream=… --label io.code-hindsight.cuda=… -t API_GPU_IMAGE --load` (`buildGpuCommand` in `src/jobs.js`). `remove-images` also removes `API_GPU_IMAGE` when present.
+- After a successful `pull`, `build-cp`, `build-gpu` or `import`, Hindsight starts if it was asked to run and is in `error`; the other Docker jobs only re-read images and containers. The backfill jobs never resolve docker and never touch Hindsight's lifecycle.
 - One job runs at a time across all kinds. `backfill-scan` and `backfill-import` are cancellable: they stop at their next file, document or request.
 
 ### Backfill
@@ -111,6 +113,7 @@ Import, per session in scan order, acting only on the confirmed plan: `lstat` mu
 |---|---|
 | API (`API_IMAGES[variant]`) | the pinned tag is present (else `IMAGE_MISSING`) |
 | CP (`CP_IMAGE`) | present (else `CP_IMAGE_MISSING`) with the base-path and upstream-revision labels (else `CP_IMAGE_MISMATCH`; `isOurCpBuild`) |
+| GPU (`API_GPU_IMAGE`), Compute `gpu` only (it replaces the API image) | present (else `GPU_IMAGE_MISSING`) with the upstream-revision and `io.code-hindsight.cuda` = `GPU_TORCH_FLAVOR` labels (else `GPU_IMAGE_MISMATCH`; `isOurGpuBuild`). The official API image is not needed then |
 | Build helper (`BUILD_HELPER`) | the pinned tag, pulled when missing; `runHelper` refuses any other ref |
 
 - Containers run by the image ID the tag resolved to at start; a different ID recreates them.
@@ -158,7 +161,7 @@ Called by Claude Code hooks (through cc's plugin proxy) and by cc's plugin MCP f
 
 | File | Content |
 |---|---|
-| `settings.json` (0600) | the settings; never a key |
+| `settings.json` (0600) | the settings; never a key. A file without a key reads that key's default (`DEFAULT_SETTINGS`), so an older file reads `compute: cpu` |
 | `secrets.json` (0600) | `apiKey`, `cpAccessKey`, `relayKey` (generated once), `llmApiKey`, `embeddingsApiKey` |
 | `stopping.json` (0600) | `{pid, at}` of the detached `docker stop` a SIGTERM left running; the next backend waits for that pid |
 | `shutdown-failed.json` (0600) | `{at, error}` when a SIGTERM could not start that stop; shown as `status.lastShutdownFailure` and removed when Hindsight is next ready |
@@ -184,11 +187,12 @@ Labels (`LABELS` in `src/pins.js`):
 | `io.code-hindsight.spec` | containers | hash of image ID, run arguments and env; a mismatch recreates the container |
 | `io.code-hindsight.embeddings` | volume | `local` or `<provider>:<model>`; a mismatch with the settings is `EMBEDDINGS_CHANGED` |
 | `io.code-hindsight.basePath`, `io.code-hindsight.upstream` | CP image | the base path and upstream commit it was built with; checked before start (`CP_IMAGE_MISMATCH`) |
+| `io.code-hindsight.upstream`, `io.code-hindsight.cuda` | GPU image | the upstream commit and the CUDA torch flavour it was built with; checked before a GPU start (`GPU_IMAGE_MISMATCH`) |
 
 ### Container environment (`apiSpec` / `cpSpec` in `src/containerSpec.js`)
 
 - Both run by the image ID the pinned tag resolved to at start (the last `docker run` argument).
-- **API** (`<prefix>-api`, alias `api` on `<prefix>-net`, `-p <bind>:<apiPort>:8888`, volume at `/home/hindsight/.pg0`, `--restart on-failure:3`, `--shm-size <API_SHM_SIZE in src/containerSpec.js>`: pg0 vector-index builds use `/dev/shm`, and Docker's 64 MiB default fails bank creation): `HINDSIGHT_ENABLE_CP=false`, `HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension`, `HINDSIGHT_API_TENANT_API_KEY`; full image: `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`; LLM: `HINDSIGHT_API_LLM_PROVIDER` (`none` by default), `_MODEL`, `_BASE_URL`, `_API_KEY`; `HINDSIGHT_API_EMBEDDINGS_PROVIDER` (+ `_OPENAI_MODEL`, `_OPENAI_BASE_URL`, `_OPENAI_API_KEY`), `HINDSIGHT_API_RERANKER_PROVIDER`.
+- **API** (`<prefix>-api`, alias `api` on `<prefix>-net`, `-p <bind>:<apiPort>:8888`, volume at `/home/hindsight/.pg0`, `--restart on-failure:3`, `--shm-size <API_SHM_SIZE in src/containerSpec.js>`: pg0 vector-index builds use `/dev/shm`, and Docker's 64 MiB default fails bank creation): `HINDSIGHT_ENABLE_CP=false`, `HINDSIGHT_API_TENANT_EXTENSION=hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension`, `HINDSIGHT_API_TENANT_API_KEY`; full image: `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`; LLM: `HINDSIGHT_API_LLM_PROVIDER` (`none` by default), `_MODEL`, `_BASE_URL`, `_API_KEY`; `HINDSIGHT_API_EMBEDDINGS_PROVIDER` (+ `_OPENAI_MODEL`, `_OPENAI_BASE_URL`, `_OPENAI_API_KEY`), `HINDSIGHT_API_RERANKER_PROVIDER`. Compute `gpu`: the GPU image's ID, plus `--gpus all` and `HINDSIGHT_API_RERANKER_LOCAL_FP16=true`; Compute `cpu` adds neither, so its spec hash is unchanged.
 - **CP** (`<prefix>-cp`, on `<prefix>-net`, `-p <bind>:<cpPort>:9999`, `--restart on-failure:3`): `HINDSIGHT_CP_DATAPLANE_API_URL=http://api:8888`, `HINDSIGHT_CP_DATAPLANE_API_KEY`, `HINDSIGHT_CP_ACCESS_KEY`.
 - Env reaches `docker run` through a 0600 `--env-file`, never the command line.
 - **Relay** (`relaySpec`; `<prefix>-relay`, alias and API-side port from the active target's entry in `RELAY_TARGETS` in `src/pins.js`, `-p <bind>:<relayPort>:<RELAY_TUNNEL_PORT>`, only the tunnel port published, `--read-only --cap-drop ALL --security-opt no-new-privileges`, `--restart on-failure:3`): runs the API image's ID with `--entrypoint node --input-type=module -e <src/relay/relay.mjs>`, so its spec hash follows the script. Env set by the plugin: `RELAY_KEY`, `RELAY_API_PORT`, `RELAY_TUNNEL_PORT`, `RELAY_MAX_WAITING` (`LLM_MAX_CONCURRENT_MAX` in `src/settings.js`). Optional, with defaults in `src/relay/relay.mjs`: `RELAY_WAIT_MS` (how long an API connection waits for an idle tunnel), `RELAY_HANDSHAKE_MS`, `RELAY_ACK_MS` (how long a paired tunnel may take to ack), `RELAY_MAX_HANDSHAKING` (tunnel sockets still in their handshake). Created before the API while linked (a change of target recreates it: its spec hash includes the alias and port); removed when unlinked.

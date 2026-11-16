@@ -5,6 +5,7 @@
 export const ACTIONS = Object.freeze({
   pull: 'pull',
   build: 'build-cp',
+  buildGpu: 'build-gpu',
   import: 'import',
   start: 'start',
   restart: 'restart',
@@ -52,6 +53,36 @@ export const CATALOG = Object.freeze({
     title: 'The control-plane image was built for something else',
     message: (p) => `${s(p.image)} carries ${s(p.found)}; this plugin needs ${s(p.expected)}. Build it again.`,
     action: ACTIONS.build, status: 409,
+  },
+  GPU_IMAGE_MISSING: {
+    title: 'The GPU image has not been built',
+    message: (p) => `Compute is set to GPU, and ${s(p.image)} is missing. Build it once on Images & data (needs network and several GB of disk), or set Compute to CPU in Settings.`,
+    action: ACTIONS.buildGpu, status: 409,
+  },
+  GPU_IMAGE_MISMATCH: {
+    title: 'The GPU image was built for something else',
+    message: (p) => `${s(p.image)} carries ${s(p.found)}; this plugin needs ${s(p.expected)}. Build it again.`,
+    action: ACTIONS.buildGpu, status: 409,
+  },
+  GPU_UNAVAILABLE: {
+    title: 'Docker cannot give the API a GPU',
+    message: (p) => `Compute is set to GPU, but the Docker daemon could not attach one: ${s(p.detail)}\nOn the Docker host: install the NVIDIA driver and the NVIDIA Container Toolkit (https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), run \`sudo nvidia-ctk runtime configure --runtime=docker\`, restart dockerd, and check with \`docker run --rm --gpus all <any image> nvidia-smi\`. Or set Compute to CPU in Settings.`,
+    action: ACTIONS.settings, status: 503,
+  },
+  GPU_NOT_USED: {
+    title: 'The models did not load on the GPU',
+    message: (p) => `Compute is set to GPU, but the API's local models loaded on: ${['embeddings', 'reranker'].filter((m) => m in p).map((m) => `${m} ${s(p[m] ?? 'unknown (no start line in its log)')}`).join(', ')}. The API container was stopped rather than left running on the CPU. Check the GPU on the host (\`nvidia-smi\`), rebuild the GPU image, or set Compute to CPU in Settings.`,
+    action: ACTIONS.settings, status: 502,
+  },
+  GPU_NEEDS_FULL: {
+    title: 'GPU compute needs the full image',
+    message: () => 'Only the full image runs local models, which are what the GPU speeds up. Choose the full image, or set Compute to CPU.',
+    action: ACTIONS.settings, status: 400,
+  },
+  GPU_NEEDS_LOCAL_MODEL: {
+    title: 'GPU compute needs a local model',
+    message: () => 'With remote embeddings and a non-local reranker nothing runs on the GPU. Use local embeddings or the local reranker, or set Compute to CPU.',
+    action: ACTIONS.settings, status: 400,
   },
   NAME_TAKEN: {
     title: 'A Docker resource with this plugin\'s name belongs to someone else',

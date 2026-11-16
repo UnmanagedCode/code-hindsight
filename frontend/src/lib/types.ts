@@ -1,7 +1,8 @@
 // Shapes of the backend's /-/api/ responses (docs/protocol.md).
 
 export type HindsightState = 'stopped' | 'checking' | 'starting' | 'ready' | 'stopping' | 'error';
-export type ErrorAction = 'pull' | 'build-cp' | 'import' | 'start' | 'restart' | 'settings' | 'stop';
+export type ErrorAction = 'pull' | 'build-cp' | 'build-gpu' | 'import' | 'start' | 'restart' | 'settings' | 'stop';
+export type ComputeMode = 'cpu' | 'gpu';
 export type Variant = 'full' | 'slim';
 
 export interface CatalogError {
@@ -23,6 +24,8 @@ export interface ImageInfo {
   revision?: string | null;
   basePath?: string | null;
   upstream?: string | null;
+  /** GPU image only: the CUDA torch flavour label it carries. */
+  cuda?: string | null;
 }
 
 export interface ContainerInfo {
@@ -64,7 +67,7 @@ export interface Status {
   bindAddress: string;
   bindAuto: boolean;
   ports: { api: number; cp: number; relay: number };
-  images: { api: ImageInfo; cp: ImageInfo } | null;
+  images: { api: ImageInfo; cp: ImageInfo; gpu: ImageInfo } | null;
   containers: { api: ContainerInfo; cp: ContainerInfo; relay: ContainerInfo } | null;
   startedAt: string | null;
   pendingRestart: boolean;
@@ -73,6 +76,8 @@ export interface Status {
   /** A previous backend could not stop the containers on SIGTERM. */
   lastShutdownFailure: { at: string; error: string } | null;
   llmMode: string;
+  /** The saved compute mode; `devices` is what the running API's local models loaded on, once a GPU start was checked. */
+  compute: { mode: ComputeMode; devices: { embeddings: string | null; reranker: string | null } | null };
   /** Null unless the LLM is linked to a backend reached through the relay. */
   relay: RelayStatus | null;
   autoStart?: boolean;
@@ -83,6 +88,7 @@ export interface Status {
 
 export interface Settings {
   variant: Variant;
+  compute: ComputeMode;
   docker: { allowSudo: boolean };
   network: { bindAddress: string | null; apiPort: number; cpPort: number; relayPort: number };
   llm: { mode: 'none' | 'manual' | 'cc-backend'; provider: string | null; model: string | null; baseUrl: string | null; backendId: string | null; maxConcurrent: number | null };
@@ -94,8 +100,8 @@ export interface SettingsView {
   settings: Settings;
   secrets: { llmApiKey: boolean; embeddingsApiKey: boolean };
   detectedBindAddress: string;
-  choices: { variants: Variant[]; llmModes: Settings['llm']['mode'][]; embeddingsProviders: string[]; rerankerProviders: string[]; llmMaxConcurrentMax: number };
-  images: { api: Record<Variant, { ref: string }>; cp: string; version: string };
+  choices: { variants: Variant[]; computeModes: ComputeMode[]; llmModes: Settings['llm']['mode'][]; embeddingsProviders: string[]; rerankerProviders: string[]; llmMaxConcurrentMax: number };
+  images: { api: Record<Variant, { ref: string }>; cp: string; gpu: string; version: string };
   /** On a save: user keys removed because their provider or URL changed. */
   cleared?: string[];
 }

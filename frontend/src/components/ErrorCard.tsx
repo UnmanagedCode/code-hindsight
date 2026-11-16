@@ -7,6 +7,7 @@ import type { CatalogError, ErrorAction } from '@/lib/types';
 export const ACTION_LABELS: Record<ErrorAction, string> = {
   pull: 'Pull image',
   'build-cp': 'Build CP image',
+  'build-gpu': 'Build GPU image',
   import: 'Import images',
   start: 'Start Hindsight',
   restart: 'Restart Hindsight',

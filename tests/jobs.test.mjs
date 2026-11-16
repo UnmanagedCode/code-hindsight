@@ -7,12 +7,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { createDocker } from '../src/docker.js';
-import { createJobs, buildCpCommand, bundleName, BUNDLE_MANIFEST } from '../src/jobs.js';
+import { createJobs, buildCpCommand, buildGpuCommand, bundleName, BUNDLE_MANIFEST } from '../src/jobs.js';
 import { createTarScanner } from '../src/tarStream.js';
 import { AppError } from '../src/errors.js';
 import { resourceNames, ownerId } from '../src/containerSpec.js';
-import { API_IMAGES, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, UPSTREAM_REVISION } from '../src/pins.js';
-import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, goodApiImage, goodCpImage, helperImage, CP_ID, API_ID, fakeBundle } from './helpers.mjs';
+import { API_IMAGES, API_GPU_IMAGE, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, GPU_DOCKERFILE, GPU_TORCH_FLAVOR, GPU_TORCH_INDEX, HINDSIGHT_VERSION, UPSTREAM_REVISION } from '../src/pins.js';
+import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, goodApiImage, goodCpImage, goodGpuImage, helperImage, CP_ID, API_ID, GPU_ID, fakeBundle } from './helpers.mjs';
 
 const names = resourceNames('code-hindsight');
 
@@ -20,7 +20,7 @@ function make(t, { seed, mode } = {}) {
   const r = mkRoot(t);
   seedDocker(r, seed);
   fs.mkdirSync(r.dataDir, { recursive: true, mode: 0o700 });
-  const docker = createDocker({ env: fakeEnv(r, { mode }), allowSudo: () => true, prefix: 'code-hindsight', images: [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE, BUILD_HELPER], runDir: r.dataDir });
+  const docker = createDocker({ env: fakeEnv(r, { mode }), allowSudo: () => true, prefix: 'code-hindsight', images: [API_IMAGES.full.ref, API_IMAGES.slim.ref, API_GPU_IMAGE, CP_IMAGE, BUILD_HELPER], runDir: r.dataDir });
   const after = [];
   const refreshed = [];
   const supervisor = { afterPrecondition: async () => { after.push(1); }, refresh: async () => { refreshed.push(1); } };
@@ -82,6 +82,48 @@ test('only the pinned helper tag gets the Docker socket', async (t) => {
   await docker.resolve();
   assert.throws(() => docker.runHelper('code-hindsight-build', 'docker:latest', ['true']), /refusing to give the Docker socket/);
   assert.throws(() => docker.runHelper('code-hindsight-build', `sha256:${'e'.repeat(64)}`, ['true']), /refusing to give the Docker socket/);
+});
+
+// GPU2: the GPU image is upstream's CUDA recipe at the pinned commit, FROM the pinned full image,
+// built in the pinned helper, labelled so the start can tell it is ours.
+test('GPU2: build-gpu runs the pinned upstream CUDA recipe in the helper with the pinned version, torch flavour, labels and tag', async (t) => {
+  const { r, jobs, after } = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage(), [BUILD_HELPER]: helperImage() }, registry: { [API_GPU_IMAGE]: goodGpuImage() } } });
+  const end = await jobs.start('build-gpu').done;
+  assert.equal(end.state, 'done', JSON.stringify(end.error));
+  const run = dockerCalls(r).find((a) => a[0] === 'run');
+  assert.deepEqual(run.slice(0, 7), ['run', '--rm', '--name', 'code-hindsight-build', '-v', '/var/run/docker.sock:/var/run/docker.sock', BUILD_HELPER]);
+  assert.deepEqual(run.slice(7), buildGpuCommand());
+  const cmd = buildGpuCommand();
+  assert.deepEqual(cmd.slice(0, 3), ['docker', 'buildx', 'build']);
+  assert.ok(cmd.includes(`https://github.com/vectorize-io/hindsight.git#${UPSTREAM_REVISION}`));
+  assert.equal(cmd[cmd.indexOf('-f') + 1], GPU_DOCKERFILE);
+  const buildArgs = cmd.flatMap((a, i) => (cmd[i - 1] === '--build-arg' ? [a] : []));
+  assert.deepEqual(buildArgs, [`HINDSIGHT_VERSION=${HINDSIGHT_VERSION}`, `PYTORCH_CUDA_FLAVOR=${GPU_TORCH_FLAVOR}`, `PYTORCH_CUDA_INDEX=${GPU_TORCH_INDEX}`]);
+  assert.equal(`ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION}`, API_IMAGES.full.ref, 'the recipe builds FROM the pinned full image');
+  assert.ok(cmd.includes(`${LABELS.upstream}=${UPSTREAM_REVISION}`) && cmd.includes(`${LABELS.cuda}=${GPU_TORCH_FLAVOR}`));
+  assert.equal(cmd[cmd.indexOf('-t') + 1], API_GPU_IMAGE);
+  assert.equal(cmd.at(-1), '--load');
+  assert.deepEqual(end.result, { image: API_GPU_IMAGE, id: GPU_ID });
+  assert.equal(after.length, 1, 'a precondition job: a GPU start waiting on the image starts');
+});
+
+test('GPU2: build-gpu without the full image is IMAGE_MISSING and runs nothing', async (t) => {
+  const { r, jobs, after } = make(t, { seed: { images: { [BUILD_HELPER]: helperImage() } } });
+  const end = await jobs.start('build-gpu').done;
+  assert.equal(end.state, 'failed');
+  assert.equal(end.error.code, 'IMAGE_MISSING');
+  assert.equal(end.error.params.image, API_IMAGES.full.ref);
+  assert.equal(dockerCalls(r).some((a) => a[0] === 'run' || a[0] === 'pull'), false, 'no helper run, nothing pulled');
+  assert.equal(after.length, 0);
+});
+
+test('GPU2: build-gpu pulls only a missing helper, and a result without the GPU labels is GPU_IMAGE_MISSING', async (t) => {
+  const { r, jobs } = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage() }, registry: { [BUILD_HELPER]: helperImage(), [API_GPU_IMAGE]: { Id: GPU_ID, Config: { Labels: {} } } } } });
+  const end = await jobs.start('build-gpu').done;
+  assert.deepEqual(dockerCalls(r).filter((a) => a[0] === 'pull'), [['pull', BUILD_HELPER]]);
+  assert.deepEqual(dockerCalls(r).filter((a) => a[0] === 'run').map((a) => a[6]), [BUILD_HELPER], 'only the helper runs');
+  assert.equal(end.state, 'failed');
+  assert.equal(end.error.code, 'GPU_IMAGE_MISSING');
 });
 
 // Decision 14: one job at a time.
@@ -192,7 +234,19 @@ test('remove-images needs confirmation and stopped containers, and removes only 
   setStateExtra(r);
   const end = await jobs.start('remove-images', { confirm: true }).done;
   assert.deepEqual(end.result.removed, [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE]);
+  assert.equal(dockerCalls(r).some((a) => a[0] === 'rmi' && a.includes(API_GPU_IMAGE)), false, 'an absent GPU image is not named');
   assert.deepEqual(Object.keys(dockerState(r).images).sort(), [BUILD_HELPER, 'node:24'].sort(), 'the build helper and unpinned images stay');
+});
+
+// GPU9: the GPU image is one of the plugin's images: Remove images removes it.
+test('GPU9: remove-images removes the GPU image when present', async (t) => {
+  const { jobs, r } = make(t);
+  const s = dockerState(r);
+  s.images[API_GPU_IMAGE] = goodGpuImage();
+  fs.writeFileSync(r.statePath, JSON.stringify(s));
+  const end = await jobs.start('remove-images', { confirm: true }).done;
+  assert.ok(end.result.removed.includes(API_GPU_IMAGE));
+  assert.equal(dockerState(r).images[API_GPU_IMAGE], undefined);
 });
 
 function setStateExtra(r) {

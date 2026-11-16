@@ -4,10 +4,10 @@ import fs from 'node:fs';
 import { AppError, describeError } from './errors.js';
 import { sendJson, readJson, securityHeaders } from './http.js';
 import { isCrossSite } from './cpProxy.js';
-import { validateSettings, keyEndpoints, LLM_MAX_CONCURRENT_MAX, LLM_MODES, EMBEDDINGS_PROVIDERS, RERANKER_PROVIDERS, SLIM_REFUSED, DEFAULT_SETTINGS } from './settings.js';
+import { validateSettings, keyEndpoints, COMPUTE_MODES, LLM_MAX_CONCURRENT_MAX, LLM_MODES, EMBEDDINGS_PROVIDERS, RERANKER_PROVIDERS, SLIM_REFUSED, DEFAULT_SETTINGS } from './settings.js';
 import { USER_SECRETS } from './secrets.js';
 import { summarizeCcBackends } from './llmEnv.js';
-import { VARIANTS, API_IMAGES, CP_IMAGE, HINDSIGHT_VERSION } from './pins.js';
+import { VARIANTS, API_IMAGES, API_GPU_IMAGE, CP_IMAGE, HINDSIGHT_VERSION } from './pins.js';
 import { bundleName } from './jobs.js';
 import { BACKFILL_LIMITS } from './backfill.js';
 import { validateScopes, renderBank, templateProblem, SCOPE_ACTIONS, SESSION_KINDS, PLACEHOLDERS, SCOPE_LIMITS } from './scopes.js';
@@ -51,8 +51,8 @@ export function createRoutes({ supervisor, jobs, docker, settings: settingsStore
       secrets: secrets.has(),
       defaults: DEFAULT_SETTINGS,
       detectedBindAddress: detectBind(),
-      choices: { variants: VARIANTS, llmModes: LLM_MODES, embeddingsProviders: EMBEDDINGS_PROVIDERS, rerankerProviders: RERANKER_PROVIDERS, slimRefused: SLIM_REFUSED, llmMaxConcurrentMax: LLM_MAX_CONCURRENT_MAX },
-      images: { api: API_IMAGES, cp: CP_IMAGE, version: HINDSIGHT_VERSION },
+      choices: { variants: VARIANTS, computeModes: COMPUTE_MODES, llmModes: LLM_MODES, embeddingsProviders: EMBEDDINGS_PROVIDERS, rerankerProviders: RERANKER_PROVIDERS, slimRefused: SLIM_REFUSED, llmMaxConcurrentMax: LLM_MAX_CONCURRENT_MAX },
+      images: { api: API_IMAGES, cp: CP_IMAGE, gpu: API_GPU_IMAGE, version: HINDSIGHT_VERSION },
     };
   }
 

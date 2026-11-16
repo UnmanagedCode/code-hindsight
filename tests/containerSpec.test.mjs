@@ -55,6 +55,24 @@ test('slim API spec carries remote embeddings and no HF offline flags', () => {
   assert.equal(s.env.HINDSIGHT_API_RERANKER_PROVIDER, 'rrf');
 });
 
+// GPU3: GPU compute adds every GPU and FP16 reranking and nothing else; CPU compute is the spec
+// an existing install already runs (same args, env and hash), so its containers are adopted.
+test('GPU3: the GPU spec adds --gpus all and FP16 reranking on the given image; the CPU spec has neither', () => {
+  const cpu = apiSpec(base);
+  assert.deepEqual(apiSpec({ ...base, compute: 'cpu' }), cpu, 'compute cpu is the spec without a compute');
+  assert.equal(cpu.args.includes('--gpus'), false);
+  assert.equal(cpu.env.HINDSIGHT_API_RERANKER_LOCAL_FP16, undefined);
+  const gpu = apiSpec({ ...base, compute: 'gpu', image: { id: OTHER_ID } });
+  assert.equal(gpu.args[gpu.args.indexOf('--gpus') + 1], 'all');
+  assert.equal(gpu.env.HINDSIGHT_API_RERANKER_LOCAL_FP16, 'true');
+  assert.equal(gpu.args.at(-1), OTHER_ID, 'runs the image it was given (the GPU image ID)');
+  const opt = (s, f) => s.args[s.args.indexOf(f) + 1];
+  for (const f of ['-v', '--shm-size', '-p', '--network', '--network-alias', '--restart']) assert.equal(opt(gpu, f), opt(cpu, f), `${f} is the same in both modes`);
+  const { HINDSIGHT_API_RERANKER_LOCAL_FP16: _fp16, ...gpuEnvRest } = gpu.env;
+  assert.deepEqual(gpuEnvRest, cpu.env);
+  assert.notEqual(apiSpec({ ...base, compute: 'gpu' }).hash, cpu.hash);
+});
+
 // Spec 5/6: CP keyed, reaching the API over the private network by alias.
 test('CP spec: own access key, API key, API by alias, published on the bind address', () => {
   const s = cpSpec({ names, image: { id: 'sha256:c' }, bind: '127.0.0.1', port: 19999, apiKey: 'a', accessKey: 'b', owner: 'o1' });

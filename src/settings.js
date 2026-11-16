@@ -6,6 +6,8 @@ import crypto from 'node:crypto';
 import { VARIANTS } from './pins.js';
 import { readJsonFile, writePrivateFileAtomic } from './fsPrivate.js';
 
+/** Where the local embedding and reranker models run: `gpu` runs the API from the CUDA image with the host's NVIDIA GPUs. */
+export const COMPUTE_MODES = Object.freeze(['cpu', 'gpu']);
 export const LLM_MODES = Object.freeze(['none', 'manual', 'cc-backend']);
 /** Upper bound for `llm.maxConcurrent` (Hindsight's own default is lower). */
 export const LLM_MAX_CONCURRENT_MAX = 256;
@@ -16,6 +18,7 @@ export const SLIM_REFUSED = Object.freeze({ embeddings: Object.freeze(['local'])
 
 export const DEFAULT_SETTINGS = Object.freeze({
   variant: 'full',
+  compute: 'cpu',
   docker: { allowSudo: true },
   network: { bindAddress: null, apiPort: 18888, cpPort: 19999, relayPort: 18434 },
   llm: { mode: 'none', provider: null, model: null, baseUrl: null, backendId: null, maxConcurrent: null },
@@ -25,6 +28,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
 
 const SHAPE = {
   variant: null,
+  compute: null,
   docker: ['allowSudo'],
   network: ['bindAddress', 'apiPort', 'cpPort', 'relayPort'],
   llm: ['mode', 'provider', 'model', 'baseUrl', 'backendId', 'maxConcurrent'],
@@ -66,6 +70,7 @@ export function validateSettings(input, has = {}) {
   }
 
   if (!VARIANTS.includes(settings.variant)) err('variant', `must be one of ${VARIANTS.join(', ')}`);
+  if (!COMPUTE_MODES.includes(settings.compute)) err('compute', `must be one of ${COMPUTE_MODES.join(', ')}`);
   if (typeof settings.docker.allowSudo !== 'boolean') err('docker.allowSudo', 'must be true or false');
 
   const n = settings.network;
@@ -107,6 +112,11 @@ export function validateSettings(input, has = {}) {
     if (SLIM_REFUSED.reranker.includes(settings.reranker.provider)) {
       err('reranker.provider', 'the slim image needs a reranker without a local model', 'SLIM_NEEDS_RERANKER');
     }
+  }
+  if (settings.compute === 'gpu') {
+    // Only the full image's in-process models run on the GPU.
+    if (settings.variant !== 'full') err('compute', 'GPU compute needs the full image', 'GPU_NEEDS_FULL');
+    else if (e.provider !== 'local' && settings.reranker.provider !== 'local') err('compute', 'GPU compute needs local embeddings or the local reranker', 'GPU_NEEDS_LOCAL_MODEL');
   }
   return { settings, errors };
 }
