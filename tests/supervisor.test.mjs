@@ -10,8 +10,8 @@ import { createSettingsStore, DEFAULT_SETTINGS } from '../src/settings.js';
 import { createSecretsStore } from '../src/secrets.js';
 import { createSupervisor } from '../src/supervisor.js';
 import { resourceNames, ownerId } from '../src/containerSpec.js';
-import { API_IMAGES, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, UPSTREAM_REVISION } from '../src/pins.js';
-import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, setDockerState, fakeClock, waitFor, goodApiImage, goodCpImage, CP_ID, API_ID, FAKE_DOCKER } from './helpers.mjs';
+import { API_IMAGES, API_GPU_IMAGE, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, UPSTREAM_TAG } from '../src/pins.js';
+import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, setDockerState, fakeClock, waitFor, goodApiImage, goodCpImage, goodGpuImage, helperImage, CP_ID, API_ID, GPU_ID, FAKE_DOCKER } from './helpers.mjs';
 
 const PREFIX = 'code-hindsight';
 const names = resourceNames(PREFIX);
@@ -40,7 +40,7 @@ function make(t, { mode = '', sudoMode, seed, settings, allowSudo, fetchCcModels
   const secrets = createSecretsStore(r.dataDir);
   const runDir = path.join(r.dataDir, 'run');
   fs.mkdirSync(runDir, { mode: 0o700 });
-  const docker = createDocker({ env, allowSudo: () => settingsStore.get().docker.allowSudo, prefix: PREFIX, images: [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE, BUILD_HELPER], runDir });
+  const docker = createDocker({ env, allowSudo: () => settingsStore.get().docker.allowSudo, prefix: PREFIX, images: [API_IMAGES.full.ref, API_IMAGES.slim.ref, API_GPU_IMAGE, CP_IMAGE, BUILD_HELPER], runDir });
   const h = health ?? { api: 200, cp: 200 };
   const probes = [];
   const probe = async (url) => { probes.push(url); return url.includes(`:${settingsStore.get().network.apiPort}/`) ? h.api : h.cp; };
@@ -166,7 +166,7 @@ test('missing or mismatched images are named and nothing is created', async (t) 
   assert.equal(errCode(noCp.sup), 'CP_IMAGE_MISSING');
   assert.equal(noCp.sup.status().error.action, 'build-cp');
 
-  const otherBase = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage('full'), [CP_IMAGE]: { Id: CP_ID, Config: { Labels: { [LABELS.basePath]: '/hindsight', [LABELS.upstream]: UPSTREAM_REVISION } } } } } });
+  const otherBase = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage('full'), [CP_IMAGE]: { Id: CP_ID, Config: { Labels: { [LABELS.basePath]: '/hindsight', [LABELS.upstream]: UPSTREAM_TAG } } } } } });
   await otherBase.sup.ensureRunning();
   assert.equal(errCode(otherBase.sup), 'CP_IMAGE_MISMATCH');
 });
@@ -818,4 +818,257 @@ test('R2-C3: a failing relay inspect counts as may-run: the relay is named in th
   await sup.shutdown();
   await waitFor(() => stopArgs(first.r));
   assert.deepEqual(stopArgs(first.r), ['stop', '-t', '30', names.cp, names.api, names.relay]);
+});
+
+// --- GPU compute ---
+
+/** Every image present, the GPU image too (labelled as build-gpu labels it). */
+const gpuSeed = (extra = {}) => ({ images: { [API_IMAGES.full.ref]: goodApiImage('full'), [API_IMAGES.slim.ref]: goodApiImage('slim'), [CP_IMAGE]: goodCpImage(), [BUILD_HELPER]: helperImage(), [API_GPU_IMAGE]: goodGpuImage(), ...extra } });
+const apiRuns = (r) => dockerCalls(r).filter((a) => a[0] === 'run' && a.includes(names.api));
+const setCompute = (settingsStore, compute) => { const s = settingsStore.get(); s.compute = compute; settingsStore.save(s); };
+
+// GPU4: a GPU start needs the labelled GPU image, and says so before any container is touched.
+test('GPU4: GPU mode without the GPU image is GPU_IMAGE_MISSING (action build-gpu) and touches no container', async (t) => {
+  const { r, sup } = make(t, { settings: { compute: 'gpu' } });
+  await sup.ensureRunning();
+  assert.equal(errCode(sup), 'GPU_IMAGE_MISSING');
+  assert.equal(sup.status().error.action, 'build-gpu');
+  assert.equal(sup.status().error.params.image, API_GPU_IMAGE);
+  assert.equal(sup.status().images.gpu.present, false);
+  assert.ok(!cmds(r).some((c) => ['run', 'rm', 'stop', 'start', 'network create', 'volume create'].includes(c)));
+});
+
+test('GPU4: a GPU image without this plugin\'s build labels is GPU_IMAGE_MISMATCH and touches no container', async (t) => {
+  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed({ [API_GPU_IMAGE]: { ...goodGpuImage(), Config: { Labels: { ...goodGpuImage().Config.Labels, [LABELS.cuda]: 'cu126' } } } }) });
+  await sup.ensureRunning();
+  assert.equal(errCode(sup), 'GPU_IMAGE_MISMATCH');
+  assert.equal(sup.status().error.action, 'build-gpu');
+  assert.ok(!cmds(r).some((c) => ['run', 'rm', 'stop', 'start'].includes(c)));
+});
+
+test('GPU4: GPU mode runs the GPU image by ID with every GPU, and needs no official full image', async (t) => {
+  const seed = gpuSeed();
+  delete seed.images[API_IMAGES.full.ref];
+  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  const api = dockerState(r).containers[names.api];
+  assert.equal(api.Image, GPU_ID);
+  assert.equal(api.RunArgs[api.RunArgs.indexOf('--gpus') + 1], 'all');
+  assert.ok(api.Config.Env.includes('HINDSIGHT_API_RERANKER_LOCAL_FP16=true'));
+  assert.deepEqual(sup.status().compute, { mode: 'gpu', devices: { embeddings: 'cuda', reranker: 'cuda' } });
+  assert.equal(sup.status().images.gpu.ok, true);
+});
+
+// GPU5: a daemon that cannot attach a GPU ends the start; nothing falls back to the CPU.
+test('GPU5: a daemon without GPU support is GPU_UNAVAILABLE and no CPU API container is created', async (t) => {
+  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed(), mode: 'no-gpu' });
+  await sup.ensureRunning();
+  assert.equal(errCode(sup), 'GPU_UNAVAILABLE');
+  assert.match(sup.status().error.message, /could not select device driver/);
+  assert.equal(sup.status().error.action, 'settings');
+  assert.ok(apiRuns(r).length >= 1 && apiRuns(r).every((a) => a.includes('--gpus')), 'every API run asked for the GPU');
+  assert.equal(dockerState(r).containers[names.api].State.Running, false);
+  // The start is re-tried (the created container is started again) with the same refusal.
+  await sup.ensureRunning();
+  assert.equal(errCode(sup), 'GPU_UNAVAILABLE');
+});
+
+// GPU6: the models' own start lines must name cuda, or the API is stopped.
+test('GPU6: models that loaded on the CPU are GPU_NOT_USED; the API is stopped and the state is not ready', async (t) => {
+  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed() });
+  setDockerState(r, (s) => { s.gpuDevice = 'cpu'; });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'error');
+  assert.equal(errCode(sup), 'GPU_NOT_USED');
+  assert.deepEqual(sup.status().error.params, { embeddings: 'cpu', reranker: 'cpu' });
+  assert.equal(dockerState(r).containers[names.api].State.Running, false, 'the API was stopped');
+  assert.ok(dockerState(r).containers[names.api], 'and kept');
+  assert.equal(sup.connection(), null);
+  assert.equal(sup.status().compute.devices, null);
+  const logs = dockerCalls(r).find((a) => a[0] === 'logs');
+  assert.ok(logs.includes('--since') && logs.includes('--until'), 'reads the start\'s log window');
+});
+
+test('GPU6: a fresh API with no start lines is GPU_NOT_USED, not recreated', async (t) => {
+  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed() });
+  setDockerState(r, (s) => { s.gpuStartLines = false; });
+  await sup.ensureRunning();
+  assert.equal(errCode(sup), 'GPU_NOT_USED');
+  assert.deepEqual(sup.status().error.params, { embeddings: null, reranker: null });
+  assert.equal(apiRuns(r).length, 1);
+  assert.equal(dockerState(r).containers[names.api].State.Running, false);
+});
+
+// GPU6 (log rotation): an adopted, long-running GPU API whose start lines rotated out of its log
+// is recreated so the check reads a fresh start, never stopped for the missing lines alone; an
+// adopted API whose lines name the CPU is GPU_NOT_USED and not recreated.
+test('GPU6: an adopted API whose start lines rotated away is recreated and checked afresh', async (t) => {
+  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed() });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready');
+  setDockerState(r, (s) => { s.containers[names.api].Log = 'INFO POST /v1/default/banks/x/memories/recall 200'; });
+  fs.writeFileSync(r.logPath, '');
+  await sup.restart(); // stops and starts again: the stopped API is started, so its lines are fresh
+  assert.equal(sup.status().state, 'ready');
+  // Now the adopted case proper: a running API (as a new backend finds it) with no start lines.
+  setDockerState(r, (s) => { s.containers[names.api].Log = 'INFO POST /v1/default/banks/x/memories/recall 200'; });
+  fs.writeFileSync(r.logPath, '');
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  assert.deepEqual(cmds(r).filter((c) => ['stop', 'rm', 'run'].includes(c)), ['stop', 'rm', 'run'], 'only the API was recreated');
+  assert.equal(apiRuns(r).length, 1);
+  assert.deepEqual(sup.status().compute.devices, { embeddings: 'cuda', reranker: 'cuda' });
+  assert.ok(!cmds(r).includes('volume rm'));
+});
+
+test('GPU6: an adopted API whose start lines name the CPU is GPU_NOT_USED and not recreated', async (t) => {
+  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed() });
+  await sup.ensureRunning();
+  setDockerState(r, (s) => { s.containers[names.api].Log = 'Embeddings: local provider initialized (dim: 384, device: cpu)\nReranker: local provider initialized (device: cpu, max_concurrent=4)'; });
+  fs.writeFileSync(r.logPath, '');
+  await sup.ensureRunning();
+  assert.equal(errCode(sup), 'GPU_NOT_USED');
+  assert.ok(!cmds(r).includes('rm') && !cmds(r).includes('run'));
+  assert.equal(dockerState(r).containers[names.api].State.Running, false);
+});
+
+// GPU7: switching modes recreates only the API, on the same volume; the CP is adopted.
+test('GPU7: CPU→GPU restart recreates only the API on the GPU image; GPU→CPU back; the volume is never removed', async (t) => {
+  const { r, sup, settingsStore } = make(t, { seed: gpuSeed() });
+  await sup.ensureRunning();
+  assert.deepEqual(sup.status().compute, { mode: 'cpu', devices: null });
+  assert.equal(dockerState(r).containers[names.api].Image, API_ID);
+  setCompute(settingsStore, 'gpu');
+  assert.equal(sup.status().pendingRestart, true);
+  fs.writeFileSync(r.logPath, '');
+  await sup.restart();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  assert.equal(sup.status().pendingRestart, false);
+  let api = dockerState(r).containers[names.api];
+  assert.equal(api.Image, GPU_ID);
+  assert.ok(api.RunArgs.includes('--gpus'));
+  assert.deepEqual(api.Mounts, [names.volume]);
+  assert.deepEqual(dockerCalls(r).filter((a) => a[0] === 'rm' || a[0] === 'run').map((a) => a.find((x) => x.startsWith('code-hindsight-'))), [names.api, names.api], 'only the API is removed and run');
+  assert.deepEqual(sup.status().compute.devices, { embeddings: 'cuda', reranker: 'cuda' });
+
+  setCompute(settingsStore, 'cpu');
+  fs.writeFileSync(r.logPath, '');
+  await sup.restart();
+  assert.equal(sup.status().state, 'ready');
+  api = dockerState(r).containers[names.api];
+  assert.equal(api.Image, API_ID);
+  assert.equal(api.RunArgs.includes('--gpus'), false);
+  assert.deepEqual(api.Mounts, [names.volume]);
+  assert.deepEqual(sup.status().compute, { mode: 'cpu', devices: null });
+  assert.ok(!cmds(r).includes('volume rm') && !cmds(r).includes('volume create'));
+  assert.ok(!dockerCalls(r).some((a) => a[0] === 'logs' && a.includes('--since')), 'CPU mode reads no device lines');
+});
+
+test('GPU7: CPU→GPU before the GPU image exists stops the stack and refuses GPU_IMAGE_MISSING; nothing is removed', async (t) => {
+  const { r, sup, settingsStore } = make(t);
+  await sup.ensureRunning();
+  setCompute(settingsStore, 'gpu');
+  fs.writeFileSync(r.logPath, '');
+  await sup.restart();
+  assert.equal(errCode(sup), 'GPU_IMAGE_MISSING');
+  assert.ok(!cmds(r).some((c) => ['rm', 'run', 'volume rm'].includes(c)));
+  assert.equal(dockerState(r).containers[names.api].Image, API_ID, 'the CPU container is kept');
+});
+
+// GPU8: Docker restarting the API (on-failure) re-runs the check: a GPU lost mid-run is not missed.
+test('GPU8: a watch tick after the API restarted on the CPU is GPU_NOT_USED and stops it; an unchanged start reads no log', async (t) => {
+  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed() });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready');
+  fs.writeFileSync(r.logPath, '');
+  await sup.checkHealth();
+  assert.equal(sup.status().state, 'ready');
+  assert.ok(!dockerCalls(r).some((a) => a[0] === 'logs'), 'same start: no log read');
+  setDockerState(r, (s) => {
+    s.containers[names.api].State.StartedAt = '2026-01-01T01:00:00.000Z';
+    s.containers[names.api].Log = 'Embeddings: local provider initialized (dim: 384, device: cpu)\nReranker: local provider initialized (device: cpu, max_concurrent=4)';
+  });
+  await sup.checkHealth();
+  assert.equal(errCode(sup), 'GPU_NOT_USED');
+  assert.equal(dockerState(r).containers[names.api].State.Running, false);
+});
+
+test('GPU8: a watch tick after the API restarted on cuda stays ready', async (t) => {
+  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed() });
+  await sup.ensureRunning();
+  setDockerState(r, (s) => { s.containers[names.api].State.StartedAt = '2026-01-01T01:00:00.000Z'; });
+  await sup.checkHealth();
+  assert.equal(sup.status().state, 'ready');
+  assert.deepEqual(sup.status().compute.devices, { embeddings: 'cuda', reranker: 'cuda' });
+});
+
+// GPU4: every build label of the GPU image is checked: the recipe, the upstream release tag and
+// the torch flavour, each on its own.
+for (const [what, labels] of [
+  ['no recipe label', (l) => { delete l[LABELS.recipe]; }],
+  ['another recipe', (l) => { l[LABELS.recipe] = 'docker/docker-compose/cuda/Dockerfile'; }],
+  ['an upstream commit instead of the release tag', (l) => { l[LABELS.upstream] = '0'.repeat(40); }],
+]) {
+  test(`GPU4: a GPU image with ${what} is GPU_IMAGE_MISMATCH naming the labels, and touches no container`, async (t) => {
+    const img = goodGpuImage();
+    labels(img.Config.Labels);
+    const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed({ [API_GPU_IMAGE]: img }) });
+    await sup.ensureRunning();
+    assert.equal(errCode(sup), 'GPU_IMAGE_MISMATCH');
+    assert.equal(sup.status().error.action, 'build-gpu');
+    assert.notEqual(sup.status().error.params.found, sup.status().error.params.expected, 'found and expected differ where the image does');
+    assert.match(sup.status().error.params.expected, /recipe src\/gpu\/Dockerfile/);
+    assert.ok(!cmds(r).some((c) => ['run', 'rm', 'stop', 'start'].includes(c)));
+  });
+}
+
+// Tag pins: a CP image labelled with an upstream commit (not the release tag) is refused, with the rebuild as its action.
+test('a CP image labelled with an upstream commit instead of the release tag is CP_IMAGE_MISMATCH with Build CP image', async (t) => {
+  const { r, sup } = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage('full'), [CP_IMAGE]: { Id: CP_ID, Config: { Labels: { [LABELS.basePath]: BASE_PATH, [LABELS.upstream]: '0'.repeat(40) } } } } } });
+  await sup.ensureRunning();
+  assert.equal(errCode(sup), 'CP_IMAGE_MISMATCH');
+  assert.equal(sup.status().error.action, 'build-cp');
+  assert.match(sup.status().error.message, /Build CP image/);
+  assert.ok(!cmds(r).some((c) => ['run', 'rm', 'stop', 'start'].includes(c)));
+});
+
+// GPU8: a Docker restart is judged by the settings the API was started with: a saved-but-not-applied
+// change (here a local reranker the running API does not load) never fails a healthy GPU API.
+test('GPU8: after a saved-but-not-applied reranker change, a Docker restart of the GPU API stays ready', async (t) => {
+  const s = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
+  const { r, sup, settingsStore } = make(t, { settings: { compute: 'gpu', reranker: { provider: 'rrf' } }, seed: gpuSeed() });
+  setDockerState(r, (st) => { st.gpuDevice = 'cuda'; });
+  await sup.ensureRunning();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  const saved = settingsStore.get();
+  saved.reranker = { ...s.reranker, provider: 'local' };
+  settingsStore.save(saved);
+  assert.equal(sup.status().pendingRestart, true);
+  // Docker restarts the API (on-failure) with the env it was created with: no local reranker line.
+  setDockerState(r, (st) => {
+    st.containers[names.api].State.StartedAt = '2026-01-01T01:00:00.000Z';
+    st.containers[names.api].Log = 'Embeddings: local provider initialized (dim: 384, device: cuda)\nReranker: RRF passthrough provider initialized (neural reranking disabled)';
+  });
+  await sup.checkHealth();
+  assert.equal(sup.status().state, 'ready', JSON.stringify(sup.status().error));
+  assert.equal(dockerState(r).containers[names.api].State.Running, true);
+});
+
+// The watch's GPU step reads the checked start once: a stop landing while it awaits the API's
+// inspect leaves it a no-op, never a TypeError on the cleared check.
+test('GPU8: a stop racing the watch\'s GPU step neither throws nor touches the stopped stack', async (t) => {
+  const { sup, docker } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed() });
+  await sup.ensureRunning();
+  const inspect = docker.inspectContainer;
+  let stopping = null;
+  docker.inspectContainer = async (name) => {
+    const c = await inspect(name);
+    if (name === names.api && !stopping) { stopping = sup.stop(); c.State.StartedAt = '2026-01-01T01:00:00.000Z'; }
+    return c;
+  };
+  await assert.doesNotReject(sup.checkHealth());
+  await stopping;
+  assert.ok(stopping, 'the stop landed inside the GPU step');
+  assert.equal(sup.status().state, 'stopped');
 });

@@ -73,6 +73,12 @@ export function Images({ status, onChanged }: { status: Status; onChanged: () =>
             <Badge variant={status.images?.cp.ok ? 'success' : 'outline'}>{status.images?.cp.ok ? 'present' : 'missing or wrong build'}</Badge>
             <Button size="sm" variant="outline" disabled={busy} onClick={() => void start('build-cp')}>Build CP image</Button>
           </div>
+          <div className="flex flex-wrap items-center gap-2" data-image="gpu">
+            <span>GPU image (Compute: GPU)</span>
+            <Badge variant={status.images?.gpu.ok ? 'success' : 'outline'}>{status.images?.gpu.ok ? 'present' : status.images?.gpu.present ? 'wrong build' : 'missing'}</Badge>
+            <Button size="sm" variant="outline" disabled={busy} onClick={() => void start('build-gpu')}>Build GPU image</Button>
+          </div>
+          <p className="text-xs text-muted-foreground">The GPU image is built here from the full image plus CUDA PyTorch: it needs the full image, network access and several GB of disk, and is not part of offline bundles.</p>
         </CardContent>
       </Card>
 

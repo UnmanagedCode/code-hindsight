@@ -50,6 +50,19 @@ describe('App shell', () => {
     for (const c of calls) expect(c.url.startsWith('/')).toBe(false);
   });
 
+  // GPU10: a GPU_IMAGE_MISSING card's action starts the build-gpu job.
+  it('GPU10: the build-gpu error action starts the build-gpu job', async () => {
+    at('');
+    const calls = stubFetch((url) => {
+      if (url.startsWith('-/api/status')) return { body: status({ state: 'error', error: catalogError('GPU_IMAGE_MISSING', 'build-gpu') }) };
+      if (url === '-/api/jobs/build-gpu') return { body: { id: 'j2', kind: 'build-gpu', state: 'running' } };
+      return undefined;
+    });
+    render(<App />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Build GPU image' }));
+    expect(calls.find((c) => c.url === '-/api/jobs/build-gpu')?.init?.method).toBe('POST');
+  });
+
   it('switches views through the query string', async () => {
     at('');
     stubFetch((url) => (url.startsWith('-/api/status') ? { body: status() } : url === '-/api/settings' ? { body: { settings: null } } : undefined));

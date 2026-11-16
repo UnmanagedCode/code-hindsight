@@ -49,6 +49,7 @@ export function embeddingsEnv(settings, secrets) {
  * @param {ReturnType<typeof resourceNames>} o.names
  * @param {{id: string}} o.image the image ID the pinned tag resolved to at start; containers run by it, so a re-pulled tag recreates them
  * @param {string} o.variant full | slim
+ * @param {string} [o.compute] cpu | gpu: `gpu` hands the container every NVIDIA GPU (o.image is then the GPU image)
  * @param {string} o.bind host address the port is published on
  * @param {number} o.port host port
  * @param {string} o.apiKey
@@ -57,7 +58,8 @@ export function embeddingsEnv(settings, secrets) {
  * @param {string} o.owner
  * @returns {{name: string, args: string[], env: Record<string,string>, hash: string}}
  */
-export function apiSpec({ names, image, variant, bind, port, apiKey, llmEnv, embeddingsEnv: embEnv, owner }) {
+export function apiSpec({ names, image, variant, compute = 'cpu', bind, port, apiKey, llmEnv, embeddingsEnv: embEnv, owner }) {
+  const gpu = compute === 'gpu';
   const env = {
     HINDSIGHT_ENABLE_CP: 'false',
     HINDSIGHT_API_TENANT_EXTENSION: 'hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension',
@@ -66,6 +68,15 @@ export function apiSpec({ names, image, variant, bind, port, apiKey, llmEnv, emb
     ...(variant === 'full' ? { HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1' } : {}),
     ...llmEnv,
     ...embEnv,
+    ...(gpu ? {
+      // Upstream's GPU recipe: half-precision reranking, the same model, faster on CUDA.
+      HINDSIGHT_API_RERANKER_LOCAL_FP16: 'true',
+      // On CUDA, torch routes an op of the reranker's ModernBERT model to a Triton kernel, and
+      // Triton compiles a C launcher at first use; the full image has no C compiler, so the API
+      // exits at start ("RuntimeError: Failed to find C compiler"). This keeps torch on its
+      // built-in kernels. Re-check it when bumping Hindsight or torch.
+      TORCH_DISABLE_NATIVE_JIT: '1',
+    } : {}),
   };
   const base = [
     '-d', '--name', names.api,
@@ -74,6 +85,7 @@ export function apiSpec({ names, image, variant, bind, port, apiKey, llmEnv, emb
     '-p', `${bind}:${port}:${API_CONTAINER_PORT}`,
     '-v', `${names.volume}:${API_DATA_PATH}`,
     '--shm-size', API_SHM_SIZE,
+    ...(gpu ? ['--gpus', 'all'] : []),
   ];
   const hash = specHash(image.id, base, env);
   const labels = { [LABELS.managed]: '1', [LABELS.owner]: owner, [LABELS.role]: 'api', [LABELS.spec]: hash };

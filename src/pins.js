@@ -1,13 +1,20 @@
 // The one place the Hindsight release, its images and the plugin's mount point are pinned.
-// Bumping Hindsight: change the version, tags and revision here, rebuild the CP image
-// (Images & data → Build CP image), and pull or import the matching API images.
+// Bumping Hindsight: change the version and tags here, rebuild the CP image
+// (Images & data → Build CP image), and pull or import the matching API images. For the GPU
+// image: re-diff src/gpu/Dockerfile against upstream's docker/docker-compose/cuda/Dockerfile at
+// the new tag (UPSTREAM_TAG), re-read the models' `device:` start lines (`src/gpuCheck.js`), re-check
+// whether the GPU API still needs TORCH_DISABLE_NATIVE_JIT (`apiSpec` in src/containerSpec.js), check a CUDA torch
+// wheel of the new base torch version exists under `GPU_TORCH_INDEX`, and rebuild the GPU image.
 //
 // Images are pinned by tag, never by digest: the tag is the pin.
 
 export const HINDSIGHT_VERSION = '1.2.1';
 export const UPSTREAM_REPO = 'https://github.com/vectorize-io/hindsight.git';
-/** The commit upstream's release tag (v1.2.1) points at; the CP is built from it, and the official images carry it as `org.opencontainers.image.revision`. */
-export const UPSTREAM_REVISION = '0eb02d8c418eac6b489bc63883c993b2257dfac4';
+/**
+ * Upstream's git release tag for HINDSIGHT_VERSION: the CP is built from the source at it, the GPU
+ * recipe derives from it, and both images are labelled with it. A tag, never a commit hash.
+ */
+export const UPSTREAM_TAG = `v${HINDSIGHT_VERSION}`;
 
 /** The official API images per variant: the tag pulled and run. */
 export const API_IMAGES = Object.freeze({
@@ -30,6 +37,17 @@ export const CP_TARGET = 'cp-only';
  */
 export const BUILD_HELPER = 'docker:29.9.2-cli';
 
+/** The CUDA build of the full API image (GPU compute): built locally from src/gpu/Dockerfile. */
+export const API_GPU_IMAGE = 'code-hindsight-api:1.2.1-cuda';
+/**
+ * The PyTorch CUDA wheel flavour the GPU image installs (the recipe swaps the base image's CPU
+ * torch for `torch==<same version>+<flavour>`). Not upstream's cu126: it has no Blackwell (sm_120)
+ * kernels. cu128 publishes no wheel for the base's torch version; cu129 has one, supports
+ * Blackwell, and stays on CUDA 12 for driver compatibility.
+ */
+export const GPU_TORCH_FLAVOR = 'cu129';
+export const GPU_TORCH_INDEX = 'https://download.pytorch.org/whl/cu129';
+
 /** Every container, volume and network this plugin creates is named `<RESOURCE_PREFIX>-…`. */
 export const RESOURCE_PREFIX = 'code-hindsight';
 
@@ -42,6 +60,8 @@ export const LABELS = Object.freeze({
   embeddings: 'io.code-hindsight.embeddings',
   basePath: 'io.code-hindsight.basePath',
   upstream: 'io.code-hindsight.upstream',
+  cuda: 'io.code-hindsight.cuda',
+  recipe: 'io.code-hindsight.recipe',
 });
 
 /** Ports the upstream images listen on inside their containers. */

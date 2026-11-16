@@ -38,7 +38,7 @@ export const BACKFILL_LIMITS = Object.freeze({
 
 /**
  * The dry run's token heuristic. `chunkChars` is Hindsight's `DEFAULT_RETAIN_CHUNK_SIZE`
- * (`hindsight_api/config.py` at `UPSTREAM_REVISION`; the plugin sets no bank config).
+ * (`hindsight_api/config.py` at `UPSTREAM_TAG`; the plugin sets no bank config).
  * `promptTokensPerChunk` covers the extraction prompt sent with every chunk
  * (`_BASE_FACT_EXTRACTION_PROMPT` plus its schema and context); `outputTokensPerChunk` the
  * extracted facts. Rough by design: the server's chunking decides the real use.

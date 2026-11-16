@@ -23,7 +23,7 @@ The page opens on **Control plane** when Hindsight is ready, otherwise on **Stat
 | Stop failure | when the previous backend could not stop the containers on SIGTERM: the reason (shown until Hindsight is next ready) |
 | Auto-start hint | when cc reports Auto-start off for this plugin: Hindsight runs only while the plugin backend runs; switch on **Settings → Plugins → Code Hindsight → Auto-start** to have it up after every cc start |
 | Settings changed | when the saved settings differ from the running containers: **Apply & restart** |
-| Hindsight | state, docker invocation (`docker` or `sudo -n docker`) and daemon version, image variant, bind address and the host ports (the relay port while a backend is linked through the relay), LLM mode, ready-since time; **Start / Restart / Stop Hindsight** |
+| Hindsight | state, docker invocation (`docker` or `sudo -n docker`) and daemon version, image variant, compute (`CPU`, or `GPU` with the device each local model loaded on once a GPU start was checked), bind address and the host ports (the relay port while a backend is linked through the relay), LLM mode, ready-since time; **Start / Restart / Stop Hindsight** |
 | Relay | only while the LLM goes through the relay: for Ollama, the daemon's version and URL (or that it is not answering); for a loopback cc backend, its endpoint URL and whether it answers; then the tunnel's state; a warning for `OLLAMA_UNREACHABLE` or `CC_BACKEND_UNREACHABLE`, and for `RELAY_DISCONNECTED` |
 | Images and containers | the pinned API image and the CP image (present / missing / the CP image built for something else), the containers' states (the relay container only while it exists), **API log** / **CP log** / **Relay log** (last 200 lines) |
 | Job | the running or last job (a Docker action, or a backfill scan or import) with its log tail |
@@ -37,6 +37,7 @@ Saved with **Save**; **Apply & restart** saves and reconciles the containers to 
 | Setting | Default | Notes |
 |---|---|---|
 | Image | `full` | `slim` has no local models: refused (`SLIM_NEEDS_REMOTE_EMBEDDINGS`, `SLIM_NEEDS_RERANKER`) until embeddings are remote **with a key of their own** (`EMBEDDINGS_NEEDS_KEY` otherwise) and the reranker is `rrf` |
+| Compute | CPU | where the local embedding and reranker models run. **GPU (NVIDIA)** runs the API from the GPU image (`API_GPU_IMAGE` in `src/pins.js`, built once on Images & data) with every host GPU (`--gpus all`). Needs the NVIDIA driver and the NVIDIA Container Toolkit on the Docker host, the full image (`GPU_NEEDS_FULL`), and local embeddings or the local reranker (`GPU_NEEDS_LOCAL_MODEL`). Applying recreates the API container, and the relay container while a backend is linked through it (it runs from the API image); the control-plane container, the data volume and its memories stay. See [GPU compute](#gpu-compute) |
 | Use `sudo -n docker` when docker is refused | on | sudo docker is root on the host |
 | Bind address | automatic | the Docker host's address the API and control-plane ports (and the relay port, while a backend is linked through the relay) are published on; automatic = the container's default gateway when cc runs in a container, else `127.0.0.1`. An unspecified (`0.x`), multicast, reserved or broadcast address is refused |
 | Relay port | `DEFAULT_SETTINGS` in `src/settings.js` | where the relay container publishes its tunnel port on the bind address; used only with an Ollama or loopback backend; must differ from the API and control-plane ports. Changing it flags **Apply & restart** even with no relayed backend (it is part of the container settings; no container is recreated for it) |
@@ -163,6 +164,15 @@ Every failure yields a memoryless turn and an Activity entry; the hooks always e
 
 Two losses are not logged: a window of turns that is only partly still in the transcript tail loses its trimmed part silently (only a window with nothing left is reported), and after a `/clear` or trim a never-sent turn stamped in exactly the same millisecond as the retained boundary is excluded.
 
+### GPU compute
+
+- **Ready only on the GPU.** After the API answers, the plugin reads the API's own start lines for the device each local model loaded on (`src/gpuCheck.js`). Any local model on another device, or with no start line, is `GPU_NOT_USED`: the API container is stopped (kept, volume kept), never left running on the CPU. Status shows the devices.
+- **Re-checked after a Docker restart.** While ready, a watch tick that finds the API restarted (by its `on-failure` policy) reads the new start's lines; a GPU lost mid-run that brings the API back on the CPU is `GPU_NOT_USED`.
+- **Rotated logs.** A running GPU API adopted by a new backend whose start lines are gone from its log (a daemon `log-opts` size limit) is recreated once so the check reads a fresh start; a line naming another device is never retried.
+- **Refusals, all before any container is touched:** GPU image absent → `GPU_IMAGE_MISSING`, built for another upstream or torch flavour → `GPU_IMAGE_MISMATCH` (both offer **Build GPU image**). Docker cannot attach a GPU → `GPU_UNAVAILABLE`, with the toolkit setup steps. Nothing falls back to the CPU.
+- **Switching.** Save Compute, then **Apply & restart**. CPU→GPU before the GPU image is built stops the stack and refuses `GPU_IMAGE_MISSING`; a successful **Build GPU image** then starts it. GPU→CPU needs the official full image (`IMAGE_MISSING` → Pull).
+- Only the embedding model and the reranker move to the GPU; the API's other work and Postgres stay on the CPU.
+
 A stopped or crashed plugin backend cannot log anything: the hooks give up at their deadline and cc's plugin row is the only sign.
 
 ## Images & data
@@ -172,16 +182,17 @@ Nothing is pulled, built, loaded or removed on its own: each is a button, one at
 | Action | Needs | Does |
 |---|---|---|
 | Pull full image / Pull slim image | network | pulls the pinned official API image |
-| Build CP image | network (once) | builds the control-plane image from the pinned upstream commit with this plugin's base path, inside the docker CLI helper image (pulled by tag when missing) |
+| Build CP image | network (once) | builds the control-plane image from upstream's source at the pinned release tag (`UPSTREAM_TAG`) with this plugin's base path, inside the docker CLI helper image (pulled by tag when missing) |
+| Build GPU image | the full image; network (once); several GB of disk | builds the GPU image (Compute: GPU) from the plugin's recipe `src/gpu/Dockerfile` (upstream's CUDA recipe at the pinned release tag, with throttled downloads): the full image with its CPU PyTorch replaced by the CUDA build of the same version, in the docker CLI helper image. Downloads about 3 GB; ten minutes or more on a slow link. Refused `IMAGE_MISSING` without the full image (never pulls it). Not part of offline bundles: build it on the host that runs it |
 | Upload and import | — | streams a bundle file from the browser into `docker load`; lists each loaded image's ID and whether it will run (pinned tag / wrong build / unused), and next to them the IDs the bundle's manifest lists (a bundle this plugin exported) |
 | Import from a path | — | the same for a `.tar` on cc's machine (absolute path) |
 | Export | the images present | writes `code-hindsight-<version>-<variant>.tar` (the variant's API image + the CP image, plus a `code-hindsight-bundle.json` listing their IDs) to the plugin data dir and offers it for download; shows size, sha256 and the image IDs |
-| Remove images | Hindsight stopped; confirm | removes the pinned API images and the CP image (and this plugin's stopped containers) |
+| Remove images | Hindsight stopped; confirm | removes the pinned API images, the GPU image and the CP image (and this plugin's stopped containers) |
 | Delete data volume | Hindsight stopped; type the volume name | deletes every memory |
 
 **Offline workflow:** on a machine with network access run Pull + Build CP image, then Export; carry the `.tar`; on the offline machine Import it, then Start.
 
-Only Pull, Build CP image, and Import can start Hindsight afterwards (when it was asked to run and is waiting on an image); Export, Remove images and Delete data volume never do.
+Only Pull, Build CP image, Build GPU image and Import can start Hindsight afterwards (when it was asked to run and is waiting on an image); Export, Remove images and Delete data volume never do.
 
 ## Errors
 
@@ -190,9 +201,10 @@ Every error is a code from `CATALOG` (`src/errors.js`); the Status card shows it
 | Code | Action button |
 |---|---|
 | `DOCKER_NOT_FOUND`, `NAME_TAKEN`, `BUSY`, `JOB_NOT_CANCELLABLE` | — |
-| `DOCKER_DENIED`, `PORT_IN_USE`, `EMBEDDINGS_CHANGED`, `SETTINGS_INVALID`, `SLIM_NEEDS_REMOTE_EMBEDDINGS`, `SLIM_NEEDS_RERANKER`, `EMBEDDINGS_NEEDS_KEY`, `CC_UNREACHABLE`, `CC_ROUTE_CHANGED`, `CC_BACKEND_MISSING`, `CC_BACKEND_UNSUPPORTED`, `CC_BACKEND_LOOPBACK` (loopback over `https`) | Open Settings |
+| `DOCKER_DENIED`, `PORT_IN_USE`, `EMBEDDINGS_CHANGED`, `SETTINGS_INVALID`, `SLIM_NEEDS_REMOTE_EMBEDDINGS`, `SLIM_NEEDS_RERANKER`, `EMBEDDINGS_NEEDS_KEY`, `GPU_NEEDS_FULL`, `GPU_NEEDS_LOCAL_MODEL`, `GPU_UNAVAILABLE`, `GPU_NOT_USED`, `CC_UNREACHABLE`, `CC_ROUTE_CHANGED`, `CC_BACKEND_MISSING`, `CC_BACKEND_UNSUPPORTED`, `CC_BACKEND_LOOPBACK` (loopback over `https`) | Open Settings |
 | `IMAGE_MISSING` | Pull image |
 | `CP_IMAGE_MISSING`, `CP_IMAGE_MISMATCH` | Build CP image |
+| `GPU_IMAGE_MISSING`, `GPU_IMAGE_MISMATCH` | Build GPU image |
 | `DOCKER_DAEMON_DOWN`, `DOCKER_FAILED` | Start Hindsight |
 | `UNHEALTHY`, `CRASHED`, `CP_LOGIN_FAILED`, `RELAY_DISCONNECTED` | Restart Hindsight |
 | `OLLAMA_UNREACHABLE` | — (a Status warning: start `ollama serve` in cc's container) |

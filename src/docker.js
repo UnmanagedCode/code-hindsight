@@ -19,6 +19,8 @@ const TAIL_BYTES = 8 * 1024;
 /** Map docker's stderr to a catalog code. */
 export function classifyDockerError(stderr) {
   const t = String(stderr ?? '');
+  // The daemon cannot attach a GPU: no NVIDIA Container Toolkit, no nvidia runtime, or a failing CDI/hook injection.
+  if (/could not select device driver .*capabilities: \[\[gpu\]\]|unknown or invalid runtime name: nvidia|nvidia-container-cli|(unresolvable|failed to inject) CDI devices/i.test(t)) return 'GPU_UNAVAILABLE';
   if (/permission denied/i.test(t) && /docker/i.test(t)) return 'DOCKER_DENIED';
   if (/Cannot connect to the Docker daemon|Is the docker daemon running|error during connect/i.test(t)) return 'DOCKER_DAEMON_DOWN';
   if (/port is already allocated|address already in use/i.test(t)) return 'PORT_IN_USE';
@@ -68,19 +70,20 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
       }
       let out = '';
       let err = '';
-      let lineBuf = '';
+      // One partial-line buffer per stream, so a line never splices stdout into stderr.
+      const lineBuf = { out: '', err: '' };
       let settled = false;
       const timer = timeoutMs ? setTimeout(() => { err += `\n(timed out after ${timeoutMs} ms)`; child.kill('SIGTERM'); }, timeoutMs) : null;
-      const feedLines = (chunk) => {
+      const feedLines = (stream, chunk) => {
         if (!onLine) return;
-        lineBuf += chunk;
-        const parts = lineBuf.split(/\r?\n|\r/);
-        lineBuf = parts.pop();
+        lineBuf[stream] += chunk;
+        const parts = lineBuf[stream].split(/\r?\n|\r/);
+        lineBuf[stream] = parts.pop();
         for (const l of parts) if (l) onLine(l);
       };
       if (sink) child.stdout.pipe(sink);
-      else child.stdout.on('data', (c) => { const s = c.toString(); feedLines(s); if (out.length < MAX_CAPTURE) out += s; });
-      child.stderr.on('data', (c) => { const s = c.toString(); feedLines(s); err = tail(err + s, 64 * 1024); });
+      else child.stdout.on('data', (c) => { const s = c.toString(); feedLines('out', s); if (out.length < MAX_CAPTURE) out += s; });
+      child.stderr.on('data', (c) => { const s = c.toString(); feedLines('err', s); err = tail(err + s, 64 * 1024); });
       if (stdin) {
         child.stdin.on('error', () => {});
         stdin.on('error', (e) => { err += `\n(input failed: ${e.message})`; child.kill('SIGTERM'); });
@@ -90,7 +93,7 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
         if (settled) return;
         settled = true;
         if (timer) clearTimeout(timer);
-        if (lineBuf && onLine) onLine(lineBuf);
+        if (onLine) for (const rest of [lineBuf.out, lineBuf.err]) if (rest) onLine(rest);
         resolve(r);
       };
       child.on('error', (error) => finish({ code: -1, error, stdout: out, stderr: err }));
@@ -206,6 +209,13 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
       const r = await exec(['logs', '--tail', String(lines), assertOwnedName(name)], { check: false, timeoutMs: 20_000 });
       return tail(`${r.stdout}\n${r.stderr}`, 64 * 1024);
     },
+    /**
+     * Stream every log line a container wrote between two times (RFC 3339 or Unix seconds) to
+     * `onLine`, uncapped (`logs` keeps only a tail). Rejects with a catalog error when docker
+     * cannot read the logs (a logging driver without read support).
+     */
+    logLines: (name, { since, until }, onLine) =>
+      exec(['logs', '--since', String(since), '--until', String(until), assertOwnedName(name)], { onLine, timeoutMs: 60_000 }),
 
     /**
      * Stop containers in a process that outlives this one (own process group), so the
@@ -246,12 +256,14 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
     removeImages: (refs) => exec(['rmi', ...refs.map(assertPinnedImage)]),
     /**
      * Run the build helper with the host's Docker socket mounted. Only the pinned BUILD_HELPER
-     * tag gets the socket; any other image ref is refused.
+     * tag gets the socket; any other image ref is refused. `stdin` (a stream) is fed to the
+     * helper's command (`docker run -i`), which is how a Dockerfile reaches it: the helper runs
+     * on the Docker host, where this process's files are not.
      */
-    runHelper(name, ref, command, onLine) {
+    runHelper(name, ref, command, onLine, { stdin } = {}) {
       assertOwnedName(name);
       if (ref !== BUILD_HELPER) throw new Error(`refusing to give the Docker socket to image ${ref}: not the pinned build helper`);
-      return exec(['run', '--rm', '--name', name, '-v', `${HOST_DOCKER_SOCKET}:${HOST_DOCKER_SOCKET}`, ref, ...command], { onLine, timeoutMs: 2 * 60 * 60_000 });
+      return exec(['run', '--rm', ...(stdin ? ['-i'] : []), '--name', name, '-v', `${HOST_DOCKER_SOCKET}:${HOST_DOCKER_SOCKET}`, ref, ...command], { stdin, onLine, timeoutMs: 2 * 60 * 60_000 });
     },
   };
 }

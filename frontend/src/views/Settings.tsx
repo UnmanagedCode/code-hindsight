@@ -117,6 +117,16 @@ export function Settings({ onSaved, onApply, busy }: { onSaved: () => void; onAp
               {view.choices.variants.map((v) => <option key={v} value={v}>{v} — {view.images.api[v].ref}</option>)}
             </NativeSelect>
           </Field>
+          <Field
+            id="compute"
+            label="Compute"
+            error={err('compute')}
+            hint={`Where the local embedding and reranker models run. GPU needs an NVIDIA GPU, its driver and the NVIDIA Container Toolkit on the Docker host, the full image, and the GPU image (${view.images.gpu}), built once on Images & data. Applying recreates the API container; memories stay.`}
+          >
+            <NativeSelect id="compute" value={form.compute} onChange={(e) => set('compute', e.target.value as SettingsT['compute'])}>
+              {view.choices.computeModes.map((m) => <option key={m} value={m}>{m === 'gpu' ? 'GPU (NVIDIA)' : 'CPU'}</option>)}
+            </NativeSelect>
+          </Field>
           <label className="flex items-center gap-2 text-sm" data-field="docker.allowSudo">
             <input type="checkbox" checked={form.docker.allowSudo} onChange={(e) => set('docker', { allowSudo: e.target.checked })} />
             Use <code>sudo -n docker</code> when docker is refused (sudo docker is root on the host)

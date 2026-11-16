@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { API_IMAGES, BASE_PATH, BUILD_HELPER, CP_IMAGE, LABELS, UPSTREAM_REVISION } from '../src/pins.js';
+import { API_IMAGES, BASE_PATH, BUILD_HELPER, CP_IMAGE, GPU_TORCH_FLAVOR, LABELS, UPSTREAM_TAG } from '../src/pins.js';
+import { GPU_RECIPE_PATH } from '../src/gpuRecipe.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 export const FAKE_DOCKER = path.join(here, 'fakes', 'fake-docker.mjs');
@@ -45,10 +46,13 @@ export function fakeEnv(r, { mode = '', sudoMode = 'ok' } = {}) {
 export const API_ID = `sha256:${'a'.repeat(64)}`;
 export const goodApiImage = (variant = 'full') => ({
   Id: API_ID,
-  Config: { Labels: { 'org.opencontainers.image.version': variant === 'slim' ? '1.2.1-slim' : '1.2.1', 'org.opencontainers.image.revision': UPSTREAM_REVISION } },
+  Config: { Labels: { 'org.opencontainers.image.version': variant === 'slim' ? '1.2.1-slim' : '1.2.1' } },
 });
 export const CP_ID = `sha256:${'c'.repeat(64)}`;
-export const goodCpImage = (id = CP_ID) => ({ Id: id, Config: { Labels: { [LABELS.basePath]: BASE_PATH, [LABELS.upstream]: UPSTREAM_REVISION } } });
+export const goodCpImage = (id = CP_ID) => ({ Id: id, Config: { Labels: { [LABELS.basePath]: BASE_PATH, [LABELS.upstream]: UPSTREAM_TAG } } });
+export const GPU_ID = `sha256:${'d'.repeat(64)}`;
+/** The GPU image as build-gpu labels it (seed it under API_GPU_IMAGE). */
+export const goodGpuImage = (id = GPU_ID) => ({ Id: id, Config: { Labels: { [LABELS.upstream]: UPSTREAM_TAG, [LABELS.cuda]: GPU_TORCH_FLAVOR, [LABELS.recipe]: GPU_RECIPE_PATH } } });
 export const helperImage = () => ({ Id: `sha256:${'e'.repeat(64)}`, Config: { Labels: {} } });
 
 /** Seed the fake daemon: by default both API images and the CP image are present and pullable. */

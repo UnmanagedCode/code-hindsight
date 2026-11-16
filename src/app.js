@@ -1,7 +1,7 @@
 // Builds the backend's state and its one request handler: `/` and the UI's files are the
 // shell, `/-/api/*` the plugin's API, and every other path the Hindsight control plane.
 import path from 'node:path';
-import { API_IMAGES, BUILD_HELPER, CP_IMAGE, RESOURCE_PREFIX, VARIANTS } from './pins.js';
+import { API_GPU_IMAGE, API_IMAGES, BUILD_HELPER, CP_IMAGE, RESOURCE_PREFIX, VARIANTS } from './pins.js';
 import { createDocker } from './docker.js';
 import { createSettingsStore } from './settings.js';
 import { createSecretsStore } from './secrets.js';
@@ -53,7 +53,7 @@ export function createApp(config, overrides = {}) {
     env,
     allowSudo: () => settings.get().docker.allowSudo === true,
     prefix,
-    images: [...VARIANTS.map((v) => API_IMAGES[v].ref), CP_IMAGE, BUILD_HELPER],
+    images: [...VARIANTS.map((v) => API_IMAGES[v].ref), API_GPU_IMAGE, CP_IMAGE, BUILD_HELPER],
     runDir,
   });
   const ccModels = () => fetchCcModels(config.conductorUrl);

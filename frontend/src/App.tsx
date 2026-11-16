@@ -60,7 +60,7 @@ export function App() {
     setBusy(true);
     try {
       if (action === 'pull') await send('-/api/jobs/pull', 'POST', { variant: status?.variant ?? 'full' });
-      else if (action === 'build-cp') await send('-/api/jobs/build-cp', 'POST');
+      else if (action === 'build-cp' || action === 'build-gpu') await send(`-/api/jobs/${action}`, 'POST');
       else await send(`-/api/${action}`, 'POST');
     } catch {
       // The refusal shows up in status.

@@ -79,6 +79,11 @@ export function Status({ status, onAction, busy }: { status: StatusT; onAction: 
           <Row label="State"><span data-state={status.state}>{status.state}</span></Row>
           <Row label="Docker">{status.docker.mode ? `${status.docker.mode === 'sudo' ? 'sudo -n docker' : 'docker'} (daemon ${status.docker.serverVersion ?? '?'})` : 'not resolved'}</Row>
           <Row label="Image">{status.variant}</Row>
+          <Row label="Compute">
+            {status.compute.mode === 'gpu'
+              ? `GPU${status.compute.devices ? ` — ${Object.entries(status.compute.devices).filter(([, d]) => d).map(([m, d]) => `${m} ${d}`).join(', ')}` : ' (not checked yet)'}`
+              : 'CPU'}
+          </Row>
           <Row label="Published on">{status.bindAddress}{status.bindAuto ? ' (automatic)' : ''} — API {status.ports.api}, control plane {status.ports.cp}{status.relay ? `, relay ${status.ports.relay}` : ''}</Row>
           <Row label="LLM">{status.llmMode === 'none' ? 'none (memories are stored as chunks; reflect is unavailable)' : status.llmMode}</Row>
           {status.relay && (

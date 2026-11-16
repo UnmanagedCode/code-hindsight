@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import { boot, goodApiImage, goodCpImage, dockerCalls, fakeBundle, waitFor } from './helpers.mjs';
-import { API_IMAGES, CP_IMAGE } from '../src/pins.js';
+import { API_IMAGES, API_GPU_IMAGE, CP_IMAGE } from '../src/pins.js';
 import { bundleName } from '../src/jobs.js';
 
 const json = { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' };
@@ -119,6 +119,24 @@ test('saving slim with local embeddings is refused 400 with the named field code
   assert.deepEqual(body.params.fields.map((f) => f.code).sort(), ['SLIM_NEEDS_REMOTE_EMBEDDINGS', 'SLIM_NEEDS_RERANKER']);
   const ok = await put(`${url}/-/api/settings`, { settings: { ...view.settings, variant: 'slim', embeddings: { provider: 'openai', model: 'e', baseUrl: null }, reranker: { provider: 'rrf' } }, secrets: { embeddingsApiKey: 'ek' } });
   assert.equal(ok.status, 200);
+});
+
+// GPU1/GPU4: compute round-trips through the settings route; status carries the GPU image and the compute mode.
+test('GPU1: PUT settings round-trips compute and refuses gpu on slim; status carries images.gpu and compute', async (t) => {
+  const { url } = await boot(t, { seed: { images: {} } });
+  const view = await (await fetch(`${url}/-/api/settings`)).json();
+  assert.equal(view.settings.compute, 'cpu');
+  assert.deepEqual(view.choices.computeModes, ['cpu', 'gpu']);
+  const ok = await put(`${url}/-/api/settings`, { settings: { ...view.settings, compute: 'gpu' } });
+  assert.equal(ok.status, 200);
+  assert.equal((await (await fetch(`${url}/-/api/settings`)).json()).settings.compute, 'gpu');
+  const slim = await put(`${url}/-/api/settings`, { settings: { ...view.settings, compute: 'gpu', variant: 'slim', embeddings: { provider: 'openai', model: 'e', baseUrl: null }, reranker: { provider: 'rrf' } }, secrets: { embeddingsApiKey: 'ek' } });
+  assert.equal(slim.status, 400);
+  assert.deepEqual((await slim.json()).params.fields.map((f) => f.code), ['GPU_NEEDS_FULL']);
+  const st = await (await fetch(`${url}/-/api/status?refresh=1`)).json();
+  assert.deepEqual(st.compute, { mode: 'gpu', devices: null });
+  assert.equal(st.images.gpu.ref, API_GPU_IMAGE);
+  assert.equal(st.images.gpu.present, false);
 });
 
 // Cross-site writes are refused on every state-changing route.

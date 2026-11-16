@@ -6,9 +6,14 @@
 //   FAKE_DOCKER_STATE  state file: {images, containers, networks, volumes, registry}
 //   FAKE_DOCKER_LOG    JSONL call log: {args, viaSudo}
 //   FAKE_DOCKER_MODE   comma list: denied (refused unless via sudo), daemon-down, port-clash,
-//                      crash (a run/start container exits 1), fail-<subcommand>
+//                      crash (a run/start container exits 1), fail-<subcommand>,
+//                      no-gpu (a run/start with --gpus fails as a daemon without the NVIDIA toolkit does)
 //   FAKE_DOCKER_VIA_SUDO  set by fake-sudo
 //   state.hangRelayInspect  (in the state file) inspecting a container named *-relay never answers
+//   state.containers[name].Log  what `logs --since …` prints for it; a container run with --gpus
+//                      starts with the pinned upstream's start lines naming cuda (state.gpuDevice
+//                      overrides the device; state.gpuStartLines false logs none); a run or start
+//                      gives a new State.StartedAt
 import fs from 'node:fs';
 
 const args = process.argv.slice(2);
@@ -70,6 +75,11 @@ if (modes.has(`fail-${cmd}`)) fail(`Error response from daemon: injected failure
 const s = load();
 const crashState = { Status: 'exited', Running: false, Restarting: false, ExitCode: 1 };
 const runState = { Status: 'running', Running: true, Restarting: false, ExitCode: 0 };
+/** A new, increasing start time per run/start (deterministic: a counter in the state). */
+const nextStartedAt = () => { s.starts = (s.starts ?? 0) + 1; return new Date(Date.UTC(2026, 0, 1, 0, 0, s.starts)).toISOString(); };
+const startLines = (device) => `INFO Embeddings: local provider initialized (dim: 384, device: ${device})\nINFO Reranker: local provider initialized (device: ${device}, max_concurrent=4)`;
+const gpuLog = () => (s.gpuStartLines === false ? 'INFO Application startup complete.' : startLines(s.gpuDevice ?? 'cuda'));
+const NO_GPU = 'docker: Error response from daemon: could not select device driver "" with capabilities: [[gpu]]';
 
 switch (cmd) {
   case 'version': out(process.env.FAKE_DOCKER_SERVER_VERSION ?? '29.9.2'); break;
@@ -109,10 +119,12 @@ switch (cmd) {
   }
   case 'run': {
     if (rest.includes('--rm')) {
-      // The CP build helper.
+      // The build helper (its image follows the socket mount); with -i the Dockerfile arrives on
+      // stdin, kept as state.lastBuildStdin.
       if (rest.includes('buildx')) {
-        out('#1 [internal] load git source'); out('#2 DONE');
-        if (!findImage(s, rest[rest.indexOf('--rm') + 5])) fail('Unable to find image locally', 125);
+        out('#1 [internal] load build definition'); out('#2 DONE');
+        if (!findImage(s, rest[rest.indexOf('-v') + 2])) fail('Unable to find image locally', 125);
+        if (rest.includes('-i')) s.lastBuildStdin = readStdin().toString('utf8');
         const tag = rest[rest.indexOf('-t') + 1];
         s.images[tag] = s.registry[tag] ?? { Id: `sha256:${'b'.repeat(64)}`, Config: { Labels: labelsFrom(rest.slice(rest.indexOf('buildx'))) } };
         save(s);
@@ -122,7 +134,7 @@ switch (cmd) {
     const opt = (flag) => { const i = rest.indexOf(flag); return i === -1 ? null : rest[i + 1]; };
     const name = opt('--name');
     // The image is the first positional after the options (a command may follow it).
-    const valued = new Set(['--name', '--network', '--network-alias', '--restart', '-p', '-v', '--label', '--env-file', '--security-opt', '--cap-drop', '--entrypoint', '--shm-size']);
+    const valued = new Set(['--name', '--network', '--network-alias', '--restart', '-p', '-v', '--label', '--env-file', '--security-opt', '--cap-drop', '--entrypoint', '--shm-size', '--gpus']);
     let image;
     for (let i = 0; i < rest.length; i++) {
       if (!rest[i].startsWith('-')) { image = rest[i]; break; }
@@ -134,7 +146,14 @@ switch (cmd) {
     const Env = envFile ? fs.readFileSync(envFile, 'utf8').split('\n').filter(Boolean) : [];
     const ports = []; const mounts = [];
     for (let i = 0; i < rest.length; i++) { if (rest[i] === '-p') ports.push(rest[i + 1]); if (rest[i] === '-v') mounts.push(rest[i + 1].split(':')[0]); }
-    const c = { Id: `cid-${name}`, Name: `/${name}`, Image: findImage(s, image).Id, Config: { Image: image, Labels: labelsFrom(rest), Env }, Ports: ports, Mounts: mounts, Network: opt('--network'), RunArgs: rest, State: runState };
+    const gpus = rest.includes('--gpus');
+    const c = { Id: `cid-${name}`, Name: `/${name}`, Image: findImage(s, image).Id, Config: { Image: image, Labels: labelsFrom(rest), Env }, Ports: ports, Mounts: mounts, Network: opt('--network'), RunArgs: rest, State: { ...runState, StartedAt: nextStartedAt() }, Log: gpus ? gpuLog() : `log line for ${name}` };
+    if (gpus && modes.has('no-gpu')) {
+      // Like dockerd: the container is created, then its start fails.
+      c.State = { Status: 'created', Running: false, Restarting: false, ExitCode: 128 };
+      s.containers[name] = c; save(s);
+      fail(NO_GPU, 125);
+    }
     if (modes.has('port-clash')) {
       c.State = { Status: 'created', Running: false, Restarting: false, ExitCode: 128 };
       s.containers[name] = c; save(s);
@@ -148,7 +167,10 @@ switch (cmd) {
     const c = s.containers[rest[0]];
     if (!c) fail(`Error response from daemon: No such container: ${rest[0]}`);
     if (modes.has('port-clash')) fail('Error response from daemon: driver failed programming external connectivity: Bind for 127.0.0.1:18888 failed: port is already allocated');
-    c.State = modes.has('crash') ? crashState : runState; save(s); out(rest[0]);
+    if (modes.has('no-gpu') && c.RunArgs?.includes('--gpus')) fail(NO_GPU.replace('docker: ', ''));
+    c.State = modes.has('crash') ? crashState : { ...runState, StartedAt: nextStartedAt() };
+    if (c.RunArgs?.includes('--gpus')) c.Log = gpuLog();
+    save(s); out(rest[0]);
     break;
   }
   case 'stop': {
@@ -164,7 +186,12 @@ switch (cmd) {
     delete s.containers[n]; save(s); out(n);
     break;
   }
-  case 'logs': out(`log line for ${rest[rest.length - 1]}`); break;
+  case 'logs': {
+    const name = rest[rest.length - 1];
+    if (rest.includes('--since')) out(s.containers[name]?.Log ?? '');
+    else out(`log line for ${name}`);
+    break;
+  }
   case 'pull': {
     const img = s.registry[rest[0]];
     if (!img) fail(`Error response from daemon: pull access denied for ${rest[0]}`);

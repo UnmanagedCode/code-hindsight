@@ -4,12 +4,18 @@
 // any HTTP answer, so the backend answers at once and reports Hindsight here).
 //
 // States: stopped → checking → starting → ready, plus stopping and error{code}.
+//
+// GPU compute runs the API from the GPU image with the host's GPUs, and is ready only once the
+// API's own start lines say its local models loaded on cuda (gpuCheck.js); otherwise the API is
+// stopped, never left running on the CPU.
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { API_IMAGES, BASE_PATH, CP_IMAGE, LABELS, RELAY_TARGETS, UPSTREAM_REVISION } from './pins.js';
-import { isOurCpBuild } from './trust.js';
+import { API_GPU_IMAGE, API_IMAGES, BASE_PATH, CP_IMAGE, GPU_TORCH_FLAVOR, LABELS, RELAY_TARGETS, UPSTREAM_TAG } from './pins.js';
+import { isOurCpBuild, isOurGpuBuild } from './trust.js';
+import { deviceReader, judgeDevices, assertOnCuda } from './gpuCheck.js';
+import { GPU_RECIPE_PATH } from './gpuRecipe.js';
 import { AppError, describeError, toAppError } from './errors.js';
 import { validateSettings, embeddingsFingerprint, containerSettingsHash } from './settings.js';
 import { apiSpec, cpSpec, relaySpec, embeddingsEnv } from './containerSpec.js';
@@ -94,6 +100,8 @@ export function createSupervisor({
   /** Bumped to end the running watch loop; each loop runs only while its token is current. */
   let watchToken = 0;
   let watchFailures = 0;
+  /** GPU compute: the API start whose devices were checked ({startedAt, devices, settings: those the API was started with}), else null. */
+  let gpuChecked = null;
 
   const set = (s, e = null) => { state = s; error = e; };
   const serial = (fn) => { const p = queue.then(fn, fn); queue = p.catch(() => {}); return p; };
@@ -129,9 +137,12 @@ export function createSupervisor({
     const want = API_IMAGES[variant];
     const api = await docker.inspectImage(want.ref);
     const cp = await docker.inspectImage(CP_IMAGE);
+    const gpu = await docker.inspectImage(API_GPU_IMAGE);
     const apiLabels = api?.Config?.Labels ?? {};
     const cpLabels = cp?.Config?.Labels ?? {};
+    const gpuLabels = gpu?.Config?.Labels ?? {};
     const built = isOurCpBuild(cp);
+    const gpuBuilt = isOurGpuBuild(gpu);
     images = {
       api: {
         ref: want.ref, present: !!api, id: api?.Id ?? null,
@@ -144,8 +155,14 @@ export function createSupervisor({
         built,
         ok: built,
       },
+      gpu: {
+        ref: API_GPU_IMAGE, present: !!gpu, id: gpu?.Id ?? null,
+        recipe: gpuLabels[LABELS.recipe] ?? null, upstream: gpuLabels[LABELS.upstream] ?? null, cuda: gpuLabels[LABELS.cuda] ?? null,
+        built: gpuBuilt,
+        ok: gpuBuilt,
+      },
     };
-    return { api, cp, want };
+    return { api, cp, gpu, want };
   }
 
   async function inspectContainers() {
@@ -221,6 +238,49 @@ export function createSupervisor({
     }
   }
 
+  /** Stop the API container (kept, with the volume); a failure is logged, the caller's error stands. */
+  async function stopApiQuietly() {
+    try { await docker.stopContainers([names.api], T.stopSeconds); } catch (e) { log(`stopping the API after a failed GPU check: ${e?.message ?? e}`); }
+  }
+
+  /** The devices the API's current start logged ({startedAt, devices}), read from that start's log window. */
+  async function readDevices() {
+    const c = await docker.inspectContainer(names.api);
+    const startedAt = c?.State?.StartedAt ?? null;
+    const reader = deviceReader();
+    if (startedAt) {
+      const until = new Date(Date.parse(startedAt) + T.apiHealthMs).toISOString();
+      await docker.logLines(names.api, { since: startedAt, until }, reader.line);
+    }
+    return { startedAt, devices: reader.devices() };
+  }
+
+  /**
+   * GPU compute's check after the API answered: its local models must have loaded on cuda.
+   * An adopted container whose start lines are no longer in its log (a daemon `log-opts`
+   * max-size rotates them out) is recreated once, so the check reads a fresh start; a line
+   * naming another device is never retried. Any failure stops the API.
+   */
+  async function verifyGpu(settings, spec, imageId, outcome, gen) {
+    try {
+      let read = await readDevices();
+      const { missing, notCuda } = judgeDevices(read.devices, settings);
+      if (outcome === 'adopted' && missing.length && !notCuda.length) {
+        log(`GPU check: the adopted API's start lines (${missing.join(', ')}) are not in its log; recreating it`);
+        await docker.stopContainers([names.api], T.stopSeconds);
+        await docker.removeContainer(names.api);
+        await adoptOrCreate(spec, imageId, 'apiPort');
+        await waitHealthy(`http://${bind}:${ports.api}/health`, 'api', names.api, T.apiHealthMs, gen);
+        read = await readDevices();
+      }
+      assertOnCuda(read.devices, settings);
+      gpuChecked = { ...read, settings };
+    } catch (e) {
+      if (!(e instanceof Cancelled)) await stopApiQuietly();
+      throw e;
+    }
+  }
+
   async function bringUp(gen) {
     set('checking');
     await waitPendingStop();
@@ -231,10 +291,16 @@ export function createSupervisor({
     bind = settings.network.bindAddress ?? detectBind();
     ports = { api: settings.network.apiPort, cp: settings.network.cpPort, relay: settings.network.relayPort };
 
-    const { api, cp, want } = await inspectImages(settings.variant);
-    if (!api) throw new AppError('IMAGE_MISSING', { image: want.ref });
+    const { api, cp, gpu, want } = await inspectImages(settings.variant);
+    const onGpu = settings.compute === 'gpu';
+    // Both checks come before any container is touched.
+    if (onGpu) {
+      if (!gpu) throw new AppError('GPU_IMAGE_MISSING', { image: API_GPU_IMAGE });
+      if (!images.gpu.built) throw new AppError('GPU_IMAGE_MISMATCH', { image: API_GPU_IMAGE, found: `recipe ${images.gpu.recipe ?? '?'}, upstream ${images.gpu.upstream ?? '?'}, torch ${images.gpu.cuda ?? '?'}`, expected: `recipe ${GPU_RECIPE_PATH}, upstream ${UPSTREAM_TAG}, torch ${GPU_TORCH_FLAVOR}` });
+    } else if (!api) throw new AppError('IMAGE_MISSING', { image: want.ref });
+    const apiImage = onGpu ? gpu : api;
     if (!cp) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
-    if (!images.cp.built) throw new AppError('CP_IMAGE_MISMATCH', { image: CP_IMAGE, found: `${images.cp.basePath ?? '?'} @ ${images.cp.upstream ?? '?'}`, expected: `${BASE_PATH} @ ${UPSTREAM_REVISION}` });
+    if (!images.cp.built) throw new AppError('CP_IMAGE_MISMATCH', { image: CP_IMAGE, found: `${images.cp.basePath ?? '?'} @ ${images.cp.upstream ?? '?'}`, expected: `${BASE_PATH} @ ${UPSTREAM_TAG}` });
 
     const baseLabels = { [LABELS.managed]: '1', [LABELS.owner]: owner };
     await ensureOwned('network', names.network, docker.inspectNetwork, () => docker.createNetwork(names.network, baseLabels));
@@ -252,7 +318,7 @@ export function createSupervisor({
     checkCancelled(gen);
     if (relayTarget) {
       // The relay first: the API's LLM client resolves the target's alias on the private network.
-      await adoptOrCreate(relaySpec({ names, image: { id: api.Id }, bind, port: ports.relay, key: secrets.relayKey, owner, target: RELAY_TARGETS[relayTarget.kind] }), api.Id, 'relayPort');
+      await adoptOrCreate(relaySpec({ names, image: { id: apiImage.Id }, bind, port: ports.relay, key: secrets.relayKey, owner, target: RELAY_TARGETS[relayTarget.kind] }), apiImage.Id, 'relayPort');
       checkCancelled(gen);
       relay.start({ host: bind, port: ports.relay }, relayTarget);
       relayStarted = true;
@@ -262,14 +328,16 @@ export function createSupervisor({
       await removeOwnedRelay();
     }
     relayLinked = relayTarget !== null;
-    const apiS = apiSpec({ names, image: { id: api.Id }, variant: settings.variant, bind, port: ports.api, apiKey: secrets.apiKey, llmEnv, embeddingsEnv: embeddingsEnv(settings, secrets), owner });
-    await adoptOrCreate(apiS, api.Id, 'apiPort');
+    const apiS = apiSpec({ names, image: { id: apiImage.Id }, variant: settings.variant, compute: settings.compute, bind, port: ports.api, apiKey: secrets.apiKey, llmEnv, embeddingsEnv: embeddingsEnv(settings, secrets), owner });
+    const apiOutcome = await adoptOrCreate(apiS, apiImage.Id, 'apiPort');
     const cpS = cpSpec({ names, image: { id: cp.Id }, bind, port: ports.cp, apiKey: secrets.apiKey, accessKey: secrets.cpAccessKey, owner });
     await adoptOrCreate(cpS, cp.Id, 'cpPort');
     await inspectContainers();
     checkCancelled(gen);
 
     await waitHealthy(`http://${bind}:${ports.api}/health`, 'api', names.api, T.apiHealthMs, gen);
+    if (onGpu) await verifyGpu(settings, apiS, apiImage.Id, apiOutcome, gen);
+    checkCancelled(gen);
     await waitHealthy(`http://${bind}:${ports.cp}${BASE_PATH}/api/health`, 'cp', names.cp, T.cpHealthMs, gen);
     cpSession.clear();
     await cpSession.token();
@@ -288,6 +356,7 @@ export function createSupervisor({
   async function runBringUp() {
     const gen = ++generation;
     relayStarted = false;
+    gpuChecked = null;
     stopWatch();
     try {
       await bringUp(gen);
@@ -332,6 +401,7 @@ export function createSupervisor({
     const gen = generation;
     if ((await probe(`http://${bind}:${ports.api}/health`)) === 200) {
       watchFailures = 0;
+      if (gpuChecked && !(await gpuStillUsed(gen))) return;
       const sideCrash = (await crashedOrNull('cp', names.cp)) ?? (relayLinked ? await crashedOrNull('relay', names.relay) : null);
       if (sideCrash && gen === generation) { stopWatch(); set('error', sideCrash.toJSON()); }
       return;
@@ -342,6 +412,37 @@ export function createSupervisor({
     if (++watchFailures >= T.watchFailures) {
       stopWatch();
       set('error', new AppError('UNHEALTHY', { role: 'api', url: `http://${bind}:${ports.api}/health`, tail: await containerTail(names.api) }).toJSON());
+    }
+  }
+
+  /**
+   * GPU compute's watch step: an API that Docker restarted (a new StartedAt) is checked again,
+   * since a lost GPU brings it back on the CPU. It is judged by the settings it was started with,
+   * not settings saved since (those apply only at the next start). False when it failed (the API
+   * is then stopped).
+   */
+  async function gpuStillUsed(gen) {
+    // A start or stop may clear or replace the checked start while this step awaits.
+    const checked = gpuChecked;
+    if (!checked) return true;
+    const stale = () => gen !== generation || gpuChecked !== checked;
+    const c = await docker.inspectContainer(names.api);
+    if (stale()) return true;
+    const startedAt = c?.State?.StartedAt ?? null;
+    if (!startedAt || startedAt === checked.startedAt) return true;
+    try {
+      const read = await readDevices();
+      assertOnCuda(read.devices, checked.settings);
+      if (!stale()) gpuChecked = { ...read, settings: checked.settings };
+      return true;
+    } catch (e) {
+      if (stale()) return false;
+      stopWatch();
+      gpuChecked = null;
+      await stopApiQuietly();
+      set('error', toAppError(e, 'DOCKER_FAILED', { command: 'logs' }).toJSON());
+      await inspectContainers();
+      return false;
     }
   }
 
@@ -386,6 +487,7 @@ export function createSupervisor({
     stop() {
       wantRunning = false;
       generation++;
+      gpuChecked = null;
       stopWatch();
       relay.stop();
       relayLinked = false;
@@ -485,6 +587,8 @@ export function createSupervisor({
         volume: names.volume,
         lastShutdownFailure,
         llmMode: settings.llm.mode,
+        /** `devices`: what the running API's local models loaded on, once a GPU start was checked. */
+        compute: { mode: settings.compute, devices: gpuChecked?.devices ?? null },
         relay: relayLinked ? relay.status() : null,
       };
     },
