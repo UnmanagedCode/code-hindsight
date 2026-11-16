@@ -119,10 +119,12 @@ switch (cmd) {
   }
   case 'run': {
     if (rest.includes('--rm')) {
-      // The CP build helper.
+      // The build helper (its image follows the socket mount); with -i the Dockerfile arrives on
+      // stdin, kept as state.lastBuildStdin.
       if (rest.includes('buildx')) {
-        out('#1 [internal] load git source'); out('#2 DONE');
-        if (!findImage(s, rest[rest.indexOf('--rm') + 5])) fail('Unable to find image locally', 125);
+        out('#1 [internal] load build definition'); out('#2 DONE');
+        if (!findImage(s, rest[rest.indexOf('-v') + 2])) fail('Unable to find image locally', 125);
+        if (rest.includes('-i')) s.lastBuildStdin = readStdin().toString('utf8');
         const tag = rest[rest.indexOf('-t') + 1];
         s.images[tag] = s.registry[tag] ?? { Id: `sha256:${'b'.repeat(64)}`, Config: { Labels: labelsFrom(rest.slice(rest.indexOf('buildx'))) } };
         save(s);

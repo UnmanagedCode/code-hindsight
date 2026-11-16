@@ -1,7 +1,7 @@
 // Gated GPU compute against the real Docker daemon and GPU.
 //
 // GPU2-real (RUN_REAL_DOCKER=1 RUN_REAL_GPU_BUILD=1, needs network): the build-gpu job builds the
-// GPU image in the build helper from upstream's recipe, labelled, with torch reporting CUDA.
+// GPU image in the build helper from src/gpu/Dockerfile, labelled, with torch reporting CUDA.
 // GPU11 (RUN_REAL_DOCKER=1; skipped unless the GPU image is present and the daemon can attach a
 // GPU): a GPU stack is ready with both models on cuda, retains and recalls; a CPU restart on the
 // same volume still recalls the memory, and so does GPU again; a second backend adopts the GPU API
@@ -12,8 +12,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import { bootRealStack, hindsightApi, hostDocker, realSkipReason, REAL } from './support/realStack.mjs';
-import { API_GPU_IMAGE, API_IMAGES, GPU_TORCH_FLAVOR, LABELS, UPSTREAM_REVISION } from '../src/pins.js';
+import { API_GPU_IMAGE, API_IMAGES, GPU_TORCH_FLAVOR, LABELS, UPSTREAM_TAG } from '../src/pins.js';
 import { RECALL_BUDGET, RECALL_MAX_TOKENS } from '../src/hindsightClient.js';
+import { GPU_RECIPE_PATH } from '../src/gpuRecipe.js';
 import { waitFor } from './helpers.mjs';
 
 const tmpName = (what) => `code-hindsight-test-${what}-${crypto.randomBytes(3).toString('hex')}`;
@@ -43,8 +44,9 @@ test('GPU2-real: build-gpu builds a labelled GPU image whose torch reports CUDA'
   assert.equal(end.state, 'done', `${JSON.stringify(end.error)}\n${end.tail}`);
   assert.equal(end.result.image, API_GPU_IMAGE);
   const img = JSON.parse(hostDocker(['image', 'inspect', API_GPU_IMAGE]).stdout)[0];
-  assert.equal(img.Config.Labels[LABELS.upstream], UPSTREAM_REVISION);
+  assert.equal(img.Config.Labels[LABELS.upstream], UPSTREAM_TAG);
   assert.equal(img.Config.Labels[LABELS.cuda], GPU_TORCH_FLAVOR);
+  assert.equal(img.Config.Labels[LABELS.recipe], GPU_RECIPE_PATH);
   const torch = hostDocker(['run', '--rm', '--name', tmpName('torch'), '--network', 'none', '--entrypoint', '/app/api/.venv/bin/python', API_GPU_IMAGE, '-c', 'import torch; print(torch.__version__, torch.version.cuda)']);
   assert.equal(torch.status, 0, torch.stderr);
   assert.match(torch.stdout, /\+cu129 12\.9/);

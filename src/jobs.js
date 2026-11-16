@@ -5,15 +5,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { Transform } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import {
-  API_GPU_IMAGE, API_IMAGES, BASE_PATH, BUILD_HELPER, CP_DOCKERFILE, CP_IMAGE, CP_TARGET, GPU_DOCKERFILE,
-  GPU_TORCH_FLAVOR, GPU_TORCH_INDEX, HINDSIGHT_VERSION, LABELS, UPSTREAM_REPO, UPSTREAM_REVISION, VARIANTS,
+  API_GPU_IMAGE, API_IMAGES, BASE_PATH, BUILD_HELPER, CP_DOCKERFILE, CP_IMAGE, CP_TARGET,
+  GPU_TORCH_FLAVOR, GPU_TORCH_INDEX, HINDSIGHT_VERSION, LABELS, UPSTREAM_REPO, UPSTREAM_TAG, VARIANTS,
 } from './pins.js';
 import { AppError, toAppError } from './errors.js';
 import { ensurePrivateDir } from './fsPrivate.js';
 import { isOurCpBuild, isOurGpuBuild } from './trust.js';
+import { GPU_RECIPE, GPU_RECIPE_PATH } from './gpuRecipe.js';
 import { createTarAppender, createTarScanner } from './tarStream.js';
 
 /** The Docker actions: they resolve docker first and re-read Hindsight's state after. */
@@ -25,38 +26,38 @@ export const BUNDLE_MANIFEST = 'code-hindsight-bundle.json';
 const TAIL_LINES = 200;
 const KEEP_JOBS = 20;
 
-/** The command the build helper runs: buildx over the upstream source at the pinned commit. */
+/** The command the build helper runs: buildx over the upstream source at the pinned release tag. */
 export function buildCpCommand() {
   return [
     'docker', 'buildx', 'build', '--progress', 'plain',
-    `${UPSTREAM_REPO}#${UPSTREAM_REVISION}`,
+    `${UPSTREAM_REPO}#${UPSTREAM_TAG}`,
     '-f', CP_DOCKERFILE,
     '--target', CP_TARGET,
     '--build-arg', `NEXT_PUBLIC_BASE_PATH=${BASE_PATH}`,
     '--label', `${LABELS.basePath}=${BASE_PATH}`,
-    '--label', `${LABELS.upstream}=${UPSTREAM_REVISION}`,
+    '--label', `${LABELS.upstream}=${UPSTREAM_TAG}`,
     '-t', CP_IMAGE,
     '--load',
   ];
 }
 
 /**
- * The command the build helper runs for the GPU image: upstream's CUDA recipe at the pinned
- * commit, FROM the full image of the pinned version, with the CUDA torch flavour pinned here.
- * The recipe's own last step fails the build unless torch reports CUDA.
+ * The command the build helper runs for the GPU image: buildx with `GPU_RECIPE` on its stdin and
+ * no build context (`-`), FROM the full image of the pinned version, with the CUDA torch flavour
+ * pinned here. The recipe's last step fails the build unless torch reports CUDA.
  */
 export function buildGpuCommand() {
   return [
     'docker', 'buildx', 'build', '--progress', 'plain',
-    `${UPSTREAM_REPO}#${UPSTREAM_REVISION}`,
-    '-f', GPU_DOCKERFILE,
     '--build-arg', `HINDSIGHT_VERSION=${HINDSIGHT_VERSION}`,
     '--build-arg', `PYTORCH_CUDA_FLAVOR=${GPU_TORCH_FLAVOR}`,
     '--build-arg', `PYTORCH_CUDA_INDEX=${GPU_TORCH_INDEX}`,
-    '--label', `${LABELS.upstream}=${UPSTREAM_REVISION}`,
+    '--label', `${LABELS.upstream}=${UPSTREAM_TAG}`,
     '--label', `${LABELS.cuda}=${GPU_TORCH_FLAVOR}`,
+    '--label', `${LABELS.recipe}=${GPU_RECIPE_PATH}`,
     '-t', API_GPU_IMAGE,
     '--load',
+    '-',
   ];
 }
 
@@ -165,7 +166,7 @@ export function createJobs({ docker, supervisor, names, owner, dataDir, kinds = 
       const full = API_IMAGES.full.ref;
       if (!(await docker.inspectImage(full))) throw new AppError('IMAGE_MISSING', { image: full });
       await ensureBuildHelper(line);
-      await docker.runHelper(names.build, BUILD_HELPER, buildGpuCommand(), line);
+      await docker.runHelper(names.build, BUILD_HELPER, buildGpuCommand(), line, { stdin: Readable.from([GPU_RECIPE]) });
       const built = await docker.inspectImage(API_GPU_IMAGE);
       if (!isOurGpuBuild(built)) throw new AppError('GPU_IMAGE_MISSING', { image: API_GPU_IMAGE });
       return { image: API_GPU_IMAGE, id: built.Id };

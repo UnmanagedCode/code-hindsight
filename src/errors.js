@@ -51,7 +51,7 @@ export const CATALOG = Object.freeze({
   },
   CP_IMAGE_MISMATCH: {
     title: 'The control-plane image was built for something else',
-    message: (p) => `${s(p.image)} carries ${s(p.found)}; this plugin needs ${s(p.expected)}. Build it again.`,
+    message: (p) => `${s(p.image)} carries ${s(p.found)}; this plugin needs ${s(p.expected)}. Build it again once (Images & data → Build CP image; needs network).`,
     action: ACTIONS.build, status: 409,
   },
   GPU_IMAGE_MISSING: {

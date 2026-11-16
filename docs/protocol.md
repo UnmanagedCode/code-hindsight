@@ -63,8 +63,8 @@ State-changing requests (`POST`, `PUT`) are refused `403 CROSS_SITE` unless `Sec
 | `backfill-import` | `{scanId, sessions: [key], confirm: true}` (body up to `BACKFILL_LIMITS.selectionMaxBytes`) | `{sessions, documents: {sent, replaced, alreadyImported, queued, retried, deleted}, failed: [{key, code, message}], skipped: [{key, code, message}], banks}`. Refused `CONFIRMATION_REQUIRED` (`params.expected: "confirm: true"`), `BACKFILL_STALE` (not the latest scan, or the saved scopes changed since), `BACKFILL_UNCHECKED` (the scan ran with `hindsightChecked: false`), `BAD_REQUEST` (an empty list, or a key that is not a `ready` row of that scan), `HINDSIGHT_NOT_READY` |
 
 - `remove-images` and `delete-volume` refuse `CONFIRMATION_REQUIRED` without their confirmation and fail `CONTAINERS_RUNNING` while a container of this plugin runs.
-- `build-cp` inspects `BUILD_HELPER` (a tag), pulls it when missing, then runs `docker run --rm --name <prefix>-build -v /var/run/docker.sock:/var/run/docker.sock <BUILD_HELPER> docker buildx build <repo>#<UPSTREAM_REVISION> …` (`buildCpCommand` in `src/jobs.js`).
-- `build-gpu` ensures `BUILD_HELPER` the same way, then runs in it `docker buildx build <repo>#<UPSTREAM_REVISION> -f GPU_DOCKERFILE --build-arg HINDSIGHT_VERSION=… --build-arg PYTORCH_CUDA_FLAVOR=GPU_TORCH_FLAVOR --build-arg PYTORCH_CUDA_INDEX=GPU_TORCH_INDEX --label io.code-hindsight.upstream=… --label io.code-hindsight.cuda=… -t API_GPU_IMAGE --load` (`buildGpuCommand` in `src/jobs.js`). `remove-images` also removes `API_GPU_IMAGE` when present.
+- `build-cp` inspects `BUILD_HELPER` (a tag), pulls it when missing, then runs `docker run --rm --name <prefix>-build -v /var/run/docker.sock:/var/run/docker.sock <BUILD_HELPER> docker buildx build <repo>#<UPSTREAM_TAG> …` (`buildCpCommand` in `src/jobs.js`).
+- `build-gpu` ensures `BUILD_HELPER` the same way, then runs `docker run --rm -i --name <prefix>-build -v /var/run/docker.sock:/var/run/docker.sock <BUILD_HELPER> docker buildx build --build-arg HINDSIGHT_VERSION=… --build-arg PYTORCH_CUDA_FLAVOR=GPU_TORCH_FLAVOR --build-arg PYTORCH_CUDA_INDEX=GPU_TORCH_INDEX --label io.code-hindsight.upstream=… --label io.code-hindsight.cuda=… --label io.code-hindsight.recipe=GPU_RECIPE_PATH -t API_GPU_IMAGE --load -` with `src/gpu/Dockerfile` on stdin (no build context) (`buildGpuCommand` in `src/jobs.js`). `remove-images` also removes `API_GPU_IMAGE` when present.
 - After a successful `pull`, `build-cp`, `build-gpu` or `import`, Hindsight starts if it was asked to run and is in `error`; the other Docker jobs only re-read images and containers. The backfill jobs never resolve docker and never touch Hindsight's lifecycle.
 - One job runs at a time across all kinds. `backfill-scan` and `backfill-import` are cancellable: they stop at their next file, document or request.
 
@@ -112,8 +112,8 @@ Import, per session in scan order, acting only on the confirmed plan: `lstat` mu
 | Image | Runs when |
 |---|---|
 | API (`API_IMAGES[variant]`) | the pinned tag is present (else `IMAGE_MISSING`) |
-| CP (`CP_IMAGE`) | present (else `CP_IMAGE_MISSING`) with the base-path and upstream-revision labels (else `CP_IMAGE_MISMATCH`; `isOurCpBuild`) |
-| GPU (`API_GPU_IMAGE`), Compute `gpu` only (it replaces the API image) | present (else `GPU_IMAGE_MISSING`) with the upstream-revision and `io.code-hindsight.cuda` = `GPU_TORCH_FLAVOR` labels (else `GPU_IMAGE_MISMATCH`; `isOurGpuBuild`). The official API image is not needed then |
+| CP (`CP_IMAGE`) | present (else `CP_IMAGE_MISSING`) with the base-path and upstream-tag labels (else `CP_IMAGE_MISMATCH`; `isOurCpBuild`). An image labelled with anything else, such as a commit hash, is a mismatch: **Build CP image** once rebuilds it under the current labels |
+| GPU (`API_GPU_IMAGE`), Compute `gpu` only (it replaces the API image) | present (else `GPU_IMAGE_MISSING`) with the `io.code-hindsight.recipe` = `GPU_RECIPE_PATH`, upstream-tag (`UPSTREAM_TAG`) and `io.code-hindsight.cuda` = `GPU_TORCH_FLAVOR` labels (else `GPU_IMAGE_MISMATCH`; `isOurGpuBuild`). The official API image is not needed then |
 | Build helper (`BUILD_HELPER`) | the pinned tag, pulled when missing; `runHelper` refuses any other ref |
 
 - Containers run by the image ID the tag resolved to at start; a different ID recreates them.
@@ -186,8 +186,8 @@ Labels (`LABELS` in `src/pins.js`):
 | `io.code-hindsight.role` | containers | `api` / `cp` / `relay` |
 | `io.code-hindsight.spec` | containers | hash of image ID, run arguments and env; a mismatch recreates the container |
 | `io.code-hindsight.embeddings` | volume | `local` or `<provider>:<model>`; a mismatch with the settings is `EMBEDDINGS_CHANGED` |
-| `io.code-hindsight.basePath`, `io.code-hindsight.upstream` | CP image | the base path and upstream commit it was built with; checked before start (`CP_IMAGE_MISMATCH`) |
-| `io.code-hindsight.upstream`, `io.code-hindsight.cuda` | GPU image | the upstream commit and the CUDA torch flavour it was built with; checked before a GPU start (`GPU_IMAGE_MISMATCH`) |
+| `io.code-hindsight.basePath`, `io.code-hindsight.upstream` | CP image | the base path and upstream release tag (`UPSTREAM_TAG`) it was built with; checked before start (`CP_IMAGE_MISMATCH`) |
+| `io.code-hindsight.recipe`, `io.code-hindsight.upstream`, `io.code-hindsight.cuda` | GPU image | the recipe it was built from (`GPU_RECIPE_PATH` in `src/gpuRecipe.js`), the upstream release tag that recipe derives from, and the CUDA torch flavour; checked before a GPU start (`GPU_IMAGE_MISMATCH`). An edit to the recipe at the same version is not detected: run **Build GPU image** after one |
 
 ### Container environment (`apiSpec` / `cpSpec` in `src/containerSpec.js`)
 

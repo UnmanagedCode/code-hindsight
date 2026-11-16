@@ -256,12 +256,14 @@ export function createDocker({ env = process.env, allowSudo, prefix, images, run
     removeImages: (refs) => exec(['rmi', ...refs.map(assertPinnedImage)]),
     /**
      * Run the build helper with the host's Docker socket mounted. Only the pinned BUILD_HELPER
-     * tag gets the socket; any other image ref is refused.
+     * tag gets the socket; any other image ref is refused. `stdin` (a stream) is fed to the
+     * helper's command (`docker run -i`), which is how a Dockerfile reaches it: the helper runs
+     * on the Docker host, where this process's files are not.
      */
-    runHelper(name, ref, command, onLine) {
+    runHelper(name, ref, command, onLine, { stdin } = {}) {
       assertOwnedName(name);
       if (ref !== BUILD_HELPER) throw new Error(`refusing to give the Docker socket to image ${ref}: not the pinned build helper`);
-      return exec(['run', '--rm', '--name', name, '-v', `${HOST_DOCKER_SOCKET}:${HOST_DOCKER_SOCKET}`, ref, ...command], { onLine, timeoutMs: 2 * 60 * 60_000 });
+      return exec(['run', '--rm', ...(stdin ? ['-i'] : []), '--name', name, '-v', `${HOST_DOCKER_SOCKET}:${HOST_DOCKER_SOCKET}`, ref, ...command], { stdin, onLine, timeoutMs: 2 * 60 * 60_000 });
     },
   };
 }

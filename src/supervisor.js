@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { API_GPU_IMAGE, API_IMAGES, BASE_PATH, CP_IMAGE, GPU_TORCH_FLAVOR, LABELS, RELAY_TARGETS, UPSTREAM_REVISION } from './pins.js';
+import { API_GPU_IMAGE, API_IMAGES, BASE_PATH, CP_IMAGE, GPU_TORCH_FLAVOR, LABELS, RELAY_TARGETS, UPSTREAM_TAG } from './pins.js';
 import { isOurCpBuild, isOurGpuBuild } from './trust.js';
 import { deviceReader, judgeDevices, assertOnCuda } from './gpuCheck.js';
 import { AppError, describeError, toAppError } from './errors.js';
@@ -295,11 +295,11 @@ export function createSupervisor({
     // Both checks come before any container is touched.
     if (onGpu) {
       if (!gpu) throw new AppError('GPU_IMAGE_MISSING', { image: API_GPU_IMAGE });
-      if (!images.gpu.built) throw new AppError('GPU_IMAGE_MISMATCH', { image: API_GPU_IMAGE, found: `upstream ${images.gpu.upstream ?? '?'}, torch ${images.gpu.cuda ?? '?'}`, expected: `upstream ${UPSTREAM_REVISION}, torch ${GPU_TORCH_FLAVOR}` });
+      if (!images.gpu.built) throw new AppError('GPU_IMAGE_MISMATCH', { image: API_GPU_IMAGE, found: `upstream ${images.gpu.upstream ?? '?'}, torch ${images.gpu.cuda ?? '?'}`, expected: `upstream ${UPSTREAM_TAG}, torch ${GPU_TORCH_FLAVOR}` });
     } else if (!api) throw new AppError('IMAGE_MISSING', { image: want.ref });
     const apiImage = onGpu ? gpu : api;
     if (!cp) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
-    if (!images.cp.built) throw new AppError('CP_IMAGE_MISMATCH', { image: CP_IMAGE, found: `${images.cp.basePath ?? '?'} @ ${images.cp.upstream ?? '?'}`, expected: `${BASE_PATH} @ ${UPSTREAM_REVISION}` });
+    if (!images.cp.built) throw new AppError('CP_IMAGE_MISMATCH', { image: CP_IMAGE, found: `${images.cp.basePath ?? '?'} @ ${images.cp.upstream ?? '?'}`, expected: `${BASE_PATH} @ ${UPSTREAM_TAG}` });
 
     const baseLabels = { [LABELS.managed]: '1', [LABELS.owner]: owner };
     await ensureOwned('network', names.network, docker.inspectNetwork, () => docker.createNetwork(names.network, baseLabels));

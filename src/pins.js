@@ -1,16 +1,19 @@
 // The one place the Hindsight release, its images and the plugin's mount point are pinned.
-// Bumping Hindsight: change the version, tags and revision here, rebuild the CP image
-// (Images & data → Build CP image), and pull or import the matching API images. Re-read the
-// GPU recipe (`GPU_DOCKERFILE`) and the models' `device:` start lines (`src/gpuCheck.js`) at the
-// new tag, check a CUDA torch wheel of the new base torch version exists under `GPU_TORCH_INDEX`,
-// and rebuild the GPU image.
+// Bumping Hindsight: change the version and tags here, rebuild the CP image
+// (Images & data → Build CP image), and pull or import the matching API images. For the GPU
+// image: re-diff src/gpu/Dockerfile against upstream's docker/docker-compose/cuda/Dockerfile at
+// the new tag (UPSTREAM_TAG), re-read the models' `device:` start lines (`src/gpuCheck.js`), check a CUDA torch
+// wheel of the new base torch version exists under `GPU_TORCH_INDEX`, and rebuild the GPU image.
 //
 // Images are pinned by tag, never by digest: the tag is the pin.
 
 export const HINDSIGHT_VERSION = '1.2.1';
 export const UPSTREAM_REPO = 'https://github.com/vectorize-io/hindsight.git';
-/** The commit upstream's release tag (v1.2.1) points at; the CP is built from it, and the official images carry it as `org.opencontainers.image.revision`. */
-export const UPSTREAM_REVISION = '0eb02d8c418eac6b489bc63883c993b2257dfac4';
+/**
+ * Upstream's git release tag for HINDSIGHT_VERSION: the CP is built from the source at it, the GPU
+ * recipe derives from it, and both images are labelled with it. A tag, never a commit hash.
+ */
+export const UPSTREAM_TAG = `v${HINDSIGHT_VERSION}`;
 
 /** The official API images per variant: the tag pulled and run. */
 export const API_IMAGES = Object.freeze({
@@ -33,9 +36,8 @@ export const CP_TARGET = 'cp-only';
  */
 export const BUILD_HELPER = 'docker:29.9.2-cli';
 
-/** The CUDA build of the full API image (GPU compute): built locally from upstream's recipe. */
+/** The CUDA build of the full API image (GPU compute): built locally from src/gpu/Dockerfile. */
 export const API_GPU_IMAGE = 'code-hindsight-api:1.2.1-cuda';
-export const GPU_DOCKERFILE = 'docker/docker-compose/cuda/Dockerfile';
 /**
  * The PyTorch CUDA wheel flavour the GPU image installs (the recipe swaps the base image's CPU
  * torch for `torch==<same version>+<flavour>`). Not upstream's cu126: it has no Blackwell (sm_120)
@@ -58,6 +60,7 @@ export const LABELS = Object.freeze({
   basePath: 'io.code-hindsight.basePath',
   upstream: 'io.code-hindsight.upstream',
   cuda: 'io.code-hindsight.cuda',
+  recipe: 'io.code-hindsight.recipe',
 });
 
 /** Ports the upstream images listen on inside their containers. */

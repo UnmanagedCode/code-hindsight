@@ -10,7 +10,7 @@ import { createSettingsStore, DEFAULT_SETTINGS } from '../src/settings.js';
 import { createSecretsStore } from '../src/secrets.js';
 import { createSupervisor } from '../src/supervisor.js';
 import { resourceNames, ownerId } from '../src/containerSpec.js';
-import { API_IMAGES, API_GPU_IMAGE, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, UPSTREAM_REVISION } from '../src/pins.js';
+import { API_IMAGES, API_GPU_IMAGE, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, UPSTREAM_TAG } from '../src/pins.js';
 import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, setDockerState, fakeClock, waitFor, goodApiImage, goodCpImage, goodGpuImage, helperImage, CP_ID, API_ID, GPU_ID, FAKE_DOCKER } from './helpers.mjs';
 
 const PREFIX = 'code-hindsight';
@@ -166,7 +166,7 @@ test('missing or mismatched images are named and nothing is created', async (t) 
   assert.equal(errCode(noCp.sup), 'CP_IMAGE_MISSING');
   assert.equal(noCp.sup.status().error.action, 'build-cp');
 
-  const otherBase = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage('full'), [CP_IMAGE]: { Id: CP_ID, Config: { Labels: { [LABELS.basePath]: '/hindsight', [LABELS.upstream]: UPSTREAM_REVISION } } } } } });
+  const otherBase = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage('full'), [CP_IMAGE]: { Id: CP_ID, Config: { Labels: { [LABELS.basePath]: '/hindsight', [LABELS.upstream]: UPSTREAM_TAG } } } } } });
   await otherBase.sup.ensureRunning();
   assert.equal(errCode(otherBase.sup), 'CP_IMAGE_MISMATCH');
 });
@@ -839,7 +839,7 @@ test('GPU4: GPU mode without the GPU image is GPU_IMAGE_MISSING (action build-gp
 });
 
 test('GPU4: a GPU image without this plugin\'s build labels is GPU_IMAGE_MISMATCH and touches no container', async (t) => {
-  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed({ [API_GPU_IMAGE]: { Id: GPU_ID, Config: { Labels: { [LABELS.upstream]: UPSTREAM_REVISION, [LABELS.cuda]: 'cu126' } } } }) });
+  const { r, sup } = make(t, { settings: { compute: 'gpu' }, seed: gpuSeed({ [API_GPU_IMAGE]: { ...goodGpuImage(), Config: { Labels: { ...goodGpuImage().Config.Labels, [LABELS.cuda]: 'cu126' } } } }) });
   await sup.ensureRunning();
   assert.equal(errCode(sup), 'GPU_IMAGE_MISMATCH');
   assert.equal(sup.status().error.action, 'build-gpu');

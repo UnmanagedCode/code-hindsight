@@ -9,9 +9,10 @@ import { Readable } from 'node:stream';
 import { createDocker } from '../src/docker.js';
 import { createJobs, buildCpCommand, buildGpuCommand, bundleName, BUNDLE_MANIFEST } from '../src/jobs.js';
 import { createTarScanner } from '../src/tarStream.js';
+import { GPU_RECIPE, GPU_RECIPE_PATH } from '../src/gpuRecipe.js';
 import { AppError } from '../src/errors.js';
 import { resourceNames, ownerId } from '../src/containerSpec.js';
-import { API_IMAGES, API_GPU_IMAGE, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, GPU_DOCKERFILE, GPU_TORCH_FLAVOR, GPU_TORCH_INDEX, HINDSIGHT_VERSION, UPSTREAM_REVISION } from '../src/pins.js';
+import { API_IMAGES, API_GPU_IMAGE, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, GPU_TORCH_FLAVOR, GPU_TORCH_INDEX, HINDSIGHT_VERSION, UPSTREAM_TAG } from '../src/pins.js';
 import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, goodApiImage, goodCpImage, goodGpuImage, helperImage, CP_ID, API_ID, GPU_ID, fakeBundle } from './helpers.mjs';
 
 const names = resourceNames('code-hindsight');
@@ -54,11 +55,11 @@ test('build-cp runs buildx at the pinned commit in the helper, by its pinned tag
   assert.deepEqual(run.slice(0, 7), ['run', '--rm', '--name', 'code-hindsight-build', '-v', '/var/run/docker.sock:/var/run/docker.sock', BUILD_HELPER]);
   assert.deepEqual(run.slice(7), buildCpCommand());
   const cmd = buildCpCommand();
-  assert.ok(cmd.includes(`https://github.com/vectorize-io/hindsight.git#${UPSTREAM_REVISION}`));
+  assert.ok(cmd.includes(`https://github.com/vectorize-io/hindsight.git#${UPSTREAM_TAG}`));
   assert.equal(cmd[cmd.indexOf('--target') + 1], 'cp-only');
   assert.equal(cmd[cmd.indexOf('-f') + 1], 'docker/standalone/Dockerfile');
   assert.equal(cmd[cmd.indexOf('--build-arg') + 1], `NEXT_PUBLIC_BASE_PATH=${BASE_PATH}`);
-  assert.ok(cmd.includes(`${LABELS.basePath}=${BASE_PATH}`) && cmd.includes(`${LABELS.upstream}=${UPSTREAM_REVISION}`));
+  assert.ok(cmd.includes(`${LABELS.basePath}=${BASE_PATH}`) && cmd.includes(`${LABELS.upstream}=${UPSTREAM_TAG}`));
   assert.equal(cmd[cmd.indexOf('-t') + 1], CP_IMAGE);
   assert.equal(end.result.id, CP_ID);
   assert.equal(after.length, 1, 'a precondition job re-checks the start');
@@ -84,25 +85,40 @@ test('only the pinned helper tag gets the Docker socket', async (t) => {
   assert.throws(() => docker.runHelper('code-hindsight-build', `sha256:${'e'.repeat(64)}`, ['true']), /refusing to give the Docker socket/);
 });
 
-// GPU2: the GPU image is upstream's CUDA recipe at the pinned commit, FROM the pinned full image,
-// built in the pinned helper, labelled so the start can tell it is ours.
-test('GPU2: build-gpu runs the pinned upstream CUDA recipe in the helper with the pinned version, torch flavour, labels and tag', async (t) => {
+// GPU2: the GPU image is built from the plugin's recipe (upstream's CUDA recipe at the pinned
+// commit plus throttled uv downloads), FROM the pinned full image, in the pinned helper, labelled
+// so the start can tell it is ours.
+test('GPU2: the GPU recipe is upstream\'s CUDA recipe with only the torch install\'s uv downloads throttled', () => {
+  assert.match(GPU_RECIPE, /^ARG HINDSIGHT_VERSION=/m);
+  assert.match(GPU_RECIPE, /^FROM ghcr\.io\/vectorize-io\/hindsight:\$\{HINDSIGHT_VERSION\}$/m, 'FROM the full image of the version passed in');
+  assert.equal(`ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION}`, API_IMAGES.full.ref);
+  assert.match(GPU_RECIPE, /^ARG PYTORCH_CUDA_FLAVOR=/m);
+  assert.match(GPU_RECIPE, /^ARG PYTORCH_CUDA_INDEX=/m);
+  assert.match(GPU_RECIPE, /&& UV_CONCURRENT_DOWNLOADS=4 UV_HTTP_TIMEOUT=300 uv pip install \\\n/);
+  assert.match(GPU_RECIPE, /"torch==\$\{TORCH_BASE_VERSION\}\+\$\{PYTORCH_CUDA_FLAVOR\}"/);
+  assert.match(GPU_RECIPE, /assert torch\.version\.cuda/);
+  assert.match(GPU_RECIPE, /docker\/docker-compose\/cuda\/Dockerfile at the release tag\n# UPSTREAM_TAG/, 'derives from upstream\'s release tag');
+  assert.equal((GPU_RECIPE.match(/^(FROM|RUN|COPY|ADD) /gm) ?? []).length, 2, 'one FROM, one RUN: no files enter the image');
+});
+
+test('GPU2: build-gpu runs the recipe in the helper with the pinned version, torch flavour, labels and tag', async (t) => {
   const { r, jobs, after } = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage(), [BUILD_HELPER]: helperImage() }, registry: { [API_GPU_IMAGE]: goodGpuImage() } } });
   const end = await jobs.start('build-gpu').done;
   assert.equal(end.state, 'done', JSON.stringify(end.error));
   const run = dockerCalls(r).find((a) => a[0] === 'run');
-  assert.deepEqual(run.slice(0, 7), ['run', '--rm', '--name', 'code-hindsight-build', '-v', '/var/run/docker.sock:/var/run/docker.sock', BUILD_HELPER]);
-  assert.deepEqual(run.slice(7), buildGpuCommand());
+  assert.deepEqual(run.slice(0, 8), ['run', '--rm', '-i', '--name', 'code-hindsight-build', '-v', '/var/run/docker.sock:/var/run/docker.sock', BUILD_HELPER]);
+  assert.deepEqual(run.slice(8), buildGpuCommand());
+  assert.equal(dockerState(r).lastBuildStdin, GPU_RECIPE, 'the recipe reaches the helper on stdin');
   const cmd = buildGpuCommand();
   assert.deepEqual(cmd.slice(0, 3), ['docker', 'buildx', 'build']);
-  assert.ok(cmd.includes(`https://github.com/vectorize-io/hindsight.git#${UPSTREAM_REVISION}`));
-  assert.equal(cmd[cmd.indexOf('-f') + 1], GPU_DOCKERFILE);
+  assert.equal(cmd.at(-1), '-', 'the Dockerfile from stdin, no build context');
   const buildArgs = cmd.flatMap((a, i) => (cmd[i - 1] === '--build-arg' ? [a] : []));
   assert.deepEqual(buildArgs, [`HINDSIGHT_VERSION=${HINDSIGHT_VERSION}`, `PYTORCH_CUDA_FLAVOR=${GPU_TORCH_FLAVOR}`, `PYTORCH_CUDA_INDEX=${GPU_TORCH_INDEX}`]);
-  assert.equal(`ghcr.io/vectorize-io/hindsight:${HINDSIGHT_VERSION}`, API_IMAGES.full.ref, 'the recipe builds FROM the pinned full image');
-  assert.ok(cmd.includes(`${LABELS.upstream}=${UPSTREAM_REVISION}`) && cmd.includes(`${LABELS.cuda}=${GPU_TORCH_FLAVOR}`));
+  assert.equal(UPSTREAM_TAG, `v${HINDSIGHT_VERSION}`);
+  assert.ok(cmd.includes(`${LABELS.upstream}=${UPSTREAM_TAG}`), 'labelled with upstream\'s release tag, not a commit');
+  assert.ok(cmd.includes(`${LABELS.cuda}=${GPU_TORCH_FLAVOR}`) && cmd.includes(`${LABELS.recipe}=${GPU_RECIPE_PATH}`));
   assert.equal(cmd[cmd.indexOf('-t') + 1], API_GPU_IMAGE);
-  assert.equal(cmd.at(-1), '--load');
+  assert.ok(cmd.includes('--load'));
   assert.deepEqual(end.result, { image: API_GPU_IMAGE, id: GPU_ID });
   assert.equal(after.length, 1, 'a precondition job: a GPU start waiting on the image starts');
 });
@@ -121,7 +137,7 @@ test('GPU2: build-gpu pulls only a missing helper, and a result without the GPU 
   const { r, jobs } = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage() }, registry: { [BUILD_HELPER]: helperImage(), [API_GPU_IMAGE]: { Id: GPU_ID, Config: { Labels: {} } } } } });
   const end = await jobs.start('build-gpu').done;
   assert.deepEqual(dockerCalls(r).filter((a) => a[0] === 'pull'), [['pull', BUILD_HELPER]]);
-  assert.deepEqual(dockerCalls(r).filter((a) => a[0] === 'run').map((a) => a[6]), [BUILD_HELPER], 'only the helper runs');
+  assert.deepEqual(dockerCalls(r).filter((a) => a[0] === 'run').map((a) => a[a.indexOf('-v') + 2]), [BUILD_HELPER], 'only the helper runs');
   assert.equal(end.state, 'failed');
   assert.equal(end.error.code, 'GPU_IMAGE_MISSING');
 });
@@ -171,7 +187,7 @@ test('import from a host path validates the path, then loads the file', async (t
   assert.deepEqual(end.result.loaded, [{ ref: API_IMAGES.slim.ref, id: `sha256:${'9'.repeat(64)}`, status: 'pinned' }]);
   // S2: a CP image under its tag without this plugin's build labels is flagged.
   const other = path.join(r.root, 'other.tar');
-  fs.writeFileSync(other, fakeBundle({ [CP_IMAGE]: { Id: CP_ID, Config: { Labels: { [LABELS.basePath]: '/other', [LABELS.upstream]: UPSTREAM_REVISION } } } }));
+  fs.writeFileSync(other, fakeBundle({ [CP_IMAGE]: { Id: CP_ID, Config: { Labels: { [LABELS.basePath]: '/other', [LABELS.upstream]: UPSTREAM_TAG } } } }));
   const wrong = await jobs.start('import', { path: other }).done;
   assert.deepEqual(wrong.result.loaded, [{ ref: CP_IMAGE, id: CP_ID, status: 'wrong-build' }]);
 });
