@@ -64,7 +64,7 @@ export function Images({ status, onChanged }: { status: Status; onChanged: () =>
         <CardContent className="space-y-3 text-sm">
           <div className="flex flex-wrap items-center gap-2">
             <span>API image</span>
-            <Badge variant={status.images?.api.ok ? 'success' : 'outline'}>{status.images?.api.ok ? 'present' : 'missing or wrong release'}</Badge>
+            <Badge variant={status.images?.api.ok ? 'success' : 'outline'}>{status.images?.api.ok ? 'present' : 'missing'}</Badge>
             <Button size="sm" variant="outline" disabled={busy} onClick={() => void start('pull', { variant: 'full' })}>Pull full image</Button>
             <Button size="sm" variant="outline" disabled={busy} onClick={() => void start('pull', { variant: 'slim' })}>Pull slim image</Button>
           </div>

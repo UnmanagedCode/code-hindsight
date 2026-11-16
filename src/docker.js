@@ -1,7 +1,7 @@
 // The only module that runs docker. It resolves how docker is invoked (directly, or through
 // `sudo -n` when allowed), classifies failures into catalog errors, and refuses to touch any
 // container, volume or network whose name lacks this plugin's prefix, or any image that is
-// a pinned tag.
+// not a pinned tag.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';

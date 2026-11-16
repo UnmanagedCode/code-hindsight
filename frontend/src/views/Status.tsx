@@ -19,7 +19,7 @@ const Row = ({ label, children }: { label: string; children: React.ReactNode }) 
 function imageText(i: { present: boolean; ok: boolean } | undefined) {
   if (!i) return 'unknown';
   if (!i.present) return 'missing';
-  return i.ok ? 'present' : 'present, wrong release';
+  return i.ok ? 'present' : 'built for something else';
 }
 
 export function Status({ status, onAction, busy }: { status: StatusT; onAction: (a: ErrorAction) => void; busy: boolean }) {

@@ -7,7 +7,7 @@ import { status, stubFetch } from '@/test/fixtures';
 const CP_ID = `sha256:${'c'.repeat(64)}`;
 describe('Images & data', () => {
   // Round 2: the import shows each loaded image's ID and standing next to the IDs the bundle's
-  // manifest lists, so they can be compared with the export's.
+  // manifest lists (information only).
   it('shows what an import loaded, with each image ID, its standing, and the bundle manifest IDs', async () => {
     const evil = '<img src=x onerror=alert(1)>';
     stubFetch((url) => (url === '-/api/jobs/j9' ? { body: { id: 'j9', kind: 'import', state: 'done', error: null, tail: 'Loaded image: x', result: {
@@ -32,7 +32,7 @@ describe('Images & data', () => {
       name: 'code-hindsight-1.2.1-full.tar', size: 1, sha256: 'x', images: [{ ref: 'ghcr.io/vectorize-io/hindsight:1.2.1', id: 'sha256:aaa' }, { ref: 'code-hindsight-cp:1.2.1', id: CP_ID }],
     } } } : undefined));
     render(<Images status={status({ job: { id: 'e1', kind: 'export', state: 'running', startedAt: '', endedAt: null, result: null, error: null, progress: null, cancellable: false } })} onChanged={vi.fn()} />);
-    const ids = await screen.findByLabelText('Image IDs in this bundle (compare them after importing it)');
+    const ids = await screen.findByLabelText('Image IDs in this bundle');
     expect(ids.textContent).toContain(CP_ID);
     expect(ids.textContent).toContain('sha256:aaa');
   });

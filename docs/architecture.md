@@ -33,7 +33,7 @@ The Claude Code side is a plugin root, `claude/` (declared by `claudePlugin` in 
 | `secrets.js` | generated and user keys in `secrets.json`; `has()` for the UI |
 | `netDetect.js` | automatic bind address from `/.dockerenv` and `/proc/net/route` |
 | `errors.js` | the error catalog (`CATALOG`), `AppError` |
-| `docker.js` | the only module that runs docker: invocation resolution (direct → `sudo -n`), error classification, name and image guards, env files, detached stop, the socket-mounting helper run (pinned IDs only) |
+| `docker.js` | the only module that runs docker: invocation resolution (direct → `sudo -n`), error classification, name and image guards, env files, detached stop, the socket-mounting helper run (the pinned tag only) |
 | `llmEnv.js` | LLM env for none / manual / cc-backend (Anthropic direct, or Anthropic-loopback and Ollama via the relay, returned with the relay target); cc backend summary for the picker |
 | `containerSpec.js` | pure builders of the containers' run args, env, labels and spec hash (API, CP, relay); resource names; owner id |
 | `relay/relay.mjs` | the relay program (Node builtins only), run inside the API image: tunnel handshake, pairing, piping |

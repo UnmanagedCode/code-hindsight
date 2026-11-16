@@ -29,7 +29,7 @@ test('API spec: keyed, API-only, published on the bind address, data volume, HF 
   assert.equal(s.name, 'code-hindsight-api');
   assert.deepEqual(s.args.slice(0, 12), ['-d', '--name', 'code-hindsight-api', '--network', 'code-hindsight-net', '--network-alias', 'api', '--restart', 'on-failure:3', '-p', '172.20.0.1:18888:8888', '-v']);
   assert.equal(s.args[12], 'code-hindsight-data:/home/hindsight/.pg0');
-  assert.equal(s.args.at(-1), API_ID, 'run by the verified image ID, not a tag');
+  assert.equal(s.args.at(-1), API_ID, 'run by the image ID the tag resolved to, not a tag');
   assert.equal(s.env.HINDSIGHT_ENABLE_CP, 'false');
   assert.equal(s.env.HINDSIGHT_API_TENANT_EXTENSION, 'hindsight_api.extensions.builtin.tenant:ApiKeyTenantExtension');
   assert.equal(s.env.HINDSIGHT_API_TENANT_API_KEY, base.apiKey);
@@ -101,8 +101,8 @@ test('bind auto-detect: default gateway in a container, else loopback', () => {
 });
 
 // OL7: the relay container: prefixed, aliased `ollama`, only the tunnel port published, run by
-// the verified API image ID, its key in env only, its hash following the script and the port.
-test('OL7: relay spec is prefixed, read-only, publishes only the tunnel port and runs the verified image', () => {
+// the API image ID the tag resolved to, its key in env only, its hash following the script and the port.
+test('OL7: relay spec is prefixed, read-only, publishes only the tunnel port and runs the API image', () => {
   const o = { names, image: { id: API_ID }, bind: '172.20.0.1', port: 18434, key: 'rk'.repeat(32), owner: 'o1', target: RELAY_TARGETS.ollama };
   const s = relaySpec(o);
   assert.equal(s.name, 'code-hindsight-relay');
@@ -113,7 +113,7 @@ test('OL7: relay spec is prefixed, read-only, publishes only the tunnel port and
   assert.deepEqual(s.args.filter((a, i) => s.args[i - 1] === '-p'), ['172.20.0.1:18434:7070'], 'the API-facing port is not published');
   for (const f of ['--read-only', '--cap-drop', '--security-opt']) assert.ok(s.args.includes(f), f);
   const image = s.args.indexOf(API_ID);
-  assert.ok(image > 0, 'run by the verified image ID');
+  assert.ok(image > 0, 'run by the image ID the tag resolved to');
   assert.deepEqual(s.args.slice(image + 1, image + 3), ['--input-type=module', '-e']);
   assert.match(s.args[image + 3], /HSR1/, 'the relay program is the script argument');
   assert.equal(s.args.join(' ').includes(o.key), false, 'the key is env only');
