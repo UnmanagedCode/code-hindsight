@@ -7,7 +7,7 @@ It manages two containers (the Hindsight API with its embedded Postgres, and a c
 ## Quick start
 
 1. In cc: **Settings → Plugins → Rescan**, enable **Code Hindsight**, open it from the app switcher.
-2. **Images & data:** **Pull full image** (or import a bundle), then **Build CP image** once (needs network). An imported control-plane image runs only after you confirm its ID there (a guard against running an unexpected image by accident; see [Trust model](#trust-model)).
+2. **Images & data:** **Pull full image** (or import a bundle), then **Build CP image** once (needs network). Images are pinned by tag; see [Trust model](#trust-model).
 3. **Status → Start Hindsight**, then the **Control plane** tab.
 4. **Memory** tab → **Add scope** and Save to switch memory on (it is off with no scopes). Sessions started afterwards use it.
 5. Switch on **Auto-start** for the plugin (Settings → Plugins) to have Hindsight up after every cc start: Hindsight runs only while the plugin's backend runs.
@@ -24,8 +24,8 @@ Install hook for a Library entry: `npm install` (it builds `frontend/dist` throu
 
 ## Trust model
 
-- **`sudo docker` is root on the host.** With sudo allowed, this plugin drives the Docker daemon as root. It only ever names `code-hindsight-*` containers, volumes and networks and the pinned images, and refuses a same-named resource another cc created.
-- **Images are trusted by ID, not by tag or label.** The official API images and the build helper (the one image given the Docker socket) must have a pinned image ID (`src/pins.js`); the control-plane image must have the ID this plugin built or the user confirmed. Containers run by that ID. The confirmation guards against running an unexpected control-plane image by accident (a wrong tarball, a stale import); it is **not** a barrier against a caller that can reach the plugin API, which publishes the ID it asks for and can import and confirm an image itself — see the next bullet.
+- **`sudo docker` is root on the host.** With sudo allowed, this plugin drives the Docker daemon as root. It only ever names `code-hindsight-*` containers, volumes and networks and the pinned image tags, and refuses a same-named resource another cc created.
+- **Images are pinned by tag, never by digest** (`src/pins.js`). The API image runs when its pinned tag is present. The control-plane image runs when `CP_IMAGE` is present and carries this plugin's base-path and upstream labels. The build helper (the one image given the Docker socket) is the pinned `BUILD_HELPER` tag, and the only image `runHelper` accepts. Containers run by the image ID the tag resolves to at start. Whatever an import or a `docker pull`/`tag` puts under those tags is what runs.
 - **The plugin's own API (`/-/api/*`) is unauthenticated**, like cc's: any local process, or any script running on cc's origin, can drive it — and could already drive cc itself, which can do more. State-changing requests and every control-plane request must carry browser fetch metadata from this origin (`Sec-Fetch-Site: same-origin` or `none`), so other websites cannot.
 - **The control plane runs same-origin with cc** and renders memories that agents wrote. A script injected into it would have cc's full (unauthenticated) API.
 - **Every published port needs a key**: the API and control-plane ports (the API key; the CP access key, used server-side) and, while a backend is linked through the relay, the relay's tunnel port (the relay key). Other containers on the Docker host can reach the bind address. Hindsight leaves `/health*`, `/version`, `/metrics`, `/docs`, `/openapi.json` (API) and its login/health/version routes (CP) open; none returns memory data.

@@ -25,7 +25,7 @@ The page opens on **Control plane** when Hindsight is ready, otherwise on **Stat
 | Settings changed | when the saved settings differ from the running containers: **Apply & restart** |
 | Hindsight | state, docker invocation (`docker` or `sudo -n docker`) and daemon version, image variant, bind address and the host ports (the relay port while a backend is linked through the relay), LLM mode, ready-since time; **Start / Restart / Stop Hindsight** |
 | Relay | only while the LLM goes through the relay: for Ollama, the daemon's version and URL (or that it is not answering); for a loopback cc backend, its endpoint URL and whether it answers; then the tunnel's state; a warning for `OLLAMA_UNREACHABLE` or `CC_BACKEND_UNREACHABLE`, and for `RELAY_DISCONNECTED` |
-| Images and containers | the pinned API image and the CP image (present / missing / not the pinned or trusted ID), the containers' states (the relay container only while it exists), **API log** / **CP log** / **Relay log** (last 200 lines) |
+| Images and containers | the pinned API image and the CP image (present / missing / the CP image built for something else), the containers' states (the relay container only while it exists), **API log** / **CP log** / **Relay log** (last 200 lines) |
 | Job | the running or last job (a Docker action, or a backfill scan or import) with its log tail |
 
 **Stop Hindsight** stops the API and control-plane containers (and the relay container and tunnel, while a backend is linked through the relay) and keeps them and the data volume. **Restart Hindsight** stops and starts them again (recreating any whose settings changed).
@@ -172,17 +172,16 @@ Nothing is pulled, built, loaded or removed on its own: each is a button, one at
 | Action | Needs | Does |
 |---|---|---|
 | Pull full image / Pull slim image | network | pulls the pinned official API image |
-| Build CP image | network (once) | builds the control-plane image from the pinned upstream commit with this plugin's base path, inside the docker CLI helper image (pulled by digest when missing; run only if its ID is pinned). The built image's ID becomes the trusted CP image |
-| Upload and import | — | streams a bundle file from the browser into `docker load`; lists each loaded image's ID and whether it will run (pinned / not pinned / trusted / needs confirmation), and next to them the IDs the bundle's manifest lists (a bundle this plugin exported) |
+| Build CP image | network (once) | builds the control-plane image from the pinned upstream commit with this plugin's base path, inside the docker CLI helper image (pulled by tag when missing) |
+| Upload and import | — | streams a bundle file from the browser into `docker load`; lists each loaded image's ID and whether it will run (pinned tag / wrong build / unused), and next to them the IDs the bundle's manifest lists (a bundle this plugin exported) |
 | Import from a path | — | the same for a `.tar` on cc's machine (absolute path) |
-| Trust this image… | a CP image that is not trusted | shows the control-plane image's ID; confirming trusts exactly that ID (for a bundle you exported yourself, compare it with the IDs the export showed). This guards against running an unexpected image by accident — a wrong tarball, a stale import — not against a caller that can reach the plugin API, which can import and confirm an image itself ([README → Trust model](../README.md#trust-model)) |
 | Export | the images present | writes `code-hindsight-<version>-<variant>.tar` (the variant's API image + the CP image, plus a `code-hindsight-bundle.json` listing their IDs) to the plugin data dir and offers it for download; shows size, sha256 and the image IDs |
 | Remove images | Hindsight stopped; confirm | removes the pinned API images and the CP image (and this plugin's stopped containers) |
 | Delete data volume | Hindsight stopped; type the volume name | deletes every memory |
 
-**Offline workflow:** on a machine with network access run Pull + Build CP image, then Export (note the IDs it reports); carry the `.tar`; on the offline machine Import it, check the IDs, **Trust this image…** for the control-plane image, then Start. The API image needs no confirmation: its ID is pinned.
+**Offline workflow:** on a machine with network access run Pull + Build CP image, then Export; carry the `.tar`; on the offline machine Import it, then Start.
 
-Only Pull, Build CP image, Import and Trust can start Hindsight afterwards (when it was asked to run and is waiting on an image); Export, Remove images and Delete data volume never do.
+Only Pull, Build CP image, and Import can start Hindsight afterwards (when it was asked to run and is waiting on an image); Export, Remove images and Delete data volume never do.
 
 ## Errors
 
@@ -190,10 +189,9 @@ Every error is a code from `CATALOG` (`src/errors.js`); the Status card shows it
 
 | Code | Action button |
 |---|---|
-| `DOCKER_NOT_FOUND`, `NAME_TAKEN`, `BUSY`, `HELPER_UNTRUSTED`, `JOB_NOT_CANCELLABLE` | — |
-| `CP_IMAGE_UNTRUSTED` | Review the image (opens Images & data) |
+| `DOCKER_NOT_FOUND`, `NAME_TAKEN`, `BUSY`, `JOB_NOT_CANCELLABLE` | — |
 | `DOCKER_DENIED`, `PORT_IN_USE`, `EMBEDDINGS_CHANGED`, `SETTINGS_INVALID`, `SLIM_NEEDS_REMOTE_EMBEDDINGS`, `SLIM_NEEDS_RERANKER`, `EMBEDDINGS_NEEDS_KEY`, `CC_UNREACHABLE`, `CC_ROUTE_CHANGED`, `CC_BACKEND_MISSING`, `CC_BACKEND_UNSUPPORTED`, `CC_BACKEND_LOOPBACK` (loopback over `https`) | Open Settings |
-| `IMAGE_MISSING`, `IMAGE_MISMATCH` | Pull image |
+| `IMAGE_MISSING` | Pull image |
 | `CP_IMAGE_MISSING`, `CP_IMAGE_MISMATCH` | Build CP image |
 | `DOCKER_DAEMON_DOWN`, `DOCKER_FAILED` | Start Hindsight |
 | `UNHEALTHY`, `CRASHED`, `CP_LOGIN_FAILED`, `RELAY_DISCONNECTED` | Restart Hindsight |

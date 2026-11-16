@@ -19,7 +19,6 @@ import { createRetainCursors, operationIdFor } from '../src/retainCursor.js';
 import { createActivityLog } from '../src/activity.js';
 import { createMemory } from '../src/memory.js';
 import { createJobs } from '../src/jobs.js';
-import { createCpTrust } from '../src/trust.js';
 import { resourceNames, ownerId } from '../src/containerSpec.js';
 import { createPlacementCache } from '../src/backfillPlacements.js';
 import { createBackfill, BACKFILL_LIMITS, BACKFILL_ESTIMATE, backfillDocumentId, estimateDocument, contentHash } from '../src/backfill.js';
@@ -61,7 +60,7 @@ async function setup(t, { scopes = [scope()], limits = BACKFILL_LIMITS, llmMode 
   });
   const docker = { resolve: async () => { throw new Error('a backfill job must not resolve docker'); } };
   const supervisor = { afterPrecondition: async () => { throw new Error('no start'); }, refresh: async () => { throw new Error('no refresh'); } };
-  x.jobs = createJobs({ docker, supervisor, cpTrust: createCpTrust(r.dataDir), names: resourceNames('code-hindsight'), owner: ownerId(r.dataDir), dataDir: r.dataDir, kinds: x.backfill.kinds });
+  x.jobs = createJobs({ docker, supervisor, names: resourceNames('code-hindsight'), owner: ownerId(r.dataDir), dataDir: r.dataDir, kinds: x.backfill.kinds });
   x.scan = (p = {}) => x.jobs.start('backfill-scan', p).done;
   x.import = (keys, extra = {}) => x.jobs.start('backfill-import', { scanId: x.backfill.latestScan().scanId, sessions: keys, confirm: true, ...extra }).done;
   /** A retired session `n` with one segment of `body` lines (default: two exchanges). */

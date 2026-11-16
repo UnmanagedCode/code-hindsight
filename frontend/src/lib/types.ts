@@ -1,7 +1,7 @@
 // Shapes of the backend's /-/api/ responses (docs/protocol.md).
 
 export type HindsightState = 'stopped' | 'checking' | 'starting' | 'ready' | 'stopping' | 'error';
-export type ErrorAction = 'pull' | 'build-cp' | 'import' | 'start' | 'restart' | 'settings' | 'stop' | 'trust-cp';
+export type ErrorAction = 'pull' | 'build-cp' | 'import' | 'start' | 'restart' | 'settings' | 'stop';
 export type Variant = 'full' | 'slim';
 
 export interface CatalogError {
@@ -19,8 +19,6 @@ export interface ImageInfo {
   id?: string | null;
   /** CP image only: carries this plugin's base-path and upstream labels. */
   built?: boolean;
-  /** CP image only: its ID is the one this plugin built or the user confirmed. */
-  trusted?: boolean;
   version?: string | null;
   revision?: string | null;
   basePath?: string | null;
@@ -97,13 +95,13 @@ export interface SettingsView {
   secrets: { llmApiKey: boolean; embeddingsApiKey: boolean };
   detectedBindAddress: string;
   choices: { variants: Variant[]; llmModes: Settings['llm']['mode'][]; embeddingsProviders: string[]; rerankerProviders: string[]; llmMaxConcurrentMax: number };
-  images: { api: Record<Variant, { ref: string; version: string }>; cp: string; version: string };
+  images: { api: Record<Variant, { ref: string }>; cp: string; version: string };
   /** On a save: user keys removed because their provider or URL changed. */
   cleared?: string[];
 }
 
-/** One image a bundle import loaded, with its trust standing. */
-export interface LoadedImage { ref: string; id: string; status: 'pinned' | 'not-pinned' | 'trusted' | 'needs-confirmation' | 'unused' }
+/** One image a bundle import loaded, with its standing. */
+export interface LoadedImage { ref: string; id: string; status: 'pinned' | 'wrong-build' | 'unused' }
 
 export interface FieldError { field: string; code?: string; message: string }
 

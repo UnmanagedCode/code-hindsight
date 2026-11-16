@@ -8,12 +8,11 @@ import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { createDocker } from '../src/docker.js';
 import { createJobs, buildCpCommand, bundleName, BUNDLE_MANIFEST } from '../src/jobs.js';
-import { createCpTrust } from '../src/trust.js';
 import { createTarScanner } from '../src/tarStream.js';
 import { AppError } from '../src/errors.js';
 import { resourceNames, ownerId } from '../src/containerSpec.js';
 import { API_IMAGES, BUILD_HELPER, CP_IMAGE, LABELS, BASE_PATH, UPSTREAM_REVISION } from '../src/pins.js';
-import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, goodApiImage, goodCpImage, helperImage, CP_ID, fakeBundle } from './helpers.mjs';
+import { mkRoot, fakeEnv, seedDocker, dockerCalls, dockerState, goodApiImage, goodCpImage, helperImage, CP_ID, API_ID, fakeBundle } from './helpers.mjs';
 
 const names = resourceNames('code-hindsight');
 
@@ -21,14 +20,13 @@ function make(t, { seed, mode } = {}) {
   const r = mkRoot(t);
   seedDocker(r, seed);
   fs.mkdirSync(r.dataDir, { recursive: true, mode: 0o700 });
-  const docker = createDocker({ env: fakeEnv(r, { mode }), allowSudo: () => true, prefix: 'code-hindsight', images: [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE, BUILD_HELPER.ref], runDir: r.dataDir });
+  const docker = createDocker({ env: fakeEnv(r, { mode }), allowSudo: () => true, prefix: 'code-hindsight', images: [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE, BUILD_HELPER], runDir: r.dataDir });
   const after = [];
   const refreshed = [];
   const supervisor = { afterPrecondition: async () => { after.push(1); }, refresh: async () => { refreshed.push(1); } };
   const owner = ownerId(r.dataDir);
-  const cpTrust = createCpTrust(r.dataDir);
-  const jobs = createJobs({ docker, supervisor, cpTrust, names, owner, dataDir: r.dataDir });
-  return { r, docker, jobs, after, refreshed, owner, cpTrust };
+  const jobs = createJobs({ docker, supervisor, names, owner, dataDir: r.dataDir });
+  return { r, docker, jobs, after, refreshed, owner };
 }
 const ourContainer = (owner, running) => ({ Name: '/x', Image: 'i', Config: { Labels: { [LABELS.owner]: owner } }, State: { Status: running ? 'running' : 'exited', Running: running } });
 
@@ -47,14 +45,13 @@ test('pull pulls the pinned image of the variant and re-checks the preconditions
 });
 
 // Spec 6 + S8: the CP image is built from the pinned upstream commit with our base path.
-// S1: the helper gets the Docker socket only as the pinned image, run by its verified ID.
-// S2: a successful build records the built image's ID as the trusted CP image.
-test('build-cp runs buildx at the pinned commit in the verified helper, by ID, and trusts the result', async (t) => {
-  const { r, jobs, cpTrust, after } = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage(), [BUILD_HELPER.ref]: helperImage() }, registry: { [CP_IMAGE]: goodCpImage() } } });
+// S1: the helper gets the Docker socket only as the pinned tag, run by that tag.
+test('build-cp runs buildx at the pinned commit in the helper, by its pinned tag', async (t) => {
+  const { r, jobs, after } = make(t, { seed: { images: { [API_IMAGES.full.ref]: goodApiImage(), [BUILD_HELPER]: helperImage() }, registry: { [CP_IMAGE]: goodCpImage() } } });
   const end = await jobs.start('build-cp').done;
   assert.equal(end.state, 'done', JSON.stringify(end.error));
   const run = dockerCalls(r).find((a) => a[0] === 'run');
-  assert.deepEqual(run.slice(0, 7), ['run', '--rm', '--name', 'code-hindsight-build', '-v', '/var/run/docker.sock:/var/run/docker.sock', BUILD_HELPER.ids[0]]);
+  assert.deepEqual(run.slice(0, 7), ['run', '--rm', '--name', 'code-hindsight-build', '-v', '/var/run/docker.sock:/var/run/docker.sock', BUILD_HELPER]);
   assert.deepEqual(run.slice(7), buildCpCommand());
   const cmd = buildCpCommand();
   assert.ok(cmd.includes(`https://github.com/vectorize-io/hindsight.git#${UPSTREAM_REVISION}`));
@@ -63,45 +60,28 @@ test('build-cp runs buildx at the pinned commit in the verified helper, by ID, a
   assert.equal(cmd[cmd.indexOf('--build-arg') + 1], `NEXT_PUBLIC_BASE_PATH=${BASE_PATH}`);
   assert.ok(cmd.includes(`${LABELS.basePath}=${BASE_PATH}`) && cmd.includes(`${LABELS.upstream}=${UPSTREAM_REVISION}`));
   assert.equal(cmd[cmd.indexOf('-t') + 1], CP_IMAGE);
-  assert.deepEqual(cpTrust.get().id, CP_ID);
-  assert.equal(cpTrust.get().source, 'build');
   assert.equal(end.result.id, CP_ID);
   assert.equal(after.length, 1, 'a precondition job re-checks the start');
 });
 
-test('build-cp pulls a missing helper by its pinned digest, never by tag', async (t) => {
-  const { r, jobs } = make(t, { seed: { images: {}, registry: { [BUILD_HELPER.ref]: helperImage(), [CP_IMAGE]: goodCpImage() } } });
+// Directive: images are pinned by tag, never by digest.
+test('build-cp pulls a missing helper by its pinned tag', async (t) => {
+  const { r, jobs } = make(t, { seed: { images: {}, registry: { [BUILD_HELPER]: helperImage(), [CP_IMAGE]: goodCpImage() } } });
   const end = await jobs.start('build-cp').done;
   assert.equal(end.state, 'done', JSON.stringify(end.error));
-  assert.deepEqual(dockerCalls(r).find((a) => a[0] === 'pull'), ['pull', BUILD_HELPER.ref]);
-  assert.match(BUILD_HELPER.ref, /@sha256:[0-9a-f]{64}$/);
+  assert.deepEqual(dockerCalls(r).find((a) => a[0] === 'pull'), ['pull', BUILD_HELPER]);
+  assert.doesNotMatch(BUILD_HELPER, /@sha256:/);
 });
 
-test('a helper image whose ID is not pinned never gets the Docker socket', async (t) => {
-  const forged = { Id: `sha256:${'e'.repeat(64)}`, Config: { Labels: {} } };
-  const { r, jobs, docker } = make(t, { seed: { images: { [BUILD_HELPER.ref]: forged } } });
+// S1: the Docker socket goes only to the pinned helper tag, whatever the image's ID.
+test('only the pinned helper tag gets the Docker socket', async (t) => {
+  const { r, jobs, docker } = make(t, { seed: { images: { [BUILD_HELPER]: helperImage() }, registry: { [CP_IMAGE]: goodCpImage() } } });
   const end = await jobs.start('build-cp').done;
-  assert.equal(end.error.code, 'HELPER_UNTRUSTED');
-  assert.equal(end.error.params.id, forged.Id);
-  assert.ok(!dockerCalls(r).some((a) => a[0] === 'run'));
+  assert.equal(end.state, 'done', JSON.stringify(end.error));
+  assert.ok(dockerCalls(r).some((a) => a[0] === 'run'));
   await docker.resolve();
-  assert.throws(() => docker.runHelper('code-hindsight-build', forged.Id, ['true']), /refusing to give the Docker socket/);
-  assert.throws(() => docker.runHelper('code-hindsight-build', 'docker:29.9.2-cli', ['true']), /refusing to give the Docker socket/);
-});
-
-// S2: an imported or otherwise unknown CP image ID runs only after the user confirms that ID.
-test('trust-cp records the CP image ID only when the confirmation names the current ID', async (t) => {
-  const { jobs, cpTrust, after } = make(t);
-  assert.throws(() => jobs.start('trust-cp', {}), { code: 'CONFIRMATION_REQUIRED' });
-  assert.throws(() => jobs.start('trust-cp', { confirm: 'yes' }), { code: 'CONFIRMATION_REQUIRED' });
-  const wrong = await jobs.start('trust-cp', { confirm: `sha256:${'0'.repeat(64)}` }).done;
-  assert.equal(wrong.error.code, 'CONFIRMATION_REQUIRED');
-  assert.equal(wrong.error.params.expected, CP_ID);
-  assert.equal(cpTrust.get(), null);
-  const ok = await jobs.start('trust-cp', { confirm: CP_ID }).done;
-  assert.equal(ok.state, 'done');
-  assert.deepEqual([cpTrust.get().id, cpTrust.get().source], [CP_ID, 'confirmed']);
-  assert.equal(after.length, 1);
+  assert.throws(() => docker.runHelper('code-hindsight-build', 'docker:latest', ['true']), /refusing to give the Docker socket/);
+  assert.throws(() => docker.runHelper('code-hindsight-build', `sha256:${'e'.repeat(64)}`, ['true']), /refusing to give the Docker socket/);
 });
 
 // Decision 14: one job at a time.
@@ -128,10 +108,10 @@ test('import streams an upload into docker load and reports the loaded tags', as
   const bundle = { [API_IMAGES.full.ref]: goodApiImage(), [CP_IMAGE]: goodCpImage() };
   const end = await jobs.start('import', { stdin: Readable.from(chunks(fakeBundle(bundle), 700)) }).done;
   assert.equal(end.state, 'done', JSON.stringify(end.error));
-  // Each loaded image with its ID and standing: the API image is pinned, the CP image needs confirming.
+  // Each loaded image with its ID and standing: the API image and the CP image built for this plugin are pinned.
   assert.deepEqual(end.result.loaded, [
-    { ref: API_IMAGES.full.ref, id: API_IMAGES.full.ids[0], status: 'pinned' },
-    { ref: CP_IMAGE, id: CP_ID, status: 'needs-confirmation' },
+    { ref: API_IMAGES.full.ref, id: API_ID, status: 'pinned' },
+    { ref: CP_IMAGE, id: CP_ID, status: 'pinned' },
   ]);
   assert.equal(end.result.manifest, null, 'a plain docker save has no bundle manifest');
   assert.deepEqual(dockerCalls(r).find((a) => a[0] === 'load'), ['load']);
@@ -145,7 +125,13 @@ test('import from a host path validates the path, then loads the file', async (t
   const file = path.join(r.root, 'bundle.tar');
   fs.writeFileSync(file, fakeBundle({ [API_IMAGES.slim.ref]: { ...goodApiImage('slim'), Id: `sha256:${'9'.repeat(64)}` } }));
   const end = await jobs.start('import', { path: file }).done;
-  assert.deepEqual(end.result.loaded, [{ ref: API_IMAGES.slim.ref, id: `sha256:${'9'.repeat(64)}`, status: 'not-pinned' }]);
+  // Directive: no ID check; an API image under the pinned tag is pinned whatever its ID.
+  assert.deepEqual(end.result.loaded, [{ ref: API_IMAGES.slim.ref, id: `sha256:${'9'.repeat(64)}`, status: 'pinned' }]);
+  // S2: a CP image under its tag without this plugin's build labels is flagged.
+  const other = path.join(r.root, 'other.tar');
+  fs.writeFileSync(other, fakeBundle({ [CP_IMAGE]: { Id: CP_ID, Config: { Labels: { [LABELS.basePath]: '/other', [LABELS.upstream]: UPSTREAM_REVISION } } } }));
+  const wrong = await jobs.start('import', { path: other }).done;
+  assert.deepEqual(wrong.result.loaded, [{ ref: CP_IMAGE, id: CP_ID, status: 'wrong-build' }]);
 });
 
 // Spec 3: export writes a bundle of the API image and the CP image, with size and sha256.
@@ -167,7 +153,7 @@ test('export saves the variant\'s API image and the CP image to a 0600 bundle wi
   // The bundle carries a manifest of the image IDs inside it, and stays loadable.
   let manifest = null;
   await new Promise((res, rej) => Readable.from([bytes]).pipe(createTarScanner(BUNDLE_MANIFEST, (b) => { manifest = JSON.parse(b); })).on('finish', res).on('error', rej).resume());
-  assert.deepEqual(manifest.images, [{ ref: API_IMAGES.full.ref, id: API_IMAGES.full.ids[0] }, { ref: CP_IMAGE, id: CP_ID }]);
+  assert.deepEqual(manifest.images, [{ ref: API_IMAGES.full.ref, id: API_ID }, { ref: CP_IMAGE, id: CP_ID }]);
   assert.deepEqual(end.result.images, manifest.images);
   const reimport = await jobs.start('import', { path: file }).done;
   assert.equal(reimport.state, 'done', JSON.stringify(reimport.error));
@@ -206,7 +192,7 @@ test('remove-images needs confirmation and stopped containers, and removes only 
   setStateExtra(r);
   const end = await jobs.start('remove-images', { confirm: true }).done;
   assert.deepEqual(end.result.removed, [API_IMAGES.full.ref, API_IMAGES.slim.ref, CP_IMAGE]);
-  assert.deepEqual(Object.keys(dockerState(r).images).sort(), [BUILD_HELPER.ref, 'node:24'].sort(), 'the build helper and unpinned images stay');
+  assert.deepEqual(Object.keys(dockerState(r).images).sort(), [BUILD_HELPER, 'node:24'].sort(), 'the build helper and unpinned images stay');
 });
 
 function setStateExtra(r) {
@@ -241,7 +227,7 @@ function makeRegistered(t, kinds) {
   const hooks = [];
   const docker = { resolve: async () => { resolves.push(1); }, pull: async () => {}, inspectImage: async () => null };
   const supervisor = { afterPrecondition: async () => { hooks.push('after'); }, refresh: async () => { hooks.push('refresh'); } };
-  const jobs = createJobs({ docker, supervisor, cpTrust: createCpTrust(r.dataDir), names, owner: ownerId(r.dataDir), dataDir: r.dataDir, kinds });
+  const jobs = createJobs({ docker, supervisor, names, owner: ownerId(r.dataDir), dataDir: r.dataDir, kinds });
   return { jobs, resolves, hooks };
 }
 const gate = () => { let open; const p = new Promise((res) => { open = res; }); return { p, open }; };

@@ -9,7 +9,7 @@ import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { API_IMAGES, BASE_PATH, CP_IMAGE, LABELS, RELAY_TARGETS, UPSTREAM_REVISION } from './pins.js';
-import { isPinnedApiImage } from './trust.js';
+import { isOurCpBuild } from './trust.js';
 import { AppError, describeError, toAppError } from './errors.js';
 import { validateSettings, embeddingsFingerprint, containerSettingsHash } from './settings.js';
 import { apiSpec, cpSpec, relaySpec, embeddingsEnv } from './containerSpec.js';
@@ -56,7 +56,6 @@ function pidAlive(pid) {
  * @param {ReturnType<import('./docker.js').createDocker>} o.docker
  * @param {ReturnType<import('./settings.js').createSettingsStore>} o.settings
  * @param {ReturnType<import('./secrets.js').createSecretsStore>} o.secrets
- * @param {ReturnType<import('./trust.js').createCpTrust>} o.cpTrust
  * @param {ReturnType<import('./containerSpec.js').resourceNames>} o.names
  * @param {string} o.owner ownership label value (containerSpec.ownerId)
  * @param {string} o.dataDir
@@ -70,7 +69,7 @@ function pidAlive(pid) {
  * @param {boolean} [o.watch] poll health while ready (tests drive `checkHealth()` instead)
  */
 export function createSupervisor({
-  docker, settings: settingsStore, secrets: secretsStore, cpTrust, names, owner, dataDir,
+  docker, settings: settingsStore, secrets: secretsStore, names, owner, dataDir,
   detectBind, fetchCcModels, cpSession, relay, probe = httpProbe, clock = realClock, timeouts = {}, watch = true,
   log = (m) => console.error(`code-hindsight: ${m}`),
 }) {
@@ -132,21 +131,18 @@ export function createSupervisor({
     const cp = await docker.inspectImage(CP_IMAGE);
     const apiLabels = api?.Config?.Labels ?? {};
     const cpLabels = cp?.Config?.Labels ?? {};
-    const trusted = cpTrust.get();
-    const built = !!cp && cpLabels[LABELS.basePath] === BASE_PATH && cpLabels[LABELS.upstream] === UPSTREAM_REVISION;
+    const built = isOurCpBuild(cp);
     images = {
       api: {
         ref: want.ref, present: !!api, id: api?.Id ?? null,
         version: apiLabels['org.opencontainers.image.version'] ?? null,
-        // Trusted by ID only: labels and tags are whatever a `docker load` said.
-        ok: !!api && isPinnedApiImage(variant, api.Id),
+        ok: !!api,
       },
       cp: {
         ref: CP_IMAGE, present: !!cp, id: cp?.Id ?? null,
         basePath: cpLabels[LABELS.basePath] ?? null, upstream: cpLabels[LABELS.upstream] ?? null,
         built,
-        trusted: !!cp && trusted?.id === cp.Id,
-        ok: built && trusted?.id === cp.Id,
+        ok: built,
       },
     };
     return { api, cp, want };
@@ -237,10 +233,8 @@ export function createSupervisor({
 
     const { api, cp, want } = await inspectImages(settings.variant);
     if (!api) throw new AppError('IMAGE_MISSING', { image: want.ref });
-    if (!images.api.ok) throw new AppError('IMAGE_MISMATCH', { image: want.ref, id: api.Id, version: images.api.version, expected: want.version });
     if (!cp) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
     if (!images.cp.built) throw new AppError('CP_IMAGE_MISMATCH', { image: CP_IMAGE, found: `${images.cp.basePath ?? '?'} @ ${images.cp.upstream ?? '?'}`, expected: `${BASE_PATH} @ ${UPSTREAM_REVISION}` });
-    if (!images.cp.trusted) throw new AppError('CP_IMAGE_UNTRUSTED', { image: CP_IMAGE, id: cp.Id });
 
     const baseLabels = { [LABELS.managed]: '1', [LABELS.owner]: owner };
     await ensureOwned('network', names.network, docker.inspectNetwork, () => docker.createNetwork(names.network, baseLabels));

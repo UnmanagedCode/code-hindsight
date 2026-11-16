@@ -7,10 +7,8 @@ import { Button } from '@/components/ui/button';
 
 const STATE_BADGE = { running: 'info', done: 'success', failed: 'destructive', cancelled: 'warning' } as const;
 const STANDING: Record<LoadedImage['status'], string> = {
-  pinned: 'pinned release',
-  'not-pinned': 'not the pinned release — will not run',
-  trusted: 'trusted',
-  'needs-confirmation': 'needs your confirmation before it runs',
+  pinned: 'pinned tag',
+  'wrong-build': 'built for something else — will not run',
   unused: 'not used by this plugin',
 };
 
@@ -92,7 +90,7 @@ export function JobPanel({ jobId, onEnd, intervalMs = 1000 }: { jobId: string; o
         <BundleIds label="Image IDs listed in the bundle (from its export)" images={imageList((job.result!.manifest as { images: unknown }).images)!} />
       )}
       {job.kind === 'export' && imageList(job.result?.images) && (
-        <BundleIds label="Image IDs in this bundle (compare them after importing it)" images={imageList(job.result!.images)!} />
+        <BundleIds label="Image IDs in this bundle" images={imageList(job.result!.images)!} />
       )}
       {job.error && <p className="text-sm text-destructive">{job.error.title}: {job.error.message}</p>}
       {job.tail && <pre className="max-h-64 overflow-auto rounded bg-muted p-2 font-mono text-xs whitespace-pre-wrap break-words">{job.tail}</pre>}

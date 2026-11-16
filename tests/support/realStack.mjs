@@ -58,10 +58,6 @@ export async function bootRealStack(t, { settings = {}, secrets = null, distDir,
   });
   const first = await make();
   if (secrets) first.app.secrets.setUserSecrets(secrets);
-  // A fresh data dir trusts no CP image yet: confirm the local one, as a user would.
-  const cpId = hostDocker(['image', 'inspect', '-f', '{{.Id}}', CP_IMAGE]).stdout.trim();
-  const trusted = await first.app.jobs.start('trust-cp', { confirm: cpId }).done;
-  if (trusted.state !== 'done') throw new Error(`trust-cp failed: ${JSON.stringify(trusted.error)}`);
   return { prefix, r, ...first, again: make };
 }
 

@@ -42,23 +42,18 @@ export function fakeEnv(r, { mode = '', sudoMode = 'ok' } = {}) {
   };
 }
 
+export const API_ID = `sha256:${'a'.repeat(64)}`;
 export const goodApiImage = (variant = 'full') => ({
-  Id: API_IMAGES[variant].ids[0],
-  Config: { Labels: { 'org.opencontainers.image.version': API_IMAGES[variant].version, 'org.opencontainers.image.revision': UPSTREAM_REVISION } },
+  Id: API_ID,
+  Config: { Labels: { 'org.opencontainers.image.version': variant === 'slim' ? '1.2.1-slim' : '1.2.1', 'org.opencontainers.image.revision': UPSTREAM_REVISION } },
 });
 export const CP_ID = `sha256:${'c'.repeat(64)}`;
 export const goodCpImage = (id = CP_ID) => ({ Id: id, Config: { Labels: { [LABELS.basePath]: BASE_PATH, [LABELS.upstream]: UPSTREAM_REVISION } } });
-export const helperImage = () => ({ Id: BUILD_HELPER.ids[0], Config: { Labels: {} } });
-
-/** Record `id` as the trusted CP image in the data dir (what a build or a confirm does). */
-export function trustCp(r, id = CP_ID) {
-  fs.mkdirSync(r.dataDir, { recursive: true, mode: 0o700 });
-  fs.writeFileSync(path.join(r.dataDir, 'trusted-cp.json'), JSON.stringify({ id, source: 'build', at: 'test' }));
-}
+export const helperImage = () => ({ Id: `sha256:${'e'.repeat(64)}`, Config: { Labels: {} } });
 
 /** Seed the fake daemon: by default both API images and the CP image are present and pullable. */
 export function seedDocker(r, { images, registry, containers = {}, networks = {}, volumes = {} } = {}) {
-  const all = { [API_IMAGES.full.ref]: goodApiImage('full'), [API_IMAGES.slim.ref]: goodApiImage('slim'), [CP_IMAGE]: goodCpImage(), [BUILD_HELPER.ref]: helperImage() };
+  const all = { [API_IMAGES.full.ref]: goodApiImage('full'), [API_IMAGES.slim.ref]: goodApiImage('slim'), [CP_IMAGE]: goodCpImage(), [BUILD_HELPER]: helperImage() };
   fs.writeFileSync(r.statePath, JSON.stringify({ images: images ?? all, registry: registry ?? all, containers, networks, volumes }));
 }
 
@@ -102,13 +97,12 @@ export async function waitFor(fn, { timeoutMs = 5_000, stepMs = 10 } = {}) {
  * root (default: an empty temp path); `ollamaUrl` the Ollama daemon (default: nothing listens); `cpSession` replaces the control-plane sign-in (needed to reach `ready` with no CP); `relay` replaces the relay tunnel; `hindsight` replaces the supervisor's connection to
  * Hindsight (`() => ({apiUrl, apiKey}) | null`, for a fake Hindsight).
  */
-export async function boot(t, { mode = '', sudoMode, seed, settings, distDir, cc = null, probe = async () => 0, start = true, trusted = true, claudeProjectsDir, hindsight, ollamaUrl = 'http://127.0.0.1:1', cpSession, relay } = {}) {
+export async function boot(t, { mode = '', sudoMode, seed, settings, distDir, cc = null, probe = async () => 0, start = true, claudeProjectsDir, hindsight, ollamaUrl = 'http://127.0.0.1:1', cpSession, relay } = {}) {
   const http = await import('node:http');
   const { createApp } = await import('../src/app.js');
   const r = mkRoot(t);
   seedDocker(r, seed);
   if (settings) writeSettings(r, settings);
-  if (trusted) trustCp(r);
   // Never the real transcripts: a temp dir unless the test writes its own.
   const config = { port: 0, dataDir: r.dataDir, conductorUrl: cc, ollamaUrl, pluginId: 'code-hindsight', distDir: distDir ?? path.join(r.root, 'no-dist'), claudeProjectsDir: claudeProjectsDir ?? path.join(r.root, 'claude-config', 'projects') };
   const app = createApp(config, { env: fakeEnv(r, { mode, sudoMode }), detectBind: () => '127.0.0.1', supervisorOptions: { probe, clock: fakeClock(), watch: false, log: () => {}, ...(cpSession ? { cpSession } : {}), ...(relay ? { relay } : {}) }, hindsightConnection: hindsight });

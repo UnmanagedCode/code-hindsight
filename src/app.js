@@ -2,7 +2,6 @@
 // shell, `/-/api/*` the plugin's API, and every other path the Hindsight control plane.
 import path from 'node:path';
 import { API_IMAGES, BUILD_HELPER, CP_IMAGE, RESOURCE_PREFIX, VARIANTS } from './pins.js';
-import { createCpTrust } from './trust.js';
 import { createDocker } from './docker.js';
 import { createSettingsStore } from './settings.js';
 import { createSecretsStore } from './secrets.js';
@@ -48,14 +47,13 @@ export function createApp(config, overrides = {}) {
   const settings = createSettingsStore(config.dataDir);
   const secrets = createSecretsStore(config.dataDir);
   secrets.get();
-  const cpTrust = createCpTrust(config.dataDir);
   const names = resourceNames(prefix);
   const owner = ownerId(config.dataDir);
   const docker = createDocker({
     env,
     allowSudo: () => settings.get().docker.allowSudo === true,
     prefix,
-    images: [...VARIANTS.map((v) => API_IMAGES[v].ref), CP_IMAGE, BUILD_HELPER.ref],
+    images: [...VARIANTS.map((v) => API_IMAGES[v].ref), CP_IMAGE, BUILD_HELPER],
     runDir,
   });
   const ccModels = () => fetchCcModels(config.conductorUrl);
@@ -71,7 +69,7 @@ export function createApp(config, overrides = {}) {
   };
   let supervisor;
   const cpSession = createCpSession({ target: () => supervisor.cpAddress(), accessKey: () => secrets.get().cpAccessKey });
-  supervisor = createSupervisor({ docker, settings, secrets, cpTrust, names, owner, dataDir: config.dataDir, detectBind, fetchCcModels: ccModels, cpSession, relay, ...supervisorOptions });
+  supervisor = createSupervisor({ docker, settings, secrets, names, owner, dataDir: config.dataDir, detectBind, fetchCcModels: ccModels, cpSession, relay, ...supervisorOptions });
   const scopes = createScopesStore(config.dataDir);
   const cc = createCcClient({ conductorUrl: config.conductorUrl });
   const activity = createActivityLog({ dataDir: config.dataDir });
@@ -82,7 +80,7 @@ export function createApp(config, overrides = {}) {
     placements: createPlacementCache(config.dataDir),
     transcriptsRoot: config.claudeProjectsDir,
   });
-  const jobs = createJobs({ docker, supervisor, cpTrust, names, owner, dataDir: config.dataDir, kinds: backfill.kinds });
+  const jobs = createJobs({ docker, supervisor, names, owner, dataDir: config.dataDir, kinds: backfill.kinds });
   const cpProxy = createCpProxy({ target: supervisor.cpTarget, session: cpSession, notReadyError: supervisor.notReadyError });
   const memory = createMemory({ scopes, cc, activity, hindsight, cursors });
   const hookRoutes = createHookRoutes({ memory });
@@ -114,6 +112,6 @@ export function createApp(config, overrides = {}) {
         if (!res.headersSent) sendText(res, 500, 'Internal error'); else res.destroy();
       });
     },
-    supervisor, jobs, docker, settings, secrets, cpTrust, names, owner, cpSession, scopes, memory, activity, backfill,
+    supervisor, jobs, docker, settings, secrets, names, owner, cpSession, scopes, memory, activity, backfill,
   };
 }

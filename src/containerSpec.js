@@ -47,7 +47,7 @@ export function embeddingsEnv(settings, secrets) {
 /**
  * @param {object} o
  * @param {ReturnType<typeof resourceNames>} o.names
- * @param {{id: string}} o.image a verified image ID: containers run by ID, never by a tag
+ * @param {{id: string}} o.image the image ID the pinned tag resolved to at start; containers run by it, so a re-pulled tag recreates them
  * @param {string} o.variant full | slim
  * @param {string} o.bind host address the port is published on
  * @param {number} o.port host port
@@ -83,7 +83,7 @@ export function apiSpec({ names, image, variant, bind, port, apiKey, llmEnv, emb
 /**
  * @param {object} o
  * @param {ReturnType<typeof resourceNames>} o.names
- * @param {{id: string}} o.image a verified image ID: containers run by ID, never by a tag
+ * @param {{id: string}} o.image the image ID the pinned tag resolved to at start; containers run by it, so a re-pulled tag recreates them
  * @param {string} o.bind
  * @param {number} o.port
  * @param {string} o.apiKey the API key the CP sends to the API
@@ -108,12 +108,12 @@ export function cpSpec({ names, image, bind, port, apiKey, accessKey, owner }) {
 }
 
 /**
- * The relay: runs from the verified API image (which carries Node), reachable by the
+ * The relay: runs from the API image (which carries Node), reachable by the
  * API under the target's alias on the private network. Only the tunnel port is published; the
  * API-facing port is not.
  * @param {object} o
  * @param {ReturnType<typeof resourceNames>} o.names
- * @param {{id: string}} o.image the verified API image
+ * @param {{id: string}} o.image the API image
  * @param {string} o.bind
  * @param {number} o.port host port the tunnel is published on
  * @param {string} o.key the relay key

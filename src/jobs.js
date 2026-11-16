@@ -13,13 +13,13 @@ import {
 } from './pins.js';
 import { AppError, toAppError } from './errors.js';
 import { ensurePrivateDir } from './fsPrivate.js';
-import { IMAGE_ID_RE, isPinnedApiImage, isPinnedHelper } from './trust.js';
+import { isOurCpBuild } from './trust.js';
 import { createTarAppender, createTarScanner } from './tarStream.js';
 
 /** The Docker actions: they resolve docker first and re-read Hindsight's state after. */
-export const JOB_KINDS = Object.freeze(['pull', 'build-cp', 'import', 'trust-cp', 'export', 'remove-images', 'delete-volume']);
+export const JOB_KINDS = Object.freeze(['pull', 'build-cp', 'import', 'export', 'remove-images', 'delete-volume']);
 /** Jobs that can fix a start precondition; only these may start Hindsight when they succeed. */
-const PRECONDITION_JOBS = new Set(['pull', 'build-cp', 'import', 'trust-cp']);
+const PRECONDITION_JOBS = new Set(['pull', 'build-cp', 'import']);
 /** The file inside an exported bundle that lists the image IDs it carries. */
 export const BUNDLE_MANIFEST = 'code-hindsight-bundle.json';
 const TAIL_LINES = 200;
@@ -47,14 +47,13 @@ const BUNDLE_RE = /^code-hindsight-[0-9A-Za-z.-]+-(full|slim)\.tar$/;
  * @param {object} o
  * @param {ReturnType<import('./docker.js').createDocker>} o.docker
  * @param {{afterPrecondition(): Promise<void>, refresh(): Promise<void>}} o.supervisor
- * @param {ReturnType<import('./trust.js').createCpTrust>} o.cpTrust
  * @param {ReturnType<import('./containerSpec.js').resourceNames>} o.names
  * @param {string} o.owner
  * @param {string} o.dataDir
  * @param {Record<string, {validate(params: unknown): object, run(params: object, io: {line(l: string): void, progress(done: number, total: number, unit: string): void, signal: AbortSignal}): Promise<unknown>, cancellable: boolean}>} [o.kinds]
  *   registered kinds: `validate` throws a catalog error or returns the params `run` gets
  */
-export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir, kinds = {}, now = () => Date.now() }) {
+export function createJobs({ docker, supervisor, names, owner, dataDir, kinds = {}, now = () => Date.now() }) {
   const logDir = path.join(dataDir, 'logs', 'jobs');
   const bundleDir = path.join(dataDir, 'bundles');
   const jobs = new Map();
@@ -82,11 +81,11 @@ export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir,
 
   const loadedFrom = (lines) => lines.map((l) => /^Loaded image(?: ID)?: (.+)$/.exec(l.trim())?.[1]).filter(Boolean);
 
-  /** A loaded image's trust standing, for the import result. */
-  function standing(ref, id) {
-    const variant = VARIANTS.find((v) => API_IMAGES[v].ref === ref);
-    if (variant) return { ref, id, status: isPinnedApiImage(variant, id) ? 'pinned' : 'not-pinned' };
-    if (ref === CP_IMAGE) return { ref, id, status: cpTrust.get()?.id === id ? 'trusted' : 'needs-confirmation' };
+  /** A loaded image's standing, for the import result: whether it will run. */
+  function standing(ref, img) {
+    const id = img?.Id ?? ref;
+    if (VARIANTS.some((v) => API_IMAGES[v].ref === ref)) return { ref, id, status: 'pinned' };
+    if (ref === CP_IMAGE) return { ref, id, status: isOurCpBuild(img) ? 'pinned' : 'wrong-build' };
     return { ref, id, status: 'unused' };
   }
 
@@ -126,22 +125,16 @@ export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir,
     async pull({ variant }, line) {
       await docker.pull(API_IMAGES[variant].ref, line);
       const img = await docker.inspectImage(API_IMAGES[variant].ref);
-      return { image: API_IMAGES[variant].ref, id: img?.Id ?? null, pinned: !!img && isPinnedApiImage(variant, img.Id) };
+      return { image: API_IMAGES[variant].ref, id: img?.Id ?? null };
     },
     async 'build-cp'(_p, line) {
-      // The helper gets the Docker socket: resolve it by digest, verify its ID, run it by ID.
-      let helper = await docker.inspectImage(BUILD_HELPER.ref);
-      if (!helper) {
-        line(`docker pull ${BUILD_HELPER.ref}`);
-        await docker.pull(BUILD_HELPER.ref, line);
-        helper = await docker.inspectImage(BUILD_HELPER.ref);
+      if (!(await docker.inspectImage(BUILD_HELPER))) {
+        line(`docker pull ${BUILD_HELPER}`);
+        await docker.pull(BUILD_HELPER, line);
       }
-      if (!helper || !isPinnedHelper(helper.Id)) throw new AppError('HELPER_UNTRUSTED', { image: BUILD_HELPER.ref, id: helper?.Id ?? 'none' });
-      await docker.runHelper(names.build, helper.Id, buildCpCommand(), line);
+      await docker.runHelper(names.build, BUILD_HELPER, buildCpCommand(), line);
       const built = await docker.inspectImage(CP_IMAGE);
       if (!built) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
-      cpTrust.set(built.Id, 'build');
-      line(`trusted ${CP_IMAGE} as ${built.Id}`);
       return { image: CP_IMAGE, id: built.Id };
     },
     async import({ stdin, path: file }, line) {
@@ -161,17 +154,9 @@ export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir,
       const loaded = [];
       for (const ref of loadedFrom(lines)) {
         const img = await docker.inspectImage(ref);
-        loaded.push(standing(ref, img?.Id ?? ref));
+        loaded.push(standing(ref, img));
       }
       return { loaded, manifest };
-    },
-    async 'trust-cp'({ confirm }, line) {
-      const cp = await docker.inspectImage(CP_IMAGE);
-      if (!cp) throw new AppError('CP_IMAGE_MISSING', { image: CP_IMAGE });
-      if (cp.Id !== confirm) throw new AppError('CONFIRMATION_REQUIRED', { expected: cp.Id });
-      cpTrust.set(cp.Id, 'confirmed');
-      line(`trusted ${CP_IMAGE} as ${cp.Id}`);
-      return { image: CP_IMAGE, id: cp.Id };
     },
     export: ({ variant }, line) => exportBundle(variant, line),
     async 'remove-images'(_p, line) {
@@ -211,10 +196,6 @@ export function createJobs({ docker, supervisor, cpTrust, names, owner, dataDir,
       if (!st.isFile()) throw new AppError('IMPORT_PATH_INVALID', { path: p.path, detail: 'not a regular file' });
       try { fs.accessSync(p.path, fs.constants.R_OK); } catch { throw new AppError('IMPORT_PATH_INVALID', { path: p.path, detail: 'not readable' }); }
       return { path: p.path };
-    }
-    if (kind === 'trust-cp') {
-      if (typeof p.confirm !== 'string' || !IMAGE_ID_RE.test(p.confirm)) throw new AppError('CONFIRMATION_REQUIRED', { expected: 'the control-plane image ID (sha256:…)' });
-      return { confirm: p.confirm };
     }
     if (kind === 'remove-images') {
       if (p.confirm !== true) throw new AppError('CONFIRMATION_REQUIRED', { expected: 'confirm: true' });

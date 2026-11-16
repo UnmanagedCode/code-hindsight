@@ -38,7 +38,7 @@ export const settingsView = (over: Partial<SettingsView> = {}): SettingsView => 
   secrets: { llmApiKey: false, embeddingsApiKey: false },
   detectedBindAddress: '172.20.0.1',
   choices: { variants: ['full', 'slim'], llmModes: ['none', 'manual', 'cc-backend'], embeddingsProviders: ['local', 'openai'], rerankerProviders: ['local', 'rrf'], llmMaxConcurrentMax: 256 },
-  images: { api: { full: { ref: 'ghcr.io/vectorize-io/hindsight:1.2.1', version: '1.2.1' }, slim: { ref: 'ghcr.io/vectorize-io/hindsight:1.2.1-slim', version: '1.2.1-slim' } }, cp: 'code-hindsight-cp:1.2.1', version: '1.2.1' },
+  images: { api: { full: { ref: 'ghcr.io/vectorize-io/hindsight:1.2.1' }, slim: { ref: 'ghcr.io/vectorize-io/hindsight:1.2.1-slim' } }, cp: 'code-hindsight-cp:1.2.1', version: '1.2.1' },
   ...over,
 });
 
