@@ -7,7 +7,7 @@ import path from 'node:path';
 import { ensurePrivateDir } from './fsPrivate.js';
 
 export const ACTIVITY_LIMITS = Object.freeze({ ringSize: 500, rotateBytes: 1024 * 1024, messageMax: 300 });
-const FIELDS = ['event', 'outcome', 'sessionId', 'project', 'worktree', 'stage', 'kind', 'banks', 'count', 'code', 'message'];
+const FIELDS = ['event', 'outcome', 'sessionId', 'project', 'worktree', 'stage', 'kind', 'banks', 'count', 'code', 'message', 'durationMs', 'timing'];
 
 export function createActivityLog({ dataDir, now = () => Date.now(), log = console.error }) {
   const dir = ensurePrivateDir(path.join(dataDir, 'logs'));

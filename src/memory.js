@@ -44,11 +44,26 @@ function cleanText(text, max) {
  * @param {ReturnType<import('./retainCursor.js').createRetainCursors>} o.cursors
  * @param {ReturnType<import('./activity.js').createActivityLog>} o.activity
  */
-export function createMemory({ scopes, cc, hindsight, cursors, activity, limits = MEMORY_LIMITS, now = () => Date.now() }) {
+export function createMemory({ scopes, cc, hindsight, cursors, activity, limits = MEMORY_LIMITS, now = () => Date.now(), clock = () => performance.now() }) {
   /** sessionId → ids of memories already injected into its current context (insertion-ordered, bounded). */
   const injected = new Map();
-  /** sessionId → {tail, dirty, done}: at most one retain in flight per session; `tail` is the newest transcript tail seen. */
+  /** sessionId → {tail, dirty, done, stops}: at most one retain in flight per session; `tail` is the newest transcript tail seen; `stops` maps a window's lastId to the timing of the Stop that recorded it. */
   const workers = new Map();
+
+  /** Whole milliseconds since a `clock()` reading (monotonic; `now` is the wall clock for timestamps). */
+  const since = (t0) => Math.max(0, Math.round(clock() - t0));
+  /** Run `fn`, recording how long it took (even when it throws) as `spans[key]`. */
+  async function timed(spans, key, fn) {
+    const t = clock();
+    try { return await fn(); } finally { spans[key] = since(t); }
+  }
+  /** The timing breakdown of an action that began at `t0`, from the spans measured so far. */
+  const snapshot = (t0, spans) => ({ totalMs: since(t0), ...spans });
+  /** The duration fields of an entry: `durationMs` is the given step's, or the total when omitted (one clock read either way). */
+  const took = (t0, spans, durationMs) => {
+    const timing = snapshot(t0, spans);
+    return { durationMs: durationMs ?? timing.totalMs, timing };
+  };
 
   const ctx = (s) => (s ? { project: s.project, worktree: s.worktree, stage: s.stage, kind: s.kind } : {});
   const fail = (event, session, sessionId, e, extra = {}) => activity.add({
@@ -63,24 +78,32 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     }
   }
 
-  async function resolve(event, sessionId, signal) {
-    try { return await cc.resolveSession(sessionId, signal && { signal }); } catch (e) {
-      activity.add({ event, outcome: e.code === 'SESSION_NOT_LIVE' ? 'skipped' : 'error', sessionId, code: e.code ?? 'SESSION_UNRESOLVED', message: e.message });
+  async function resolve(event, sessionId, signal, t0, spans) {
+    try { return await timed(spans, 'sessionMs', () => cc.resolveSession(sessionId, signal && { signal })); } catch (e) {
+      activity.add({ event, outcome: e.code === 'SESSION_NOT_LIVE' ? 'skipped' : 'error', sessionId, code: e.code ?? 'SESSION_UNRESOLVED', message: e.message, ...took(t0, spans, spans.sessionMs) });
       return null;
     }
   }
 
-  const placeWorkspace = (list, session, signal) => withWorkspace(list, session, signal ? (p) => cc.workspaceOf(p, { signal }) : cc.workspaceOf);
+  const placeWorkspace = (list, session, signal, spans) => withWorkspace(list, session, (p) => timed(spans, 'workspaceMs', () => (signal ? cc.workspaceOf(p, { signal }) : cc.workspaceOf(p))));
 
-  function logSkipped(event, session, m) {
-    for (const k of m.skipped) fail(event, session, session.sessionId, new AppError(k.code, { scope: k.scope, detail: k.detail }));
+  function logSkipped(event, session, m, timing = {}) {
+    for (const k of m.skipped) fail(event, session, session.sessionId, new AppError(k.code, { scope: k.scope, detail: k.detail }), k.code === 'WORKSPACE_UNRESOLVED' ? timing : {});
   }
 
   /** Recall every bank in parallel; a bank that fails or times out is reported, the others are used. */
   async function recallBanks(banks, query, signal) {
     return Promise.all(banks.map(async ({ bank }) => {
-      try { return { bank, results: await hindsight.recall(bank, query, { signal }) }; } catch (error) { return { bank, error }; }
+      const t = clock();
+      try { return { bank, results: await hindsight.recall(bank, query, { signal }), ms: since(t) }; } catch (error) { return { bank, error, ms: since(t) }; }
     }));
+  }
+
+  /** Fan out to the banks and return their answers with the whole recall's timing (fan-out and per-bank times included). */
+  async function recallTimed(banks, query, signal, t0, spans) {
+    const perBank = await timed(spans, 'hindsightMs', () => recallBanks(banks, query, signal));
+    const timing = { ...snapshot(t0, spans), banks: perBank.map((b) => ({ bank: b.bank, ms: b.ms, ...(b.error ? { code: b.error.code ?? 'INTERNAL' } : {}) })) };
+    return { perBank, timing };
   }
 
   /** The injected block for results already fetched; null when nothing fits or is new. */
@@ -191,7 +214,7 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     if (newest && newest.bank === w.bank && turns.some((t) => t.id === newest.lastId)) pending[pending.length - 1] = w; else pending.push(w);
     while (pending.length > limits.retainQueueMax && pending.some((p) => p.bank)) shed(sessionId, session, turns, boundary, pending);
     cursors.set(sessionId, { lastId: cursor.lastId, lastTs: cursor.lastTs, ...(cursor.inflight ? { inflight: cursor.inflight } : {}), pending });
-    return true;
+    return w;
   }
 
   const buildItem = (sessionId, delta, ses) => buildRetainItem({
@@ -205,21 +228,32 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
    */
   async function drain(sessionId, worker) {
     let fresh = false;
+    /** The Stop that recorded the batch now in flight, while this worker sent it for the first time. */
+    let stop = null;
     for (;;) {
       const cursor = readCursor(sessionId);
       if (!cursor) return;
       if (cursor.inflight) {
         const inf = cursor.inflight;
-                if (!hindsight.isReady()) return fail('retain', inf.session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks: [inf.bank] });
-        try { await hindsight.retain(inf.bank, inf.item, { operationId: inf.operationId }); } catch (e) { return fail('retain', inf.session, sessionId, e, { banks: [inf.bank] }); }
+        if (!hindsight.isReady()) return fail('retain', inf.session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks: [inf.bank] });
+        const spans = {};
+        // With the Stop's own timing, the batch's total runs from that Stop to Hindsight's answer.
+        const timingOf = () => (fresh && stop ? { totalMs: since(stop.t0), ...stop.spans, ...spans } : { ...spans });
+        try { await timed(spans, 'hindsightMs', () => hindsight.retain(inf.bank, inf.item, { operationId: inf.operationId })); } catch (e) {
+          return fail('retain', inf.session, sessionId, e, { banks: [inf.bank], durationMs: spans.hindsightMs, timing: timingOf() });
+        }
         update(sessionId, { lastId: inf.lastId, lastTs: inf.lastTs, inflight: undefined });
-        activity.add({ event: 'retain', outcome: 'ok', sessionId, ...inf.session, banks: [inf.bank], count: inf.count, ...(fresh ? {} : { message: 'resent an unacknowledged batch' }) });
+        const timing = timingOf();
+        activity.add({ event: 'retain', outcome: 'ok', sessionId, ...inf.session, banks: [inf.bank], count: inf.count, ...(fresh ? {} : { message: 'resent an unacknowledged batch' }), durationMs: timing.totalMs ?? spans.hindsightMs, timing });
         fresh = false;
+        stop = null;
         continue;
       }
       const win = cursor.pending[0];
       if (!win) return;
       const rest = cursor.pending.slice(1);
+      const winStop = worker.stops.get(win.lastId);
+      worker.stops.delete(win.lastId);
       // Never move the cursor backwards: a window provably at or behind it (a late Stop) is dropped from
       // the list and the cursor stays. Its turns were already passed (sent, or reported as lost).
       if (provablyBehind(worker.tail, win, cursor)) {
@@ -248,7 +282,16 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
       };
       update(sessionId, { inflight, pending: rest });
       fresh = true;
+      stop = winStop ?? null;
     }
+  }
+
+  /** Forget the Stops of windows that no longer exist (replaced by a newer Stop, or merged away by `shed`). */
+  function pruneStops(sessionId, worker) {
+    const pending = cursors.get(sessionId)?.pending;
+    if (!Array.isArray(pending)) return;
+    const live = new Set(pending.map((p) => p.lastId));
+    for (const id of worker.stops.keys()) if (!live.has(id)) worker.stops.delete(id);
   }
 
   /**
@@ -256,11 +299,18 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
    * marked dirty, so it drains once more before it ends: a window recorded just as a drain finishes
    * is never left without a worker.
    */
-  function kick(sessionId, turns) {
+  function kick(sessionId, turns, win, { t0, ...spans }) {
     const running = workers.get(sessionId);
     // The newest tail is the one windows are placed in: a late, older Stop does not replace it.
-    if (running) { if (!isOlderTail(turns, running.tail)) running.tail = turns; running.dirty = true; return; }
-    const w = { tail: turns, dirty: false, done: null };
+    if (running) {
+      if (!isOlderTail(turns, running.tail)) running.tail = turns;
+      running.dirty = true;
+      running.stops.set(win.lastId, { t0, spans });
+      pruneStops(sessionId, running);
+      return;
+    }
+    const w = { tail: turns, dirty: false, done: null, stops: new Map([[win.lastId, { t0, spans }]]) };
+    pruneStops(sessionId, w);
     workers.set(sessionId, w);
     w.done = (async () => {
       try {
@@ -276,51 +326,56 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
      * Never throws.
      */
     async recallForHook(sessionId, prompt) {
+      const t0 = clock();
+      const spans = {};
       const signal = AbortSignal.timeout(limits.recallDeadlineMs);
       try {
         const list = loadScopes('recall', sessionId);
         if (!list.some(isScopeEnabled)) return NONE;
-        const resolved = await resolve('recall', sessionId, signal);
+        const resolved = await resolve('recall', sessionId, signal, t0, spans);
         if (!resolved) return NONE;
-        const session = await placeWorkspace(list, resolved, signal);
+        const session = await placeWorkspace(list, resolved, signal, spans);
         const m = matchScopes(list, session);
-        logSkipped('recall', session, m);
+        logSkipped('recall', session, m, took(t0, spans, spans.workspaceMs));
         if (!m.recall.length) return NONE;
         const banks = m.recall.map((r) => r.bank);
         if (!hindsight.isReady()) {
-          fail('recall', session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks });
+          fail('recall', session, sessionId, new AppError('HINDSIGHT_NOT_READY'), { banks, ...took(t0, spans) });
           return NONE;
         }
-        const perBank = await recallBanks(m.recall, prompt, signal);
-        for (const b of perBank) if (b.error) fail('recall', session, sessionId, b.error, { banks: [b.bank] });
+        const { perBank, timing } = await recallTimed(m.recall, prompt, signal, t0, spans);
+        for (const b of perBank) if (b.error) fail('recall', session, sessionId, b.error, { banks: [b.bank], durationMs: b.ms, timing });
         const out = formatContext(perBank, injected.get(sessionId));
-        activity.add({ event: 'recall', outcome: 'ok', sessionId, ...ctx(session), banks: perBank.filter((b) => b.results).map((b) => b.bank), count: out?.count ?? 0 });
+        activity.add({ event: 'recall', outcome: 'ok', sessionId, ...ctx(session), banks: perBank.filter((b) => b.results).map((b) => b.bank), count: out?.count ?? 0, durationMs: timing.totalMs, timing });
         return { context: out?.context ?? null, commit: () => { if (out) markInjected(sessionId, out.ids); } };
       } catch (e) {
-        fail('recall', null, sessionId, e);
+        fail('recall', null, sessionId, e, took(t0, spans));
         return NONE;
       }
     },
 
     /** Queue the newest turns for retain. Answers once the scopes are matched; sending happens after. Never throws. */
     async retainForHook(sessionId, turns) {
+      const t0 = clock();
+      const spans = {};
       try {
         const list = loadScopes('retain', sessionId);
         // Deliberately "no scopes", not "no enabled scopes": with scopes all disabled the Stop still
         // matches nothing and advances the cursor, so turns of a disabled stretch are never sent later.
         if (!list.length) return { status: 'off' };
         if (!turns.length) return { status: 'empty' };
-        const resolved = await resolve('retain', sessionId);
+        const resolved = await resolve('retain', sessionId, undefined, t0, spans);
         if (!resolved) return { status: 'unresolved' };
-        const session = await placeWorkspace(list, resolved);
+        const session = await placeWorkspace(list, resolved, undefined, spans);
         const m = matchScopes(list, session);
-        logSkipped('retain', session, m);
+        logSkipped('retain', session, m, took(t0, spans, spans.workspaceMs));
         // Like an unresolved session: nothing recorded, so the next Stop that resolves takes these turns.
         if (m.retainUnresolved) return { status: 'unresolved' };
-        if (record(sessionId, turns, session, m.retain)) kick(sessionId, turns);
+        const win = record(sessionId, turns, session, m.retain);
+        if (win) kick(sessionId, turns, win, { t0, acceptMs: since(t0), ...spans });
         return { status: 'accepted' };
       } catch (e) {
-        fail('retain', null, sessionId, e);
+        fail('retain', null, sessionId, e, took(t0, spans));
         return { status: 'error' };
       }
     },
@@ -334,35 +389,37 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
      */
     async recallForMcp(sessionId, query) {
       if (!sessionId) throw new AppError('NO_SESSION');
+      const t0 = clock();
+      const spans = {};
       const signal = AbortSignal.timeout(limits.recallDeadlineMs);
       const list = loadScopes('mcp-recall', sessionId);
       if (!list.some(isScopeEnabled)) throw new AppError('NO_RECALL_SCOPE');
       let resolved;
-      try { resolved = await cc.resolveSession(sessionId, { signal }); } catch (e) {
-        activity.add({ event: 'mcp-recall', outcome: e.code === 'SESSION_NOT_LIVE' ? 'skipped' : 'error', sessionId, code: e.code, message: e.message });
+      try { resolved = await timed(spans, 'sessionMs', () => cc.resolveSession(sessionId, { signal })); } catch (e) {
+        activity.add({ event: 'mcp-recall', outcome: e.code === 'SESSION_NOT_LIVE' ? 'skipped' : 'error', sessionId, code: e.code, message: e.message, ...took(t0, spans, spans.sessionMs) });
         throw e;
       }
-      const session = await placeWorkspace(list, resolved, signal);
+      const session = await placeWorkspace(list, resolved, signal, spans);
       const m = matchScopes(list, session);
-      logSkipped('mcp-recall', session, m);
+      logSkipped('mcp-recall', session, m, took(t0, spans, spans.workspaceMs));
       const undecided = m.skipped.find((k) => k.code === 'WORKSPACE_UNRESOLVED');
       // Already logged by logSkipped; the caller learns why rather than a plain "no scope".
       if (!m.recall.length && undecided) throw new AppError('WORKSPACE_UNRESOLVED', { scope: undecided.scope, detail: undecided.detail });
       if (!m.recall.length) {
-        activity.add({ event: 'mcp-recall', outcome: 'skipped', sessionId, ...ctx(session), code: 'NO_RECALL_SCOPE' });
+        activity.add({ event: 'mcp-recall', outcome: 'skipped', sessionId, ...ctx(session), code: 'NO_RECALL_SCOPE', ...took(t0, spans) });
         throw new AppError('NO_RECALL_SCOPE');
       }
       const banks = m.recall.map((r) => r.bank);
       if (!hindsight.isReady()) {
         const e = new AppError('HINDSIGHT_NOT_READY');
-        fail('mcp-recall', session, sessionId, e, { banks });
+        fail('mcp-recall', session, sessionId, e, { banks, ...took(t0, spans) });
         throw e;
       }
-      const perBank = await recallBanks(m.recall, query, signal);
-      for (const b of perBank) if (b.error) fail('mcp-recall', session, sessionId, b.error, { banks: [b.bank] });
+      const { perBank, timing } = await recallTimed(m.recall, query, signal, t0, spans);
+      for (const b of perBank) if (b.error) fail('mcp-recall', session, sessionId, b.error, { banks: [b.bank], durationMs: b.ms, timing });
       if (perBank.every((b) => b.error)) throw perBank[0].error;
       const out = formatContext(perBank, null);
-      activity.add({ event: 'mcp-recall', outcome: 'ok', sessionId, ...ctx(session), banks: perBank.filter((b) => b.results).map((b) => b.bank), count: out?.count ?? 0 });
+      activity.add({ event: 'mcp-recall', outcome: 'ok', sessionId, ...ctx(session), banks: perBank.filter((b) => b.results).map((b) => b.bank), count: out?.count ?? 0, durationMs: timing.totalMs, timing });
       return out?.context ?? 'No matching memories.';
     },
 
