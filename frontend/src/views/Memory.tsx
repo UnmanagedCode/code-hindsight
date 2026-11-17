@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { ArrowDownIcon, ArrowUpIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon, Trash2Icon } from 'lucide-react';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { NameListInput } from '@/components/NameListInput';
 import { Backfill } from '@/views/Backfill';
+import { formatDuration, TimingBreakdown } from '@/components/ActivityDuration';
 import { api, ApiError, send } from '@/lib/api';
 import type { ActivityEntry, CcProjectsView, FieldError, Scope, ScopesView, StagesView, Status } from '@/lib/types';
 
@@ -111,8 +112,22 @@ function summarize(f: ScopeForm): string {
   return [...(narrowing.length ? narrowing : ['any session']), `bank ${f.bank}`, actions.length ? actions.join(', ') : 'no actions'].join(' · ');
 }
 
+/** A key built from an entry's content plus its occurrence among identical ones, so it survives new entries arriving above it. */
+function rowKeys(entries: ActivityEntry[]): string[] {
+  const seen = new Map<string, number>();
+  return entries.map((e) => {
+    const base = JSON.stringify([e.at, e.event, e.sessionId, e.banks, e.code]);
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    return `${base}#${n}`;
+  });
+}
+
 function Activity() {
   const [entries, setEntries] = useState<ActivityEntry[] | null>(null);
+  const [open, setOpen] = useState<Set<string>>(new Set());
+  const keys = useMemo(() => rowKeys(entries ?? []), [entries]);
+  const toggle = (key: string) => setOpen((o) => { const n = new Set(o); if (!n.delete(key)) n.add(key); return n; });
   const load = useCallback(() => { api<{ entries: ActivityEntry[] }>('-/api/memory/activity').then((r) => setEntries(r.entries), () => {}); }, []);
   useEffect(() => {
     load();
@@ -131,19 +146,33 @@ function Activity() {
             : (
               <div className="overflow-x-auto">
                 <table className="w-full text-left text-xs">
-                  <thead><tr className="text-muted-foreground"><th className="pr-2">Time</th><th className="pr-2">Event</th><th className="pr-2">Session</th><th className="pr-2">Project · stage</th><th className="pr-2">Banks</th><th className="pr-2">#</th><th>Result</th></tr></thead>
+                  <thead><tr className="text-muted-foreground"><th className="pr-2">Time</th><th className="pr-2">Event</th><th className="pr-2">Session</th><th className="pr-2">Project · stage</th><th className="pr-2">Banks</th><th className="pr-2">#</th><th className="pr-2">Took</th><th>Result</th></tr></thead>
                   <tbody>
-                    {entries.map((e, i) => (
-                      <tr key={`${e.at}-${i}`} data-outcome={e.outcome} className={e.outcome === 'error' ? 'text-destructive' : e.outcome === 'skipped' ? 'text-muted-foreground' : ''}>
+                    {entries.flatMap((e, i) => {
+                      const key = keys[i];
+                      const expanded = open.has(key);
+                      const panel = `timing-${i}`;
+                      return [(
+                      <tr key={key} data-outcome={e.outcome} className={e.outcome === 'error' ? 'text-destructive' : e.outcome === 'skipped' ? 'text-muted-foreground' : ''}>
                         <td className="pr-2 whitespace-nowrap">{e.at.replace('T', ' ').replace(/\.\d+Z$/, 'Z')}</td>
                         <td className="pr-2">{e.event}</td>
                         <td className="pr-2">{e.sessionId ?? ''}</td>
                         <td className="pr-2">{[e.project, e.stage].filter(Boolean).join(' · ')}</td>
                         <td className="pr-2">{(e.banks ?? []).join(', ')}</td>
                         <td className="pr-2">{e.count ?? ''}</td>
+                        <td className="pr-2 whitespace-nowrap">
+                          {e.durationMs === undefined ? null : e.timing === undefined ? formatDuration(e.durationMs) : (
+                            <Button type="button" variant="ghost" size="sm" className="h-6 px-1 text-xs" aria-expanded={expanded} aria-controls={panel} onClick={() => toggle(key)}>
+                              {formatDuration(e.durationMs)}
+                            </Button>
+                          )}
+                        </td>
                         <td>{e.outcome === 'ok' ? 'ok' : `${e.code ?? e.outcome}${e.message ? `: ${e.message}` : ''}`}</td>
                       </tr>
-                    ))}
+                      ), ...(expanded && e.timing ? [(
+                        <tr key={`${key}-timing`}><td colSpan={8}><TimingBreakdown id={panel} timing={e.timing} /></td></tr>
+                      )] : [])];
+                    })}
                   </tbody>
                 </table>
               </div>

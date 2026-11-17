@@ -238,4 +238,21 @@ export interface ActivityEntry {
   count?: number;
   code?: string;
   message?: string;
+  /** How long the step this entry reports took; absent when not measured and on older entries. */
+  durationMs?: number;
+  timing?: ActivityTiming;
+}
+
+/** Where one activity entry's action spent its time, backend-side; only what was measured is present. */
+export interface ActivityTiming {
+  totalMs?: number;
+  /** Retain: how long the hook waited for the Stop to be accepted. */
+  acceptMs?: number;
+  /** cc's session lookup. */
+  sessionMs?: number;
+  /** cc's workspace lookup; about 0 when served from its cache. */
+  workspaceMs?: number;
+  /** Hindsight calls: the recall fan-out, or the retain send. */
+  hindsightMs?: number;
+  banks?: { bank: string; ms: number; code?: string }[];
 }
