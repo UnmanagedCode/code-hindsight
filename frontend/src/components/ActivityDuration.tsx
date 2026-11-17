@@ -2,8 +2,10 @@ import type { ActivityTiming } from '@/lib/types';
 
 export function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms} ms`;
-  if (ms < 120_000) return `${(ms / 1000).toFixed(1)} s`;
-  return `${Math.floor(ms / 60_000)} min ${Math.round((ms % 60_000) / 1000)} s`;
+  const tenths = Math.round(ms / 100);
+  if (tenths < 600) return `${(tenths / 10).toFixed(1)} s`;
+  const seconds = Math.round(ms / 1000);
+  return `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
 }
 
 const STEPS: { key: Exclude<keyof ActivityTiming, 'banks'>; label: string }[] = [

@@ -88,13 +88,15 @@ test('a bank that hit the recall deadline is logged with its own duration, and t
   await x.settle(await x.ports.session.next(), 10, SESSION);
   const fast = await x.ports.recall.next();
   const slow = await x.ports.recall.next();
-  await x.settle(fast, 50, []);
+  // The failing bank settles first, so its own time (150) differs from the fan-out's (200).
   await x.settle(slow, 150, new AppError('RECALL_FAILED', { bank: 'slow', detail: 'no answer before the recall deadline' }));
+  await x.settle(fast, 50, []);
   await done;
   const [bankErr] = x.entries((a) => a.code === 'RECALL_FAILED');
-  assert.equal(bankErr.durationMs, 200);
+  assert.equal(bankErr.durationMs, 150);
   const [ok] = x.entries((a) => a.outcome === 'ok');
-  assert.deepEqual(ok.timing.banks, [{ bank: 'fast', ms: 50 }, { bank: 'slow', ms: 200, code: 'RECALL_FAILED' }]);
+  assert.deepEqual(ok.timing.banks, [{ bank: 'fast', ms: 200 }, { bank: 'slow', ms: 150, code: 'RECALL_FAILED' }]);
+  assert.equal(ok.timing.hindsightMs, 200);
 });
 
 test('the recall tool keeps the breakdown when every bank failed: each per-bank entry carries the whole recall\'s timing', async (t) => {
