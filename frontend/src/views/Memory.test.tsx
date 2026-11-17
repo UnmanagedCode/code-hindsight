@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { Memory } from './Memory';
@@ -377,5 +377,49 @@ describe('Memory scope switch', () => {
     stub({ scopes: [scope('alpha', { enabled: false }), scope('beta', { enabled: false })] });
     render(<Memory status={status()} />);
     expect((await screen.findByText(/Memory is off/)).textContent).toMatch(/every scope is disabled/);
+  });
+
+  /** A PUT that answers only when `release` is called; counts the PUTs made. */
+  function deferredPut() {
+    stub({ scopes: [scope('alpha'), scope('beta')] });
+    const base = globalThis.fetch;
+    let puts = 0;
+    let release = () => {};
+    vi.stubGlobal('fetch', (url: RequestInfo | URL, init?: RequestInit) => {
+      if (String(url) !== '-/api/scopes' || init?.method !== 'PUT') return base(url, init);
+      puts++;
+      const sent = JSON.parse(String(init.body));
+      return new Promise<Response>((resolve) => {
+        release = () => resolve(new Response(JSON.stringify({ scopes: sent.scopes }), { status: 200, headers: { 'content-type': 'application/json' } }));
+      });
+    });
+    return { puts: () => puts, release: () => release() };
+  }
+
+  it('the switches are disabled while a save is in flight, so a second click sends no second PUT', async () => {
+    const d = deferredPut();
+    render(<Memory status={status()} />);
+    await userEvent.click(await sw('alpha'));
+    await waitFor(() => expect(d.puts()).toBe(1));
+    const beta = await sw('beta');
+    expect((beta as HTMLButtonElement).disabled).toBe(true);
+    await userEvent.click(beta);
+    expect(d.puts()).toBe(1);
+    d.release();
+    await waitFor(() => expect((screen.getByRole('switch', { name: 'beta enabled' }) as HTMLButtonElement).disabled).toBe(false));
+  });
+
+  it('a card expanded while a save is in flight stays expanded after the save answers', async () => {
+    const d = deferredPut();
+    render(<Memory status={status()} />);
+    const header = await screen.findByRole('button', { name: /^beta/ });
+    expect(header.getAttribute('aria-expanded')).toBe('false');
+    await userEvent.click(await sw('alpha'));
+    await waitFor(() => expect(d.puts()).toBe(1));
+    await userEvent.click(header);
+    expect(header.getAttribute('aria-expanded')).toBe('true');
+    d.release();
+    await waitFor(() => expect((screen.getByRole('switch', { name: 'alpha enabled' }) as HTMLButtonElement).disabled).toBe(false));
+    expect(screen.getByRole('button', { name: /^beta/ }).getAttribute('aria-expanded')).toBe('true');
   });
 });

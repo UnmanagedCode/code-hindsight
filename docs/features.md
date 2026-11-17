@@ -57,7 +57,7 @@ Saved with **Save**; **Apply & restart** saves and reconciles the containers to 
 
 ## Memory
 
-Gives cc sessions memory. **Off by default:** with no enabled scope every session is memoryless and the hooks answer without calling cc or Hindsight. Hooks and the recall tool are frozen into a session when cc spawns it, so enabling the plugin (or adding the first scope's hooks) reaches sessions started afterwards; scopes themselves are read on every prompt.
+Gives cc sessions memory. **Off by default:** with no scopes every session is memoryless and the hooks answer without calling cc or Hindsight. With scopes saved but all disabled, recall and the recall tool answer without calling cc or Hindsight, while the Stop still resolves the session so its cursor advances (see Scopes → Disabled). Hooks and the recall tool are frozen into a session when cc spawns it, so enabling the plugin (or adding the first scope's hooks) reaches sessions started afterwards; scopes themselves are read on every prompt.
 
 ### What happens in a session
 
@@ -106,7 +106,7 @@ A scope is `{name, match: {projects?, workspaces?, sessions?, stages?}, bank, ac
   - **List input (Projects, Workspaces, Stages):** one input shared by the three fields: chips, a text entry with a suggestion list under it, and an **Add** button. Suggestions come from cc (projects with their workspace or "no workspace", plus an always-present `.conduct` hint "conductor sessions" because cc never lists it, workspaces with their project count, stages with their playbooks); typing filters by name or hint, case-insensitively, and values already added are not offered. Suggestions never restrict: Enter adds the typed text as is (so globs such as `code-*` and `CC-*` work) unless an arrow key chose an option; clicking an option adds it; Escape closes the list; text left in the input is added when it loses focus. A literal name cc does not list is marked "unknown to cc" and kept, except `.conduct`, which is never marked.
   - **cc unreadable:** when cc's lists cannot be read there are no suggestions and a warning says to type the names; typing and **Save** work as usual.
 - **Import past sessions:** see [below](#import-past-sessions).
-- **Activity:** recent recalls, retains, past-session scans and imports, and refusals (time, event, session, project · stage, banks, count, result), newest first, refreshed every few seconds. Entries hold ids, names, counts and error text, never prompt or memory text. A prompt or Stop from a session that matches no enabled scope (including one whose only match is disabled) leaves no entry (there would be one per prompt); the recall tool, by contrast, logs `NO_RECALL_SCOPE`.
+- **Activity:** recent recalls, retains, past-session scans and imports, and refusals (time, event, session, project · stage, banks, count, result), newest first, refreshed every few seconds. Entries hold ids, names, counts and error text, never prompt or memory text. A prompt or Stop from a session that matches no enabled scope (including one whose only match is disabled) leaves no entry (there would be one per prompt); the recall tool, by contrast, logs `NO_RECALL_SCOPE` when at least one scope is enabled.
 
 ### Import past sessions
 

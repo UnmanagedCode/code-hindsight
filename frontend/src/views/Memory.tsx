@@ -194,8 +194,8 @@ export function Memory({ status }: { status: Status }) {
     try {
       const r = await send<{ scopes: Scope[] }>('-/api/scopes', 'PUT', { scopes: list.map(toScope) });
       setSaved(r.scopes);
-      // The saved list has the sent order and length, so each card keeps its open state.
-      setForms(r.scopes.map((sc, i) => toForm(sc, list[i]?.open ?? false)));
+      // The saved list has the sent order and length, so each card keeps its open state (as it is now, not as when the request started).
+      setForms((prev) => r.scopes.map((sc, i) => toForm(sc, prev[i]?.open ?? list[i]?.open ?? false)));
       setMessage(okMessage ?? (r.scopes.length ? 'Saved. Sessions started from now on use these scopes at their next prompt.' : 'Saved. Memory is off.'));
       return true;
     } catch (e) {
