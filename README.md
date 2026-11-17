@@ -2,14 +2,14 @@
 
 A code-conductor (cc) plugin that runs [Hindsight](https://hindsight.vectorize.io), an agent memory server, in Docker on the cc host and shows Hindsight's control-plane UI inside cc at `/plugins/code-hindsight/`.
 
-It manages two containers (the Hindsight API with its embedded Postgres, and a control plane built for cc's mount path), keeps memories in a named Docker volume, works offline from exported image bundles, and reports every failure by name with the action that fixes it. It also gives cc sessions memory: Claude Code hooks recall from and retain into Hindsight banks chosen by user-configured scopes, and past sessions' saved transcripts can be imported on request (Memory → Import past sessions). Memory is off until a scope exists.
+It manages two containers (the Hindsight API with its embedded Postgres, and a control plane built for cc's mount path), keeps memories in a named Docker volume, works offline from exported image bundles, and reports every failure by name with the action that fixes it. It also gives cc sessions memory: Claude Code hooks recall from and retain into Hindsight banks chosen by user-configured scopes, and past sessions' saved transcripts can be imported on request (Memory → Import past sessions). Memory is off until an enabled scope exists.
 
 ## Quick start
 
 1. In cc: **Settings → Plugins → Rescan**, enable **Code Hindsight**, open it from the app switcher.
 2. **Images & data:** **Pull full image** (or import a bundle), then **Build CP image** once (needs network). A CP image whose build labels do not match this plugin's (for example one labelled with a commit hash rather than `UPSTREAM_TAG`) stops the start with `CP_IMAGE_MISMATCH` and a **Build CP image** button: rebuild it once. Images are pinned by tag; see [Trust model](#trust-model).
 3. **Status → Start Hindsight**, then the **Control plane** tab.
-4. **Memory** tab → **Add scope** and Save to switch memory on (it is off with no scopes). Sessions started afterwards use it.
+4. **Memory** tab → **Add scope** and Save to switch memory on (it is off with no enabled scope). Sessions started afterwards use it.
 5. Switch on **Auto-start** for the plugin (Settings → Plugins) to have Hindsight up after every cc start: Hindsight runs only while the plugin's backend runs.
 
 Install hook for a Library entry: `npm install` (it builds `frontend/dist` through `prepare`).

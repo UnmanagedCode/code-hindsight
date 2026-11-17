@@ -310,3 +310,72 @@ describe('Memory', () => {
     expect(document.querySelector('img')).toBeNull();
   });
 });
+
+describe('Memory scope switch', () => {
+  const sw = (name: string) => screen.findByRole('switch', { name: `${name} enabled` });
+
+  it('loads a disabled scope with its switch off and marked disabled', async () => {
+    stub({ scopes: [scope('alpha', { enabled: false }), scope('beta')] });
+    render(<Memory status={status()} />);
+    expect((await sw('alpha')).getAttribute('aria-checked')).toBe('false');
+    expect((await sw('beta')).getAttribute('aria-checked')).toBe('true');
+    const card = (await sw('alpha')).closest('[data-scope]') as HTMLElement;
+    expect(within(card).getByText('disabled')).toBeTruthy();
+    expect(within((await sw('beta')).closest('[data-scope]') as HTMLElement).queryByText('disabled')).toBeNull();
+  });
+
+  it('one click on a clean editor saves at once, with only that scope flipped and no confirm', async () => {
+    const calls = stub({ scopes: [scope('alpha'), scope('beta')] });
+    render(<Memory status={status()} />);
+    await userEvent.click(await sw('alpha'));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    expect(putBody(calls).scopes.map((s) => s.enabled)).toEqual([false, undefined]);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    await waitFor(() => expect(screen.getByRole('switch', { name: 'alpha enabled' }).getAttribute('aria-checked')).toBe('false'));
+    expect((await screen.findByRole('status')).textContent).toMatch(/"alpha" disabled/);
+  });
+
+  it('enabling a disabled scope sends no enabled key', async () => {
+    const calls = stub({ scopes: [scope('alpha', { enabled: false })] });
+    render(<Memory status={status()} />);
+    await userEvent.click(await sw('alpha'));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    expect('enabled' in putBody(calls).scopes[0]).toBe(false);
+  });
+
+  it('with other unsaved edits the toggle asks first: Cancel saves nothing and keeps the flag; Save all saves the edits and the flip', async () => {
+    const calls = stub({ scopes: [scope('alpha'), scope('beta')] });
+    render(<Memory status={status()} />);
+    const card = await expand('beta');
+    await userEvent.clear(within(card).getByLabelText('Bank template'));
+    await userEvent.type(within(card).getByLabelText('Bank template'), 'edited');
+    await userEvent.click(await sw('alpha'));
+    const dialog = await screen.findByRole('dialog');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+    expect(calls.some((c) => c.init?.method === 'PUT')).toBe(false);
+    expect((await sw('alpha')).getAttribute('aria-checked')).toBe('true');
+    await userEvent.click(await sw('alpha'));
+    await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Save all' }));
+    await waitFor(() => expect(calls.some((c) => c.init?.method === 'PUT')).toBe(true));
+    const sent = putBody(calls).scopes;
+    expect([sent[0].enabled, sent[1].bank]).toEqual([false, 'edited']);
+  });
+
+  it('a refused toggle keeps the scope\'s previous state and shows the field error on its card', async () => {
+    stub({
+      scopes: [scope('alpha')],
+      put: () => ({ status: 400, body: { code: 'SCOPES_INVALID', message: 'bad', params: { fields: [{ field: 'scopes[0].bank', message: 'refused here' }] } } }),
+    });
+    render(<Memory status={status()} />);
+    await userEvent.click(await sw('alpha'));
+    await waitFor(() => expect(screen.getByText('refused here')).toBeTruthy());
+    expect((await sw('alpha')).getAttribute('aria-checked')).toBe('true');
+    expect((await screen.findByRole('status')).textContent).toMatch(/not switched/);
+  });
+
+  it('says memory is off when every scope is disabled', async () => {
+    stub({ scopes: [scope('alpha', { enabled: false }), scope('beta', { enabled: false })] });
+    render(<Memory status={status()} />);
+    expect((await screen.findByText(/Memory is off/)).textContent).toMatch(/every scope is disabled/);
+  });
+});

@@ -719,3 +719,37 @@ test('scopes without workspaces never ask cc for project membership', async (t) 
   assert.equal(x.cc.listProjectsCalls(), 0);
   assert.equal(x.hs.retains().length, 1);
 });
+
+test('with every scope disabled, recall makes zero cc and Hindsight calls and the recall tool answers NO_RECALL_SCOPE', async (t) => {
+  const x = await setup(t, { scopes: [scope({ enabled: false }), scope({ name: 'two', enabled: false })] });
+  assert.deepEqual(await recall(x.memory, S, 'hello'), { context: null });
+  await assert.rejects(x.memory.recallForMcp(S, 'q'), { code: 'NO_RECALL_SCOPE' });
+  assert.equal(x.cc.calls.length, 0);
+  assert.equal(x.hs.requests.length, 0);
+});
+
+test('a session whose only matching scope is disabled gets no context and leaves no activity entry', async (t) => {
+  const x = await setup(t, { scopes: [scope({ name: 'off', enabled: false }), scope({ name: 'other', match: { stages: ['plan'] } })] });
+  x.hs.bank('cc-proj', [{ id: 'a', text: 'a note' }]);
+  assert.deepEqual(await recall(x.memory, S, 'hello'), { context: null });
+  await x.memory.retainForHook(S, [turn(1, 'user'), turn(2)]);
+  await x.memory.idle();
+  assert.equal(x.hs.requests.length, 0);
+  assert.deepEqual(x.activity.list(), []);
+});
+
+test('turns from Stops while the retain scope is disabled are never sent after it is enabled again', async (t) => {
+  const x = await setup(t);
+  const t1 = [turn(1, 'user', 'q1'), turn(2, 'assistant', 'a1')];
+  await x.memory.retainForHook(S, t1);
+  await x.memory.idle();
+  x.save([scope({ enabled: false })]);
+  const t2 = [...t1, turn(3, 'user', 'off q'), turn(4, 'assistant', 'off a')];
+  assert.deepEqual(await x.memory.retainForHook(S, t2), { status: 'accepted' });
+  await x.memory.idle();
+  x.save([scope()]);
+  const t3 = [...t2, turn(5, 'user', 'q3'), turn(6, 'assistant', 'a3')];
+  await x.memory.retainForHook(S, t3);
+  await x.memory.idle();
+  assert.deepEqual(lines(x.hs.doc('cc-proj', `cc-session:${S}`)).map((l) => l.content), ['q1', 'a1', 'q3', 'a3']);
+});

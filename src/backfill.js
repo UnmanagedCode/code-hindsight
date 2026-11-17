@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { AppError } from './errors.js';
-import { matchScopes, renderBank, withWorkspace } from './scopes.js';
+import { isScopeEnabled, matchScopes, renderBank, withWorkspace } from './scopes.js';
 import { buildRetainItem, renderTurn } from './retainItem.js';
 import { operationIdFor } from './retainCursor.js';
 import { isSessionId } from './ccSession.js';
@@ -214,7 +214,8 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
   /**
    * Where live memory of this session starts: the earliest turn timestamp of its `cc-session:`
    * document across every bank a retain scope renders for it (whether or not that scope matches
-   * now: stages may have changed since). null when there is none; a Skip when it cannot be read.
+   * now: stages may have changed since), disabled scopes included: a disabled scope's bank can still
+   * hold the session's live document. null when there is none; a Skip when it cannot be read.
    * Hindsight failures throw.
    */
   async function liveCutoff(list, session, signal) {
@@ -548,7 +549,7 @@ export function createBackfill({ scopes, cc, hindsight, cursors, activity, setti
         cancellable: true,
         validate(p) {
           const list = savedScopes();
-          if (!list.some((sc) => sc.actions.includes('retain'))) throw new AppError('BACKFILL_NO_SCOPES');
+          if (!list.some((sc) => isScopeEnabled(sc) && sc.actions.includes('retain'))) throw new AppError('BACKFILL_NO_SCOPES');
           if (!cc.isConfigured()) throw new AppError('BACKFILL_CC_UNAVAILABLE', { detail: 'this backend has no cc to ask (CONDUCTOR_URL is unset)' });
           return { fresh: p.fresh === true };
         },
