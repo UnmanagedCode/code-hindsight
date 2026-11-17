@@ -200,7 +200,7 @@ export const CATALOG = Object.freeze({
     message: (p) => `${p.scope ? `Scope ${s(p.scope)}: ` : ''}cc could not say which workspace this session's project is in (${s(p.detail)}); ${p.scope ? 'the scope was' : 'scopes that depend on it were'} not applied to this call.`,
     action: null, status: 502,
   },
-  NO_RECALL_SCOPE: { title: 'No scope allows recall', message: () => 'No memory scope grants recall to this session (project, kind and stage are matched against Memory → scopes).', action: null, status: 403 },
+  NO_RECALL_SCOPE: { title: 'No scope allows recall', message: () => 'No enabled memory scope grants recall to this session (project, kind and stage are matched against Memory → scopes).', action: null, status: 403 },
   HINDSIGHT_NOT_READY: { title: 'Hindsight is not ready', message: () => 'Hindsight is not running, so this turn has no memory. Open Status to start it.', action: ACTIONS.start, status: 503 },
   RECALL_FAILED: { title: 'Recall failed', message: (p) => `Recall from bank ${s(p.bank)} failed: ${s(p.detail)}`, action: null, status: 502 },
   RETAIN_FAILED: { title: 'Retain failed', message: (p) => `Retaining into bank ${s(p.bank)} failed: ${s(p.detail)}; ${p.origin === 'backfill' ? 'importing again resumes where this stopped' : 'the turns are resent with the next turn'}.`, action: null, status: 502 },
@@ -210,8 +210,8 @@ export const CATALOG = Object.freeze({
   RETAIN_DROPPED: { title: 'Turns were dropped before they were retained', message: (p) => `Some turns of this session were not retained (${s(p.reason)}). They were not sent to any other bank.`, action: null, status: 503 },
   BANK_RENDER_FAILED: { title: 'A bank template did not render to a valid bank id', message: (p) => `Scope ${s(p.scope)}: ${s(p.detail)}.`, action: null, status: 409 },
   BACKFILL_NO_SCOPES: {
-    title: 'No scope retains',
-    message: () => 'Importing past sessions needs a memory scope that grants retain: each session is imported only into the bank its retain scope chooses.',
+    title: 'No enabled scope retains',
+    message: () => 'Importing past sessions needs an enabled memory scope that grants retain: each session is imported only into the bank its retain scope chooses.',
     action: null, status: 409,
   },
   BACKFILL_CC_UNAVAILABLE: {
@@ -231,7 +231,7 @@ export const CATALOG = Object.freeze({
   },
   BACKFILL_UNPLACEABLE: { title: 'cc could not place this transcript', message: (p) => `cc has no project for it (${s(p.detail)}); it is not imported anywhere.`, action: null, status: 409 },
   SESSION_LIVE: { title: 'The session is still running', message: () => 'A running session is imported after it ends: scan again then.', action: null, status: 409 },
-  NO_RETAIN_SCOPE: { title: 'No scope retains this session', message: () => "No memory scope grants retain to this session's project, kind and stage, so it is not imported anywhere.", action: null, status: 409 },
+  NO_RETAIN_SCOPE: { title: 'No scope retains this session', message: () => "No enabled memory scope grants retain to this session's project, kind and stage, so it is not imported anywhere.", action: null, status: 409 },
   LIVE_RETAIN_PENDING: { title: 'Live retain still has turns to send', message: () => 'Live memory holds unsent turns of this session, so where live memory starts is not settled; import it once they are sent.', action: null, status: 409 },
   LIVE_OVERLAP_UNKNOWN: { title: "Live memory's start could not be read", message: (p) => `The session's live document${p.bank ? ` in bank ${s(p.bank)}` : ''} has no readable turn timestamps, so the turns before it cannot be told apart; it is not imported.`, action: null, status: 409 },
   ALREADY_LIVE: { title: 'Already in live memory', message: () => 'Live memory already holds all of this session.', action: null, status: 409 },

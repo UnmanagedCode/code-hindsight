@@ -3,7 +3,7 @@
 // routes never see an exception. Owns the recall budget, the injected-context format, the set of
 // memories already injected per session, and the one-in-flight-per-session retain worker.
 import { AppError } from './errors.js';
-import { matchScopes, withWorkspace } from './scopes.js';
+import { isScopeEnabled, matchScopes, withWorkspace } from './scopes.js';
 import { buildRetainItem } from './retainItem.js';
 import { windowTurns, lastExchangeBoundary, endsAfter, provablyBehind, isOlderTail, isValidCursor, tailEnd, operationIdFor } from './retainCursor.js';
 
@@ -279,7 +279,7 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
       const signal = AbortSignal.timeout(limits.recallDeadlineMs);
       try {
         const list = loadScopes('recall', sessionId);
-        if (!list.length) return NONE;
+        if (!list.some(isScopeEnabled)) return NONE;
         const resolved = await resolve('recall', sessionId, signal);
         if (!resolved) return NONE;
         const session = await placeWorkspace(list, resolved, signal);
@@ -306,6 +306,8 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
     async retainForHook(sessionId, turns) {
       try {
         const list = loadScopes('retain', sessionId);
+        // Deliberately "no scopes", not "no enabled scopes": with scopes all disabled the Stop still
+        // matches nothing and advances the cursor, so turns of a disabled stretch are never sent later.
         if (!list.length) return { status: 'off' };
         if (!turns.length) return { status: 'empty' };
         const resolved = await resolve('retain', sessionId);
@@ -334,7 +336,7 @@ export function createMemory({ scopes, cc, hindsight, cursors, activity, limits 
       if (!sessionId) throw new AppError('NO_SESSION');
       const signal = AbortSignal.timeout(limits.recallDeadlineMs);
       const list = loadScopes('mcp-recall', sessionId);
-      if (!list.length) throw new AppError('NO_RECALL_SCOPE');
+      if (!list.some(isScopeEnabled)) throw new AppError('NO_RECALL_SCOPE');
       let resolved;
       try { resolved = await cc.resolveSession(sessionId, { signal }); } catch (e) {
         activity.add({ event: 'mcp-recall', outcome: e.code === 'SESSION_NOT_LIVE' ? 'skipped' : 'error', sessionId, code: e.code, message: e.message });

@@ -3,6 +3,7 @@ import { ArrowDownIcon, ArrowUpIcon, ChevronDownIcon, ChevronRightIcon, PlusIcon
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { Dialog, DialogClose, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { NameListInput } from '@/components/NameListInput';
@@ -27,14 +28,15 @@ interface ScopeForm {
   stages: string[];
   bank: string;
   actions: Record<(typeof ACTIONS)[number], boolean>;
+  enabled: boolean;
 }
 
 let nextKey = 1;
 
-function toForm(s: Scope, open = false): ScopeForm {
+function formOf(s: Scope, open: boolean, key: number): ScopeForm {
   const kinds = s.match.sessions;
   return {
-    key: nextKey++,
+    key,
     open,
     name: s.name,
     projects: s.match.projects ?? [],
@@ -43,8 +45,11 @@ function toForm(s: Scope, open = false): ScopeForm {
     stages: s.match.stages ?? [],
     bank: s.bank,
     actions: { recall: s.actions.includes('recall'), retain: s.actions.includes('retain') },
+    enabled: s.enabled !== false,
   };
 }
+
+const toForm = (s: Scope, open = false): ScopeForm => formOf(s, open, nextKey++);
 
 /** Both kinds ticked means "any": the key is omitted, never sent as an empty list. */
 function toScope(f: ScopeForm): Scope {
@@ -54,8 +59,14 @@ function toScope(f: ScopeForm): Scope {
   const kinds = KINDS.filter((k) => f.sessions[k]);
   if (kinds.length === 1) match.sessions = [...kinds];
   if (f.stages.length) match.stages = f.stages;
-  return { name: f.name, match, bank: f.bank, actions: ACTIONS.filter((a) => f.actions[a]) };
+  const scope: Scope = { name: f.name, match, bank: f.bank, actions: ACTIONS.filter((a) => f.actions[a]) };
+  // Only a disabled scope carries the key: enabled is the absence of it.
+  if (!f.enabled) scope.enabled = false;
+  return scope;
 }
+
+/** A saved scope in the canonical shape the editor sends, for comparing a draft with what is saved. */
+const canonical = (s: Scope): Scope => toScope(formOf(s, false, 0));
 
 function blankScope(n: number): ScopeForm {
   return toForm({ name: `scope ${n}`, match: {}, bank: 'cc-{project}', actions: ['recall', 'retain'] }, true);
@@ -148,6 +159,8 @@ export function Memory({ status }: { status: Status }) {
   const [errors, setErrors] = useState<FieldError[]>([]);
   const [message, setMessage] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  /** Index of the scope whose switch was clicked while the draft held other unsaved edits. */
+  const [confirmToggle, setConfirmToggle] = useState<number | null>(null);
   const [stages, setStages] = useState<StagesView | null>(null);
   const [ccProjects, setCcProjects] = useState<CcProjectsView | null>(null);
 
@@ -173,16 +186,18 @@ export function Memory({ status }: { status: Status }) {
     setForms(next);
   };
 
-  const save = async () => {
+  /** Save `list`; true when saved. A refusal shows its field errors (opening the named cards) and leaves the draft as it was. */
+  const persist = async (list: ScopeForm[], okMessage?: string, refusedMessage = 'Some scopes are not valid.'): Promise<boolean> => {
     setSaving(true);
     setErrors([]);
     setMessage(null);
     try {
-      const r = await send<{ scopes: Scope[] }>('-/api/scopes', 'PUT', { scopes: forms.map(toScope) });
+      const r = await send<{ scopes: Scope[] }>('-/api/scopes', 'PUT', { scopes: list.map(toScope) });
       setSaved(r.scopes);
-      // The saved list has the sent order and length, so each card keeps its open state.
-      setForms((prev) => r.scopes.map((sc, i) => toForm(sc, prev[i]?.open ?? false)));
-      setMessage(r.scopes.length ? 'Saved. Sessions started from now on use these scopes at their next prompt.' : 'Saved. Memory is off.');
+      // The saved list has the sent order and length, so each card keeps its open state (as it is now, not as when the request started).
+      setForms((prev) => r.scopes.map((sc, i) => toForm(sc, prev[i]?.open ?? list[i]?.open ?? false)));
+      setMessage(okMessage ?? (r.scopes.length ? 'Saved. Sessions started from now on use these scopes at their next prompt.' : 'Saved. Memory is off.'));
+      return true;
     } catch (e) {
       if (e instanceof ApiError && e.code === 'SCOPES_INVALID') {
         const fields = ((e.body as { params?: { fields?: FieldError[] } })?.params?.fields) ?? [];
@@ -190,11 +205,25 @@ export function Memory({ status }: { status: Status }) {
         // A refusal inside a collapsed card must not stay hidden.
         const named = new Set(fields.map((x) => /^scopes\[(\d+)\]\./.exec(x.field)?.[1]).filter((n) => n !== undefined).map(Number));
         setForms((prev) => prev.map((f, i) => (named.has(i) ? { ...f, open: true } : f)));
-        setMessage('Some scopes are not valid.');
+        setMessage(refusedMessage);
       } else setMessage(e instanceof Error ? e.message : String(e));
+      return false;
     } finally {
       setSaving(false);
     }
+  };
+  const save = () => persist(forms);
+
+  const flip = (i: number) => forms.map((f, j) => (j === i ? { ...f, enabled: !f.enabled } : f));
+  const runToggle = (i: number) => {
+    const target = forms[i];
+    const note = target.enabled ? `"${target.name}" disabled: it matches no session from the next prompt.` : `"${target.name}" enabled: it applies from the next prompt.`;
+    return persist(flip(i), note, `"${target.name}" was not switched: the scopes are not valid.`);
+  };
+  /** One click saves at once; with other unsaved edits it asks first, since they are saved too. */
+  const toggle = (i: number) => {
+    const dirty = JSON.stringify(forms.map(toScope)) !== JSON.stringify(saved.map(canonical));
+    if (dirty) setConfirmToggle(i); else void runToggle(i);
   };
 
   return (
@@ -202,7 +231,9 @@ export function Memory({ status }: { status: Status }) {
       <div className="space-y-1 text-sm" data-memory-header>
         {saved.length === 0
           ? <p className="font-medium">Memory is off — no scopes; every session is memoryless.</p>
-          : <p>Memory is on for sessions that match a scope. A session with no matching scope is memoryless.</p>}
+          : saved.every((sc) => sc.enabled === false)
+            ? <p className="font-medium">Memory is off — every scope is disabled; every session is memoryless.</p>
+            : <p>Memory is on for sessions that match a scope. A session with no matching scope is memoryless.</p>}
         {status.state !== 'ready' && <p className="text-warning">Hindsight is {status.state}: sessions are memoryless until it is ready.</p>}
         {status.llmMode === 'none' && <p className="text-muted-foreground">Hindsight's LLM mode is none: retained turns are stored as raw chunks, without fact extraction.</p>}
       </div>
@@ -211,7 +242,7 @@ export function Memory({ status }: { status: Status }) {
         <CardHeader>
           <CardTitle>Scopes</CardTitle>
           <CardDescription>
-            Checked on every prompt, in this order. <strong>Recall</strong> reads every matching scope's bank (merged, at most four banks). <strong>Retain</strong> writes to the first matching scope that retains. A blank field matches anything; a conductor's project is <code>.conduct</code>. A session matches when its project matches a <strong>Projects</strong> entry <em>or</em> is in one of the <strong>Workspaces</strong>, and Sessions and Stages match too. Placeholders: <code>{'{project}'}</code> <code>{'{worktree}'}</code> <code>{'{kind}'}</code>.
+            Checked on every prompt, in this order; a disabled scope is skipped. <strong>Recall</strong> reads every matching scope's bank (merged, at most four banks). <strong>Retain</strong> writes to the first matching scope that retains. A blank field matches anything; a conductor's project is <code>.conduct</code>. A session matches when its project matches a <strong>Projects</strong> entry <em>or</em> is in one of the <strong>Workspaces</strong>, and Sessions and Stages match too. Placeholders: <code>{'{project}'}</code> <code>{'{worktree}'}</code> <code>{'{kind}'}</code>.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -220,13 +251,20 @@ export function Memory({ status }: { status: Status }) {
             const id = `scope-${f.key}`;
             const invalid = errors.some((x) => x.field.startsWith(`${p}.`));
             return (
-              <div key={f.key} className="space-y-3 rounded-md border p-3" data-scope={i}>
+              <div key={f.key} className={`space-y-3 rounded-md border p-3 ${f.enabled ? '' : 'border-dashed'}`} data-scope={i} data-enabled={String(f.enabled)}>
                 <div className="flex items-center gap-2">
-                  <button type="button" aria-expanded={f.open} aria-controls={`${id}-body`} onClick={() => patch(i, { open: !f.open })} className="flex min-w-0 flex-1 items-center gap-2 rounded px-1 py-1 text-left hover:bg-accent">
+                  <button type="button" aria-expanded={f.open} aria-controls={`${id}-body`} onClick={() => patch(i, { open: !f.open })} className={`flex min-w-0 flex-1 items-center gap-2 rounded px-1 py-1 text-left hover:bg-accent ${f.enabled ? '' : 'opacity-60'}`}>
                     {f.open ? <ChevronDownIcon className="size-4 shrink-0" /> : <ChevronRightIcon className="size-4 shrink-0" />}
                     <span className="shrink-0 text-sm font-medium">{f.name || 'unnamed scope'}</span>
+                    {!f.enabled && <Badge variant="outline">disabled</Badge>}
                     {invalid && <Badge variant="destructive">invalid</Badge>}
                     <span className="truncate text-xs text-muted-foreground">{summarize(f)}</span>
+                  </button>
+                  <button
+                    type="button" role="switch" aria-checked={f.enabled} aria-label={`${f.name} enabled`} disabled={saving} onClick={() => toggle(i)}
+                    className={`relative h-5 w-9 shrink-0 rounded-full border transition-colors disabled:opacity-50 ${f.enabled ? 'bg-primary' : 'bg-muted'}`}
+                  >
+                    <span className={`absolute top-0.5 size-3.5 rounded-full bg-background shadow transition-all ${f.enabled ? 'left-[1.1rem]' : 'left-0.5'}`} />
                   </button>
                   <Button type="button" size="icon" variant="outline" aria-label={`Move ${f.name} up`} disabled={i === 0} onClick={() => move(i, -1)}><ArrowUpIcon /></Button>
                   <Button type="button" size="icon" variant="outline" aria-label={`Move ${f.name} down`} disabled={i === forms.length - 1} onClick={() => move(i, 1)}><ArrowDownIcon /></Button>
@@ -307,6 +345,19 @@ export function Memory({ status }: { status: Status }) {
           </div>
         </CardContent>
       </Card>
+
+      <Dialog open={confirmToggle !== null} onOpenChange={(o) => { if (!o) setConfirmToggle(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Save your other edits too?</DialogTitle>
+            <DialogDescription>The editor has unsaved changes. Switching a scope saves the whole list, so they are saved together with this switch.</DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <DialogClose asChild><Button type="button" variant="ghost">Cancel</Button></DialogClose>
+            <Button type="button" onClick={() => { const i = confirmToggle; setConfirmToggle(null); if (i !== null) void runToggle(i); }}>Save all</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Backfill status={status} />
 

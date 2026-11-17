@@ -16,7 +16,10 @@ const STAGE_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,59}$/;
 const LITERAL_RE = /^[a-z0-9._:-]*$/;
 const BANK_RE = /^[a-z0-9][a-z0-9._:-]{0,127}$/;
 const MATCH_KEYS = ['projects', 'workspaces', 'sessions', 'stages'];
-const SCOPE_KEYS = ['name', 'match', 'bank', 'actions'];
+const SCOPE_KEYS = ['name', 'match', 'bank', 'actions', 'enabled'];
+
+/** Whether a scope takes part in matching: only an explicit `enabled: false` switches one off. */
+export const isScopeEnabled = (scope) => scope.enabled !== false;
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -72,6 +75,11 @@ export function validateScopes(input) {
       list('stages', (x) => STAGE_RE.test(x), 'a stage name');
     }
 
+    if (raw.enabled !== undefined) {
+      if (typeof raw.enabled !== 'boolean') err(f('enabled'), 'must be true or false');
+      else if (!raw.enabled) scope.enabled = false;
+    }
+
     const problem = templateProblem(raw.bank);
     if (problem) err(f('bank'), problem); else scope.bank = raw.bank;
 
@@ -115,9 +123,11 @@ export function globMatches(glob, text) {
  * `workspaces`); an absent key matches anything. `'unresolved'` when the answer depends on the
  * session's cc workspace and that could not be looked up (`session.workspaceError`).
  * `session.workspace` is the project's workspace (null: none); both are set only when looked up.
+ * A disabled scope never matches (and so never needs the workspace).
  * @returns {'match'|'no'|'unresolved'}
  */
 export function scopeMatches(scope, session) {
+  if (!isScopeEnabled(scope)) return 'no';
   const { projects, workspaces, sessions, stages } = scope.match;
   if (sessions && !sessions.includes(session.kind)) return 'no';
   if (stages && !(session.stage && stages.includes(session.stage))) return 'no';

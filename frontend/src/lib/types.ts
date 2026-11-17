@@ -136,6 +136,8 @@ export interface Scope {
   match: { projects?: string[]; workspaces?: string[]; sessions?: ('conductor' | 'worker')[]; stages?: string[] };
   bank: string;
   actions: ('recall' | 'retain')[];
+  /** Absent means enabled; only `false` is ever stored. */
+  enabled?: boolean;
 }
 
 export interface ScopesView {

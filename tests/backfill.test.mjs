@@ -854,3 +854,33 @@ test('an import of a scan made while Hindsight was not ready is refused BACKFILL
   ok(await x.scan());
   ok(await x.import([KEY(1)]));
 });
+
+test('a scan is refused BACKFILL_NO_SCOPES when every retain scope is disabled', async (t) => {
+  const x = await setup(t, { scopes: [scope({ enabled: false }), scope({ name: 'recall-only', actions: ['recall'] })] });
+  x.place(1);
+  assert.throws(() => x.scan(), { code: 'BACKFILL_NO_SCOPES' });
+});
+
+test('a session whose only retain scope is disabled is skipped NO_RETAIN_SCOPE', async (t) => {
+  const x = await setup(t, { scopes: [scope({ name: 'off', enabled: false }), scope({ name: 'other', match: { projects: ['other'] } })] });
+  x.place(1);
+  ok(await x.scan());
+  assert.equal(x.skip(B(1)).code, 'NO_RETAIN_SCOPE');
+  assert.deepEqual(x.backfill.latestScan().sessions, []);
+});
+
+test('a live document in a disabled scope\'s bank still sets the cutoff', async (t) => {
+  const x = await setup(t, { scopes: [scope({ name: 'off', bank: 'off-{project}', enabled: false }), scope({ name: 'on', bank: 'on-{project}' })] });
+  x.place(1, { body: exchanges(3) });
+  x.hs.putDoc('off-proj', `cc-session:${H(1)}`, JSON.stringify({ role: 'user', content: 'x', timestamp: at(2) }));
+  ok(await x.scan());
+  assert.deepEqual([x.row(KEY(1)).bank, x.row(KEY(1)).cutoffAt, x.row(KEY(1)).turns], ['on-proj', at(2), 2]);
+});
+
+test('toggling a scope after a scan makes the import BACKFILL_STALE', async (t) => {
+  const x = await setup(t, { scopes: [scope(), scope({ name: 'second', bank: 'second-{project}' })] });
+  x.place(1);
+  ok(await x.scan());
+  x.save([scope(), scope({ name: 'second', bank: 'second-{project}', enabled: false })]);
+  assert.throws(() => x.import([KEY(1)]), { code: 'BACKFILL_STALE' });
+});

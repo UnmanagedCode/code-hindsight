@@ -94,3 +94,25 @@ test('scope editor in a real browser: collapse, anchored suggestions, keyboard',
   await page.goto(`${front.origin}${plugin}`, { waitUntil: 'networkidle' });
   await checkAnchored(page);
 });
+
+test('the scope toggle saves through cc\'s proxy in one click: scopes.json holds enabled:false', { skip, timeout: 120_000 }, async (t) => {
+  const fakeCc = await startFakeCc(t);
+  const { url, r } = await boot(t, { cc: fakeCc.url, distDir: dist, start: false });
+  fs.mkdirSync(r.dataDir, { recursive: true, mode: 0o700 });
+  const file = path.join(r.dataDir, 'scopes.json');
+  fs.writeFileSync(file, JSON.stringify({ scopes: [scope('alpha'), scope('beta')] }), { mode: 0o600 });
+  const front = await startCcFront({ pluginId: 'code-hindsight', backendPort: Number(new URL(url).port) });
+  t.after(() => front.close());
+  const { chromium: pw } = await import('playwright-core');
+  const browser = cdp ? await pw.connectOverCDP(cdp) : await pw.launch({ executablePath: chromium });
+  t.after(() => browser.close());
+  const page = await (await browser.newContext()).newPage();
+  await page.goto(`${front.origin}/__host?src=${front.prefix}/?view=memory`, { waitUntil: 'networkidle' });
+  const frame = page.frameLocator('iframe[data-plugin-frame]');
+  const alpha = frame.getByRole('switch', { name: 'alpha enabled' });
+  await alpha.click();
+  await frame.locator('[data-scope="0"][data-enabled="false"]').waitFor();
+  const saved = JSON.parse(fs.readFileSync(file, 'utf8')).scopes;
+  assert.equal(saved[0].enabled, false);
+  assert.equal('enabled' in saved[1], false);
+});

@@ -3,7 +3,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { validateScopes, matchScopes, needsWorkspace, renderBank, createScopesStore, globMatches, SCOPE_LIMITS } from '../src/scopes.js';
+import { validateScopes, isScopeEnabled, matchScopes, needsWorkspace, renderBank, createScopesStore, globMatches, SCOPE_LIMITS } from '../src/scopes.js';
 import { mkRoot } from './helpers.mjs';
 
 const scope = (over = {}) => ({ name: 's', match: {}, bank: 'cc-{project}', actions: ['recall', 'retain'], ...over });
@@ -204,4 +204,46 @@ test('needsWorkspace is true only when a scope\'s outcome depends on the workspa
   assert.equal(needs({ workspaces: ['WS'], stages: ['plan'] }), false, 'the stage rules it out');
   assert.equal(needs({ workspaces: ['WS'], sessions: ['conductor'] }), false, 'the kind rules it out');
   assert.equal(needs({ projects: ['other'] }), false);
+});
+
+test('a scope without enabled validates unchanged; enabled:true is dropped and enabled:false is kept', () => {
+  const plain = [scope({ name: 'a' })];
+  assert.deepEqual(ok(plain), plain);
+  assert.equal('enabled' in ok([scope({ enabled: true })])[0], false);
+  assert.equal(ok([scope({ enabled: false })])[0].enabled, false);
+  assert.equal(isScopeEnabled(ok([scope()])[0]), true);
+  assert.equal(isScopeEnabled(ok([scope({ enabled: false })])[0]), false);
+});
+
+test('validation refuses a non-boolean enabled, naming scopes[i].enabled', () => {
+  for (const bad of ['false', 0, null, 'yes']) {
+    assert.deepEqual(validateScopes([scope({ name: 'a' }), scope({ name: 'b', enabled: bad })]).errors, [{ field: 'scopes[1].enabled', message: 'must be true or false' }]);
+  }
+});
+
+test('a disabled scope matches nothing: no recall bank, and retain falls through to the next enabled retain scope', () => {
+  const list = ok([
+    scope({ name: 'off', bank: 'off', actions: ['recall', 'retain'], enabled: false }),
+    scope({ name: 'on', bank: 'on', actions: ['recall', 'retain'] }),
+  ]);
+  assert.deepEqual(matchScopes(list, session()), { recall: [{ scope: 'on', bank: 'on' }], retain: { scope: 'on', bank: 'on' }, retainUnresolved: false, skipped: [] });
+  const onlyOff = ok([scope({ enabled: false })]);
+  assert.deepEqual(matchScopes(onlyOff, session()), { recall: [], retain: null, retainUnresolved: false, skipped: [] });
+});
+
+test('a disabled workspace scope never needs a workspace', () => {
+  const failed = session({ workspaceError: 'cc did not answer' });
+  const list = ok([scope({ match: { workspaces: ['WS'] }, enabled: false })]);
+  assert.equal(needsWorkspace(list, session()), false);
+  assert.deepEqual(matchScopes(list, failed).skipped, []);
+  assert.equal(needsWorkspace(ok([scope({ match: { workspaces: ['WS'] } })]), session()), true);
+});
+
+test('the store round-trips a disabled scope, and a scopes.json written without enabled loads as enabled', (t) => {
+  const r = mkRoot(t);
+  createScopesStore(r.dataDir).save(ok([scope({ name: 'a', enabled: false }), scope({ name: 'b' })]));
+  const loaded = createScopesStore(r.dataDir).get();
+  assert.deepEqual(loaded.map(isScopeEnabled), [false, true]);
+  fs.writeFileSync(path.join(r.dataDir, 'scopes.json'), JSON.stringify({ scopes: [scope({ name: 'old' })] }));
+  assert.equal(isScopeEnabled(createScopesStore(r.dataDir).get()[0]), true);
 });

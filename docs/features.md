@@ -57,7 +57,7 @@ Saved with **Save**; **Apply & restart** saves and reconciles the containers to 
 
 ## Memory
 
-Gives cc sessions memory. **Off by default:** with no scopes every session is memoryless and the hooks answer without calling cc or Hindsight. Hooks and the recall tool are frozen into a session when cc spawns it, so enabling the plugin (or adding the first scope's hooks) reaches sessions started afterwards; scopes themselves are read on every prompt.
+Gives cc sessions memory. **Off by default:** with no scopes every session is memoryless and the hooks answer without calling cc or Hindsight. With scopes saved but all disabled, recall and the recall tool answer without calling cc or Hindsight, while the Stop still resolves the session so its cursor advances (see Scopes → Disabled). Hooks and the recall tool are frozen into a session when cc spawns it, so enabling the plugin (or adding the first scope's hooks) reaches sessions started afterwards; scopes themselves are read on every prompt.
 
 ### What happens in a session
 
@@ -75,7 +75,7 @@ Gives cc sessions memory. **Off by default:** with no scopes every session is me
 
 ### Scopes
 
-A scope is `{name, match: {projects?, workspaces?, sessions?, stages?}, bank, actions}`. Scopes are checked in list order on every prompt.
+A scope is `{name, match: {projects?, workspaces?, sessions?, stages?}, bank, actions, enabled?}`. Scopes are checked in list order on every prompt.
 
 | Field | Meaning |
 |---|---|
@@ -86,24 +86,27 @@ A scope is `{name, match: {projects?, workspaces?, sessions?, stages?}, bank, ac
 | `stages` | the session's playbook stage must be listed. A session with no stage never matches a `stages` list. Names cc does not know are warned about in the UI and kept (playbooks come and go) |
 | `bank` | a template with `{project}`, `{worktree}`, `{kind}`; literal text uses lowercase `a-z 0-9 . _ : -` |
 | `actions` | `recall` and/or `retain` |
+| `enabled` | `false` switches the scope off; **absent means enabled**. Only `false` is stored: `true` is dropped on save |
 
 - **Combining keys:** a scope matches when `sessions` AND `stages` match AND (`projects` OR `workspaces` matches). With only one of `projects` / `workspaces` present, that one decides; with neither, any project matches.
 - **Workspace lookup:** cc is asked for workspace membership only when some scope's outcome depends on it (its `sessions` and `stages` match, it has `workspaces`, and none of its `projects` globs matched); scope lists without `workspaces` never ask. If cc cannot answer, every scope that depends on it is undecided: it is neither a match nor a non-match (`WORKSPACE_UNRESOLVED`, see Degrading).
 - **Workspace membership lag (known limitation):** membership is cached for `WORKSPACES_TTL_MS` (`src/ccSession.js`), so a project moved into or out of a workspace changes what it matches within that time. A project cc did not list in the cached copy is looked up again at once.
 - **Recall** merges every matching scope that grants it, in order; the same bank twice counts once; at most `SCOPE_LIMITS.recallMaxBanks` banks (`src/scopes.js`).
 - **Retain** goes to the **first** matching scope that grants it. If that scope's bank does not render, the session retains nothing (`BANK_RENDER_FAILED` in the activity log); it never falls through to a later scope. Likewise when the first retain scope not ruled out by its other keys is undecided (`WORKSPACE_UNRESOLVED`).
+- **Disabled:** a disabled scope stays in `scopes.json` and in the editor but matches no session, for recall, retain, the recall tool and Import past sessions; it never triggers a workspace lookup. Retain falls through to the next enabled retain scope, as if the scope were deleted. Turns that happen while the retain scope is disabled are passed over (the session's cursor still advances), so they are never sent after it is enabled again.
 - **Bank rendering:** each placeholder value is lowercased, characters outside `a-z 0-9 . _ -` become `-`, runs collapse, leading `. _ -` is trimmed (`.conduct` → `conduct`); the main checkout's `{worktree}` is `main`. The result must be a valid bank id, else `BANK_RENDER_FAILED`. Different projects can sanitize to the same bank.
 - **Stage and bank change mid-session:** the session is resolved on every call, so a stage change moves recall and retain to the matching scopes at once; later turns go to the new bank's `cc-session:<id>` document.
 
 ### The tab
 
-- **Header:** says "Memory is off" when no scopes are saved; warns when Hindsight is not ready (sessions are memoryless) and when its LLM mode is `none`.
+- **Header:** says "Memory is off" when no scopes are saved, and again when every saved scope is disabled; warns when Hindsight is not ready (sessions are memoryless) and when its LLM mode is `none`.
 - **Scope editor:** ordered cards (move up/down, delete, **Add scope**) with name, projects, workspaces, sessions, stages, bank template with a live preview, and actions. **Save** sends the whole list; a refusal (`SCOPES_INVALID`) shows against the field it names.
+  - **Enable switch:** each card header has a switch (works while collapsed) that saves the whole list at once through the same route as **Save**. A disabled card shows a "disabled" badge and is muted. If the editor holds other unsaved edits, the switch asks first (**Cancel** changes nothing; **Save all** saves the edits with the flip). A refusal (`SCOPES_INVALID`) leaves the switch as it was and shows the field errors.
   - **Collapsible cards:** each card has a header with a chevron toggle, the scope name and a one-line summary (what it narrows, or "any session", then bank and actions); Move up/down and Delete work while collapsed. Saved scopes load collapsed, **Add scope** appends an expanded card, and open/collapsed state survives **Save**. A card a refusal names is opened and badged "invalid".
   - **List input (Projects, Workspaces, Stages):** one input shared by the three fields: chips, a text entry with a suggestion list under it, and an **Add** button. Suggestions come from cc (projects with their workspace or "no workspace", plus an always-present `.conduct` hint "conductor sessions" because cc never lists it, workspaces with their project count, stages with their playbooks); typing filters by name or hint, case-insensitively, and values already added are not offered. Suggestions never restrict: Enter adds the typed text as is (so globs such as `code-*` and `CC-*` work) unless an arrow key chose an option; clicking an option adds it; Escape closes the list; text left in the input is added when it loses focus. A literal name cc does not list is marked "unknown to cc" and kept, except `.conduct`, which is never marked.
   - **cc unreadable:** when cc's lists cannot be read there are no suggestions and a warning says to type the names; typing and **Save** work as usual.
 - **Import past sessions:** see [below](#import-past-sessions).
-- **Activity:** recent recalls, retains, past-session scans and imports, and refusals (time, event, session, project · stage, banks, count, result), newest first, refreshed every few seconds. Entries hold ids, names, counts and error text, never prompt or memory text. A prompt or Stop from a session that matches no scope leaves no entry (there would be one per prompt); the recall tool, by contrast, logs `NO_RECALL_SCOPE`.
+- **Activity:** recent recalls, retains, past-session scans and imports, and refusals (time, event, session, project · stage, banks, count, result), newest first, refreshed every few seconds. Entries hold ids, names, counts and error text, never prompt or memory text. A prompt or Stop from a session that matches no enabled scope (including one whose only match is disabled) leaves no entry (there would be one per prompt); the recall tool, by contrast, logs `NO_RECALL_SCOPE` when at least one scope is enabled.
 
 ### Import past sessions
 
@@ -119,7 +122,7 @@ A card on the Memory tab, between the scope editor and Activity, that retains pa
 - **What is sent:** the same as live retain sends, verbatim: user and assistant text and one `action` line per tool call. Tool results, other tool arguments, thinking and sub-agent (sidechain) lines are dropped; **there is no secret redaction**. With an LLM configured, the imported turns also reach that LLM provider for extraction.
 - **Eligible:** any transcript cc places (its `describe_session` record gives a project): cc-launched sessions and plain `claude` runs in a registered project. A session still running is skipped (`SESSION_LIVE`) and offered by a later scan once it ends.
 - **Placement:** only cc's record decides, never the file's contents or its directory name. The session's **last recorded stage** places the whole transcript, then the scopes pick the bank exactly as for live retain (first matching retain scope). A transcript cc cannot place, or that no retain scope matches, is skipped and reported, never sent to a default bank.
-- **Overlap with live memory:** only turns earlier than the first turn of the session's live document (`cc-session:<id>`, in any bank a retain scope renders for it) are imported; turns without a timestamp are then left out. A session wholly covered is `ALREADY_LIVE`. A live document in a bank no current retain scope renders for the session (a scope renamed or removed since) is not seen; the cursor store cannot fill that gap, since it keeps no bank once a session's turns are sent.
+- **Overlap with live memory:** only turns earlier than the first turn of the session's live document (`cc-session:<id>`, in any bank a retain scope renders for it, disabled scopes included) are imported; turns without a timestamp are then left out. A session wholly covered is `ALREADY_LIVE`. A live document in a bank no current retain scope renders for the session (a scope renamed or removed since) is not seen; the cursor store cannot fill that gap, since it keeps no bank once a session's turns are sent.
 - **Re-running** is safe: a part Hindsight already holds with exactly the content that would be sent is not sent again, an operation still queued is left alone, and a failed one is retried. A stored part whose content differs (live memory's start moved earlier since the last import) is replaced, and stored parts numbered past what is sent now are deleted, with the memories extracted from them.
 - **The import sends only what the dry run showed:** for each session it re-checks the file and live memory's start. If either differs from the scan (`TRANSCRIPT_CHANGED`: the file's size, modification time, identity or content; `LIVE_CUTOFF_MOVED`: live memory now starts elsewhere), the session is skipped with nothing sent or deleted; scan again. A session stopped mid-import (Cancel, Hindsight going away, or the file changing between its two reads) may already have sent some of its confirmed parts, never anything unconfirmed; a re-run finishes it. Only the orphaned parts the scan listed are deleted, highest first, so an interrupted import leaves parts the next scan finds.
 - **Bank settings that defeat the content check:** with a bank's `store_document_text` off, or Hindsight's sensitive-data redaction on, a stored part never matches what would be sent: it shows as outdated and the session never reads as imported. Nothing is extracted twice: the operation check sees the part's operation and does not resend it.
@@ -127,13 +130,13 @@ A card on the Memory tab, between the scope editor and Activity, that retains pa
 - **Pacing:** one request at a time, so live hooks keep their budget. With an LLM configured, Hindsight's extraction of a large import delays extraction of later live retains (they are still acknowledged at once).
 - **Hindsight not ready:** a scan still places sessions but cannot check overlap or earlier imports (the card says so) and **Import** is disabled, and the backend refuses to import from that scan (`BACKFILL_UNCHECKED`); an import is refused `HINDSIGHT_NOT_READY`; Hindsight going away mid-import stops the job (`RETAIN_FAILED`), keeping what was sent, and a re-run resumes; so does an authentication refusal (HTTP 401 or 403). A refusal of one session's item (any other HTTP 4xx) fails that session only.
 - **Activity:** one entry per scan and per import (counts and banks; an import counts sessions finished and documents sent separately, since a stopped session may have sent some of its parts), plus one per failed session. An import that was cancelled is logged `skipped`, one that stopped `error`. Per-session detail is in the job log.
-- **Refusals:** `BACKFILL_NO_SCOPES` (no scope grants retain), `BACKFILL_CC_UNAVAILABLE` (no cc, or cc failing repeatedly), `BACKFILL_STALE` ("scan again": scopes changed or a newer scan exists), `BACKFILL_UNCHECKED` ("scan again once Hindsight is ready"), `CONFIRMATION_REQUIRED`, `HINDSIGHT_NOT_READY`.
+- **Refusals:** `BACKFILL_NO_SCOPES` (no enabled scope grants retain), `BACKFILL_CC_UNAVAILABLE` (no cc, or cc failing repeatedly), `BACKFILL_STALE` ("scan again": scopes changed or a newer scan exists), `BACKFILL_UNCHECKED` ("scan again once Hindsight is ready"), `CONFIRMATION_REQUIRED`, `HINDSIGHT_NOT_READY`.
 
 | Skip code | Why the transcript is not offered |
 |---|---|
 | `BACKFILL_UNPLACEABLE` | cc has no project for it (its reason is shown), or did not answer |
 | `SESSION_LIVE` | the session is still running |
-| `NO_RETAIN_SCOPE` | no scope grants retain to the session |
+| `NO_RETAIN_SCOPE` | no enabled scope grants retain to the session |
 | `WORKSPACE_UNRESOLVED`, `BANK_RENDER_FAILED` | as for live retain: the first retain scope is undecided, or its bank does not render |
 | `LIVE_RETAIN_PENDING` | live retain still holds unsent turns of this session |
 | `LIVE_OVERLAP_UNKNOWN` | its live document has no readable turn timestamps |
